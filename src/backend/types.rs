@@ -56,6 +56,8 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDefinition>,
     pub temperature: f64,
     pub max_tokens: Option<usize>,
+    /// Optional model identifier for OpenAI-compatible APIs
+    pub model_id: Option<String>,
 }
 
 /// Response from the model
@@ -186,7 +188,24 @@ impl HardwareInfo {
             .unwrap_or(8)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    fn detect_ram_gb() -> u64 {
+        // Use wmic to query total physical memory on Windows
+        use std::process::Command;
+        Command::new("wmic")
+            .args(["computersystem", "get", "TotalPhysicalMemory"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .find_map(|l| l.trim().parse::<u64>().ok())
+            })
+            .map(|bytes| bytes / (1024 * 1024 * 1024))
+            .unwrap_or(8)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn detect_ram_gb() -> u64 {
         // Fallback — read /proc/meminfo on Linux
         std::fs::read_to_string("/proc/meminfo")

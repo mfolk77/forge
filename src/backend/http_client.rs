@@ -164,7 +164,7 @@ impl HttpModelClient {
 
     pub async fn generate(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let oai_req = OaiRequest {
-            model: "default".to_string(),
+            model: request.model_id.clone().unwrap_or_default(),
             messages: request.messages.iter().map(Self::convert_message).collect(),
             tools: if request.tools.is_empty() {
                 None
@@ -237,7 +237,7 @@ impl HttpModelClient {
         request: &ChatRequest,
     ) -> Result<(mpsc::Receiver<Token>, tokio::task::JoinHandle<Result<ChatResponse>>)> {
         let oai_req = OaiRequest {
-            model: "default".to_string(),
+            model: request.model_id.clone().unwrap_or_default(),
             messages: request.messages.iter().map(Self::convert_message).collect(),
             tools: if request.tools.is_empty() {
                 None

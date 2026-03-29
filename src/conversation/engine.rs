@@ -65,6 +65,7 @@ impl ConversationEngine {
             tools: self.tools.clone(),
             temperature: config.model.temperature,
             max_tokens: Some(4096),
+            model_id: config.model.path.clone(),
         }
     }
 
@@ -150,6 +151,17 @@ impl ConversationEngine {
 
     pub fn update_tools(&mut self, tools: Vec<ToolDefinition>) {
         self.tools = tools;
+    }
+
+    /// Inject contextual content (e.g., skill content) as a system message in the conversation.
+    pub fn add_system_context(&mut self, content: &str) {
+        self.messages.push(Message {
+            role: Role::System,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        self.estimated_tokens += estimate_tokens(content);
     }
 }
 

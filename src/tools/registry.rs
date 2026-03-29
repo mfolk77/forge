@@ -90,6 +90,13 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Register multiple plugin tools at once.
+    pub fn register_plugin_tools(&mut self, tools: Vec<impl Tool + 'static>) {
+        for tool in tools {
+            self.register(tool);
+        }
+    }
+
     /// Create registry with all default tools
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();

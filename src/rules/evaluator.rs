@@ -84,6 +84,11 @@ impl RulesEngine {
         self.load(&content)
     }
 
+    /// Load rules from a string
+    pub fn load_string(&mut self, content: &str) -> Result<usize, String> {
+        self.load(content)
+    }
+
     /// Clear all loaded rules
     pub fn clear(&mut self) {
         self.global_rules.clear();

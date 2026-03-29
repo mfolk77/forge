@@ -15,10 +15,46 @@ use crate::formatting::{self, TemplateSet};
 use crate::permissions::{self, GrantCache, GrantScope, PermissionGrant, PermissionVerdict};
 use crate::rules::{EvalContext, RuleAction, RulesEngine};
 use crate::rules::parser::Event as RuleEvent;
+use crate::plugins::PluginManager;
+use crate::skills::LoadedSkill;
 use crate::tools::{ToolContext, ToolRegistry};
 
 use super::input::InputState;
 use super::render::{self, DisplayMessage};
+
+/// Error type for interruptible backend startup.
+enum StartErr {
+    UserQuit,
+    BackendFailed(String),
+}
+
+/// Operating mode for the TUI session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Full coding assistant — tools active, agentic loop, project context.
+    Coding,
+    /// General conversational assistant — tools available but passive.
+    Chat,
+}
+
+impl Mode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Mode::Coding => "coding",
+            Mode::Chat => "chat",
+        }
+    }
+}
+
+/// Detect the appropriate startup mode for a project path.
+/// Returns Coding if the directory contains `.git/` or `.ftai/`, Chat otherwise.
+pub fn detect_mode(project_path: &std::path::Path) -> Mode {
+    if project_path.join(".git").exists() || project_path.join(".ftai").exists() {
+        Mode::Coding
+    } else {
+        Mode::Chat
+    }
+}
 
 pub struct TuiApp {
     config: Config,
@@ -29,17 +65,55 @@ pub struct TuiApp {
     rules: RulesEngine,
     templates: TemplateSet,
     grant_cache: GrantCache,
+    plugin_manager: PluginManager,
+    skills: Vec<LoadedSkill>,
     input: InputState,
     messages: Vec<DisplayMessage>,
     project_path: PathBuf,
+    mode: Mode,
     should_quit: bool,
     is_generating: bool,
     streaming_text: String,
+    /// Channel for receiving streaming tokens during generation
+    token_rx: Option<tokio::sync::mpsc::Receiver<crate::backend::types::Token>>,
+    /// Handle for the streaming generation task
+    stream_handle: Option<tokio::task::JoinHandle<Result<ChatResponse>>>,
+    /// Scroll offset — lines from the bottom (0 = pinned to bottom)
+    scroll_offset: u16,
 }
 
 impl TuiApp {
     pub fn new(config: Config, project_path: PathBuf) -> Self {
-        let tools = ToolRegistry::with_defaults();
+        let mut tools = ToolRegistry::with_defaults();
+
+        // Load plugins
+        let plugins_dir = crate::config::global_config_dir()
+            .map(|d| d.join("plugins"))
+            .unwrap_or_else(|_| PathBuf::from("~/.ftai/plugins"));
+
+        let mut plugin_manager = PluginManager::new(plugins_dir);
+        let mut plugin_loaded_skills = Vec::new();
+
+        if config.plugins.enabled {
+            let _plugin_count = plugin_manager.load_all().unwrap_or(0);
+
+            // Register plugin tools
+            for plugin_tool in plugin_manager.get_tools() {
+                tools.register(plugin_tool);
+            }
+
+            // Load plugin skills and convert to skills::LoadedSkill
+            for ps in plugin_manager.get_skills() {
+                plugin_loaded_skills.push(LoadedSkill {
+                    name: ps.name,
+                    description: ps.description,
+                    trigger: ps.trigger,
+                    content: ps.content,
+                    source: ps.plugin_name,
+                });
+            }
+        }
+
         let tool_defs = tools.tool_definitions();
 
         let mut rules = RulesEngine::new();
@@ -57,23 +131,58 @@ impl TuiApp {
         }
 
         let memory = prompt::load_memory_context(&project_path);
+        let ftai_context = prompt::load_ftai_context(&project_path);
+        let mode = detect_mode(&project_path);
+
+        let templates = formatting::load_templates(&config.formatting, Some(&project_path))
+            .unwrap_or_default();
+
+        // Load plugin rules into rules engine
+        if config.plugins.enabled {
+            for (_plugin_name, rule_content) in plugin_manager.get_rules() {
+                let _ = rules.load_string(&rule_content);
+            }
+        }
+
+        // Rebuild rules summary after plugin rules
         let rules_summary = if rules.rule_count() > 0 {
             Some(rules.summary())
         } else {
             None
         };
 
-        let templates = formatting::load_templates(&config.formatting, Some(&project_path))
-            .unwrap_or_default();
+        // Load skills: builtins merged with plugin skills
+        let skills = crate::skills::loader::load_all_skills(plugin_loaded_skills);
 
-        let system_prompt = prompt::build_system_prompt(
-            &project_path,
-            &tool_defs,
-            rules_summary.as_deref(),
-            memory.as_deref(),
-            Some(&templates),
-            &config.formatting.enabled,
-        );
+        let skills_prompt = if !skills.is_empty() {
+            let mut out = String::from("Available skills via slash commands:\n\n");
+            for skill in &skills {
+                out.push_str(&format!(
+                    "- `{}` ({}) — {}\n",
+                    skill.trigger, skill.source, skill.description
+                ));
+            }
+            Some(out)
+        } else {
+            None
+        };
+
+        let system_prompt = match mode {
+            Mode::Coding => prompt::build_system_prompt(
+                &project_path,
+                &tool_defs,
+                rules_summary.as_deref(),
+                memory.as_deref(),
+                Some(&templates),
+                &config.formatting.enabled,
+                ftai_context.as_deref(),
+                skills_prompt.as_deref(),
+            ),
+            Mode::Chat => prompt::build_chat_system_prompt(
+                memory.as_deref(),
+                ftai_context.as_deref(),
+            ),
+        };
 
         let engine = ConversationEngine::new(
             system_prompt,
@@ -84,6 +193,13 @@ impl TuiApp {
         let parser = ToolCallParser::new(config.model.tool_calling.clone());
         let backend = BackendManager::from_config(&config);
 
+        let startup_msg = format!(
+            "Forge v{} | Project: {} | mode: {}",
+            env!("CARGO_PKG_VERSION"),
+            project_path.display(),
+            mode.label(),
+        );
+
         Self {
             config,
             backend,
@@ -93,37 +209,54 @@ impl TuiApp {
             rules,
             templates,
             grant_cache: GrantCache::new(),
+            plugin_manager,
+            skills,
             input: InputState::new(),
-            messages: vec![DisplayMessage::System(format!(
-                "ftai v{} | Project: {}",
-                env!("CARGO_PKG_VERSION"),
-                project_path.display()
-            ))],
+            messages: vec![DisplayMessage::System(startup_msg)],
             project_path,
+            mode,
             should_quit: false,
             is_generating: false,
             streaming_text: String::new(),
+            token_rx: None,
+            stream_handle: None,
+            scroll_offset: 0,
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Start the backend
-        self.messages.push(DisplayMessage::System(
-            format!("Starting {} backend...", self.backend.backend_name()),
-        ));
-
-        if let Err(e) = self.backend.start(&self.config).await {
-            self.messages
-                .push(DisplayMessage::System(format!("Backend error: {e}")));
-            self.messages.push(DisplayMessage::System(
-                "Running in offline mode. Use /model to configure.".to_string(),
-            ));
-        }
-
-        // Enter TUI mode
+        // Enter TUI mode FIRST so the user can see the splash and exit
         terminal::enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+
+        // Show splash immediately
+        terminal.draw(|frame| self.render(frame))?;
+
+        // Start the backend — this can take a while for large models.
+        // We poll for quit keys during the wait so the user isn't trapped.
+        self.messages.push(DisplayMessage::System(
+            format!("Starting {} backend...", self.backend.backend_name()),
+        ));
+        terminal.draw(|frame| self.render(frame))?;
+
+        let start_result = self.start_backend_interruptible(&mut terminal).await;
+
+        match start_result {
+            Ok(()) => {}
+            Err(StartErr::UserQuit) => {
+                terminal::disable_raw_mode()?;
+                stdout().execute(LeaveAlternateScreen)?;
+                return Ok(());
+            }
+            Err(StartErr::BackendFailed(e)) => {
+                self.messages
+                    .push(DisplayMessage::System(format!("Backend error: {e}")));
+                self.messages.push(DisplayMessage::System(
+                    "Running in offline mode. Use /model to configure.".to_string(),
+                ));
+            }
+        }
 
         let result = self.main_loop(&mut terminal).await;
 
@@ -131,7 +264,42 @@ impl TuiApp {
         terminal::disable_raw_mode()?;
         stdout().execute(LeaveAlternateScreen)?;
 
+        // Intentionally DO NOT stop the backend server here.
+        // Keeping it warm means the next `forge` invocation connects instantly
+        // instead of waiting 30-60s for model reload. The server uses idle
+        // memory that macOS will reclaim under pressure anyway.
+
         result
+    }
+
+    /// Start the backend with Ctrl+C support via tokio::select.
+    async fn start_backend_interruptible(
+        &mut self,
+        _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> std::result::Result<(), StartErr> {
+        // Quick check — maybe a server is already running
+        if self.backend.health_check().await {
+            return Ok(());
+        }
+
+        self.messages.push(DisplayMessage::System(
+            "Loading model... (Ctrl+C to cancel)".to_string(),
+        ));
+
+        // Use tokio::select to race backend start against Ctrl+C signal
+        let config = self.config.clone();
+        tokio::select! {
+            result = self.backend.start(&config) => {
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(StartErr::BackendFailed(e.to_string())),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                self.backend.stop();
+                Err(StartErr::UserQuit)
+            }
+        }
     }
 
     async fn main_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -139,10 +307,48 @@ impl TuiApp {
             // Render
             terminal.draw(|frame| self.render(frame))?;
 
-            // Handle input
-            if event::poll(std::time::Duration::from_millis(50))? {
+            // Poll for key events (non-blocking)
+            if event::poll(std::time::Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     self.handle_key(key).await?;
+                }
+            }
+
+            // Drain any pending streaming tokens
+            if let Some(rx) = &mut self.token_rx {
+                while let Ok(token) = rx.try_recv() {
+                    if token.is_final {
+                        // Stream finished — collect the final response
+                        if let Some(handle) = self.stream_handle.take() {
+                            match handle.await {
+                                Ok(Ok(response)) => {
+                                    // Display accumulated text (cleaned of special tokens)
+                                    let raw = std::mem::take(&mut self.streaming_text);
+                                    let text = Self::clean_model_output(&raw);
+                                    if !text.is_empty() {
+                                        self.messages.push(DisplayMessage::Assistant(text));
+                                    }
+                                    // Process tool calls from the complete response
+                                    self.process_response_after_stream(response).await?;
+                                }
+                                Ok(Err(e)) => {
+                                    self.messages.push(DisplayMessage::System(
+                                        format!("Stream error: {e}"),
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.messages.push(DisplayMessage::System(
+                                        format!("Stream task panicked: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        self.token_rx = None;
+                        self.is_generating = false;
+                        break;
+                    } else {
+                        self.streaming_text.push_str(&token.text);
+                    }
                 }
             }
 
@@ -179,8 +385,14 @@ impl TuiApp {
             frame.buffer_mut(),
         );
 
-        // Messages
-        render::render_messages(&self.messages, layout[1], frame.buffer_mut());
+        // Messages — include streaming text as a live assistant message
+        let mut display_msgs = self.messages.clone();
+        if self.is_generating && !self.streaming_text.is_empty() {
+            display_msgs.push(DisplayMessage::Assistant(
+                format!("{}▊", self.streaming_text),
+            ));
+        }
+        render::render_messages(&display_msgs, self.mode.label(), layout[1], frame.buffer_mut());
 
         // Status line
         render::render_status_line(
@@ -197,7 +409,19 @@ impl TuiApp {
         } else {
             &self.input.lines[self.input.cursor_line]
         };
-        render::render_input(input_text, self.input.cursor_col, layout[3], frame.buffer_mut());
+        let cursor_pos = render::render_input(
+            input_text,
+            self.input.cursor_col,
+            layout[3],
+            frame.buffer_mut(),
+        );
+
+        // Position the terminal cursor inside the input area
+        if !self.is_generating {
+            if let Some((cx, cy)) = cursor_pos {
+                frame.set_cursor_position((cx, cy));
+            }
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -232,39 +456,120 @@ impl TuiApp {
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Left => self.input.move_left(),
             KeyCode::Right => self.input.move_right(),
-            KeyCode::Up => self.input.history_up(),
-            KeyCode::Down => self.input.history_down(),
+            KeyCode::Up => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                } else {
+                    self.input.history_up();
+                }
+            }
+            KeyCode::Down => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                } else {
+                    self.input.history_down();
+                }
+            }
+            KeyCode::PageUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+            }
             KeyCode::Esc => {
                 self.input = InputState::new();
             }
-            KeyCode::Char(c) => self.input.insert_char(c),
+            KeyCode::Char(c) => {
+                self.input.insert_char(c);
+            }
             _ => {}
         }
 
         Ok(())
     }
 
+    /// Known slash commands — anything starting with / that isn't in this
+    /// list gets treated as normal user input (e.g. file paths).
+    const SLASH_COMMANDS: &'static [&'static str] = &[
+        "/help", "/clear", "/compact", "/rules", "/permissions", "/templates",
+        "/config", "/model", "/project", "/memory", "/context", "/plugin",
+        "/hardware", "/chat", "/code", "/skill", "/quit", "/exit",
+    ];
+
     async fn handle_submit(&mut self, text: String) -> Result<()> {
-        // Check for slash commands
+        // Auto-scroll to bottom on new input
+        self.scroll_offset = 0;
+
+        // Bare exit/quit — no slash needed
+        let trimmed = text.trim().to_lowercase();
+        if trimmed == "exit" || trimmed == "quit" {
+            self.should_quit = true;
+            return Ok(());
+        }
+
+        // Only treat as slash command if it matches a known command.
+        // This prevents file paths like "/Users/foo" from being misinterpreted.
         if text.starts_with('/') {
-            return self.handle_slash_command(&text).await;
+            let cmd = text.split_whitespace().next().unwrap_or("");
+            if Self::SLASH_COMMANDS.contains(&cmd) {
+                return self.handle_slash_command(&text).await;
+            }
         }
 
         // Add user message
         self.messages.push(DisplayMessage::User(text.clone()));
         self.engine.add_user_message(&text);
 
-        // Generate response
-        self.is_generating = true;
-        let request = self.engine.build_request(&self.config);
+        // Start the agentic loop
+        self.run_agentic_loop().await
+    }
 
-        match self.backend.generate(&request).await {
-            Ok(response) => {
-                self.process_response(response).await?;
+    /// Agentic loop: generate → parse tool calls → execute → feed results → repeat.
+    /// Uses streaming for the first turn (user sees tokens live), then falls back
+    /// to synchronous generate for tool-result continuations (speed over UX for
+    /// intermediate turns).
+    async fn run_agentic_loop(&mut self) -> Result<()> {
+        const MAX_TURNS: usize = 25;
+
+        for turn in 0..MAX_TURNS {
+            self.engine.compact();
+            self.is_generating = true;
+            let request = self.engine.build_request(&self.config);
+
+            if turn == 0 {
+                // First turn: try streaming for live token display
+                match self.backend.generate_stream(&request).await {
+                    Ok((rx, handle)) => {
+                        self.streaming_text.clear();
+                        self.token_rx = Some(rx);
+                        self.stream_handle = Some(handle);
+                        // Return to main_loop — tokens will be drained there.
+                        // process_response_after_stream will handle continuation.
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Streaming not supported — fall through to sync
+                    }
+                }
             }
-            Err(e) => {
-                self.messages
-                    .push(DisplayMessage::System(format!("Error: {e}")));
+
+            // Sync generate (fallback for first turn, default for continuations)
+            let response = match self.backend.generate(&request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.messages.push(DisplayMessage::System(format!("Error: {e}")));
+                    break;
+                }
+            };
+
+            let has_tool_calls = response.message.tool_calls.as_ref()
+                .map_or(false, |tc| !tc.is_empty())
+                || !self.parser.parse(&response.message.content).1.is_empty();
+
+            self.process_response(response).await?;
+
+            if !has_tool_calls {
+                break;
             }
         }
 
@@ -272,16 +577,79 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Called after streaming completes. Processes tool calls from the streamed
+    /// response and continues the agentic loop synchronously if needed.
+    async fn process_response_after_stream(&mut self, response: ChatResponse) -> Result<()> {
+        let has_tool_calls = response.message.tool_calls.as_ref()
+            .map_or(false, |tc| !tc.is_empty())
+            || !self.parser.parse(&response.message.content).1.is_empty();
+
+        // Text was already displayed during streaming — clear content before
+        // passing to process_response so it doesn't display it again.
+        // Tool calls and engine state are still handled normally.
+        let mut response = response;
+        response.message.content = String::new();
+        self.process_response(response).await?;
+
+        // If there were tool calls, continue the agentic loop (sync for subsequent turns)
+        if has_tool_calls {
+            const MAX_CONTINUATION_TURNS: usize = 24;
+            for _ in 0..MAX_CONTINUATION_TURNS {
+                self.engine.compact();
+                let request = self.engine.build_request(&self.config);
+
+                let response = match self.backend.generate(&request).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.messages.push(DisplayMessage::System(format!("Error: {e}")));
+                        break;
+                    }
+                };
+
+                let more_tools = response.message.tool_calls.as_ref()
+                    .map_or(false, |tc| !tc.is_empty())
+                    || !self.parser.parse(&response.message.content).1.is_empty();
+
+                self.process_response(response).await?;
+
+                if !more_tools {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Strip chat template special tokens from model output.
+    fn clean_model_output(text: &str) -> String {
+        text.replace("<|im_end|>", "")
+            .replace("<|im_start|>", "")
+            .replace("<|end|>", "")
+            .replace("<|endoftext|>", "")
+            .trim()
+            .to_string()
+    }
+
     async fn process_response(&mut self, response: ChatResponse) -> Result<()> {
-        let content = response.message.content.clone();
+        let content = Self::clean_model_output(&response.message.content);
         let tool_calls = response.message.tool_calls.clone();
+
+        // In Chat mode skip tool call parsing — display the full response as text.
+        if self.mode == Mode::Chat {
+            if !content.trim().is_empty() {
+                self.messages.push(DisplayMessage::Assistant(content));
+            }
+            self.engine.add_assistant_message(response);
+            return Ok(());
+        }
 
         // Parse tool calls from text (for prompted mode)
         let (display_text, parsed_calls) = self.parser.parse(&content);
 
         if !display_text.trim().is_empty() {
             self.messages
-                .push(DisplayMessage::Assistant(display_text));
+                .push(DisplayMessage::Assistant(Self::clean_model_output(&display_text)));
         }
 
         self.engine.add_assistant_message(response);
@@ -366,24 +734,74 @@ impl TuiApp {
                     self.engine.add_tool_result(&call.id, &format!("BLOCKED: {reason}"));
                 }
                 RuleAction::Allow | RuleAction::Modify(_) => {
+                    // Run pre-hooks
+                    let pre_event = format!("pre:{}", call.name);
+                    let pre_hooks = self.plugin_manager.get_hooks(&pre_event);
+                    let params_json = serde_json::to_string(&call.arguments).unwrap_or_default();
+                    let mut hook_blocked = false;
+
+                    for hook in &pre_hooks {
+                        match crate::plugins::hooks::run_pre_hook(
+                            hook,
+                            &call.name,
+                            &params_json,
+                            &self.project_path,
+                        ).await {
+                            crate::plugins::hooks::HookResult::Blocked(msg) => {
+                                self.messages.push(DisplayMessage::System(
+                                    format!("Hook blocked {}: {msg}", call.name),
+                                ));
+                                self.engine.add_tool_result(&call.id, &format!("BLOCKED by hook: {msg}"));
+                                hook_blocked = true;
+                                break;
+                            }
+                            crate::plugins::hooks::HookResult::Error(msg) => {
+                                self.messages.push(DisplayMessage::System(
+                                    format!("Hook error: {msg}"),
+                                ));
+                            }
+                            crate::plugins::hooks::HookResult::Passed => {}
+                        }
+                    }
+
+                    if hook_blocked {
+                        continue;
+                    }
+
                     let ctx = ToolContext {
                         cwd: self.project_path.clone(),
                         project_path: self.project_path.clone(),
                     };
 
+                    let args_summary = summarize_args(&call.arguments);
                     match self.tools.execute(&call.name, call.arguments.clone(), &ctx).await {
                         Ok(result) => {
                             self.messages.push(DisplayMessage::ToolCall {
                                 name: call.name.clone(),
+                                args_summary: args_summary.clone(),
                                 result: result.output.clone(),
                                 is_error: result.is_error,
                             });
                             self.engine.add_tool_result(&call.id, &result.output);
+
+                            // Run post-hooks
+                            let post_event = format!("post:{}", call.name);
+                            let post_hooks = self.plugin_manager.get_hooks(&post_event);
+                            for hook in &post_hooks {
+                                let _ = crate::plugins::hooks::run_post_hook(
+                                    hook,
+                                    &call.name,
+                                    &params_json,
+                                    &result.output,
+                                    &self.project_path,
+                                ).await;
+                            }
                         }
                         Err(e) => {
                             let err = format!("Tool error: {e}");
                             self.messages.push(DisplayMessage::ToolCall {
                                 name: call.name.clone(),
+                                args_summary,
                                 result: err.clone(),
                                 is_error: true,
                             });
@@ -501,14 +919,80 @@ impl TuiApp {
         }
     }
 
+    /// Switch to a new mode, rebuilding the system prompt accordingly.
+    fn switch_mode(&mut self, new_mode: Mode) {
+        if self.mode == new_mode {
+            return;
+        }
+
+        let memory = prompt::load_memory_context(&self.project_path);
+        let ftai_context = prompt::load_ftai_context(&self.project_path);
+
+        let new_system_prompt = match new_mode {
+            Mode::Coding => {
+                let tool_defs = self.tools.tool_definitions();
+                let rules_summary = if self.rules.rule_count() > 0 {
+                    Some(self.rules.summary())
+                } else {
+                    None
+                };
+                let skills_prompt = if !self.skills.is_empty() {
+                    let mut out = String::from("Available skills via slash commands:\n\n");
+                    for skill in &self.skills {
+                        out.push_str(&format!(
+                            "- `{}` ({}) — {}\n",
+                            skill.trigger, skill.source, skill.description
+                        ));
+                    }
+                    Some(out)
+                } else {
+                    None
+                };
+                prompt::build_system_prompt(
+                    &self.project_path,
+                    &tool_defs,
+                    rules_summary.as_deref(),
+                    memory.as_deref(),
+                    Some(&self.templates),
+                    &self.config.formatting.enabled,
+                    ftai_context.as_deref(),
+                    skills_prompt.as_deref(),
+                )
+            }
+            Mode::Chat => prompt::build_chat_system_prompt(
+                memory.as_deref(),
+                ftai_context.as_deref(),
+            ),
+        };
+
+        self.engine.update_system_prompt(new_system_prompt);
+        self.mode = new_mode;
+    }
+
     async fn handle_slash_command(&mut self, text: &str) -> Result<()> {
+        // Show the command as user input and scroll to bottom
+        self.messages.push(DisplayMessage::User(text.trim().to_string()));
+        self.scroll_offset = 0;
+
         let parts: Vec<&str> = text.trim().split_whitespace().collect();
         let cmd = parts[0];
 
         match cmd {
             "/help" => {
                 self.messages.push(DisplayMessage::System(
-                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /hardware /quit".to_string(),
+                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /chat /code /quit".to_string(),
+                ));
+            }
+            "/chat" => {
+                self.switch_mode(Mode::Chat);
+                self.messages.push(DisplayMessage::System(
+                    "Switched to chat mode. General conversation — tools available on explicit request only.".to_string(),
+                ));
+            }
+            "/code" => {
+                self.switch_mode(Mode::Coding);
+                self.messages.push(DisplayMessage::System(
+                    "Switched to coding mode. Full agentic loop with tools and project context active.".to_string(),
                 ));
             }
             "/clear" => {
@@ -659,16 +1143,339 @@ impl TuiApp {
                     hw.arch, hw.gpu, hw.ram_gb, rec.name, rec.backend, rec.size_gb
                 )));
             }
+            "/plugin" => {
+                match parts.get(1).copied() {
+                    Some("list") => {
+                        let plugins = self.plugin_manager.list();
+                        if plugins.is_empty() {
+                            self.messages.push(DisplayMessage::System("No plugins installed.".to_string()));
+                        } else {
+                            let mut info = String::from("Installed plugins:\n");
+                            for p in plugins {
+                                info.push_str(&format!(
+                                    "  {} v{} — {}\n",
+                                    p.manifest.plugin.name,
+                                    p.manifest.plugin.version,
+                                    p.manifest.plugin.description,
+                                ));
+                            }
+                            self.messages.push(DisplayMessage::System(info));
+                        }
+                    }
+                    Some("install") => {
+                        if let Some(source) = parts.get(2) {
+                            let result = if source.starts_with("http://") || source.starts_with("https://") || source.contains("github.com") {
+                                self.plugin_manager.install_from_git(source)
+                            } else {
+                                self.plugin_manager.install_from_path(std::path::Path::new(source))
+                            };
+                            match result {
+                                Ok(name) => self.messages.push(DisplayMessage::System(
+                                    format!("Installed plugin: {name}"),
+                                )),
+                                Err(e) => self.messages.push(DisplayMessage::System(
+                                    format!("Install failed: {e}"),
+                                )),
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /plugin install <git-url-or-path>".to_string(),
+                            ));
+                        }
+                    }
+                    Some("uninstall") => {
+                        if let Some(name) = parts.get(2) {
+                            match self.plugin_manager.uninstall(name) {
+                                Ok(_) => self.messages.push(DisplayMessage::System(
+                                    format!("Uninstalled plugin: {name}"),
+                                )),
+                                Err(e) => self.messages.push(DisplayMessage::System(
+                                    format!("Uninstall failed: {e}"),
+                                )),
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /plugin uninstall <name>".to_string(),
+                            ));
+                        }
+                    }
+                    Some("search") => {
+                        if let Some(query) = parts.get(2) {
+                            let registry_url = self.config.plugins.registry_url.as_deref();
+                            let client = crate::plugins::registry::RegistryClient::new(registry_url);
+                            match client.search(query).await {
+                                Ok(results) => {
+                                    if results.is_empty() {
+                                        self.messages.push(DisplayMessage::System(
+                                            format!("No plugins found matching '{query}'"),
+                                        ));
+                                    } else {
+                                        let mut info = format!("Registry results for '{query}':\n");
+                                        for r in &results {
+                                            info.push_str(&format!(
+                                                "  {} v{} — {} ({})\n",
+                                                r.name, r.version, r.description, r.repo,
+                                            ));
+                                        }
+                                        self.messages.push(DisplayMessage::System(info));
+                                    }
+                                }
+                                Err(e) => self.messages.push(DisplayMessage::System(
+                                    format!("Registry search failed: {e}"),
+                                )),
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /plugin search <query>".to_string(),
+                            ));
+                        }
+                    }
+                    Some("info") => {
+                        if let Some(name) = parts.get(2) {
+                            // Check local first
+                            let local = self.plugin_manager.list().iter().find(|p| p.manifest.plugin.name == *name);
+                            if let Some(p) = local {
+                                let mut info = format!(
+                                    "Plugin: {} v{}\nAuthor: {}\nDescription: {}\nTools: {}\nSkills: {}\nHooks: {}\n",
+                                    p.manifest.plugin.name,
+                                    p.manifest.plugin.version,
+                                    p.manifest.plugin.author,
+                                    p.manifest.plugin.description,
+                                    p.manifest.tools.len(),
+                                    p.manifest.skills.len(),
+                                    p.manifest.hooks.len(),
+                                );
+                                if let Some(reg) = &p.manifest.registry {
+                                    if let Some(repo) = &reg.repo {
+                                        info.push_str(&format!("Repo: {repo}\n"));
+                                    }
+                                }
+                                self.messages.push(DisplayMessage::System(info));
+                            } else {
+                                self.messages.push(DisplayMessage::System(
+                                    format!("Plugin '{name}' not installed locally."),
+                                ));
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /plugin info <name>".to_string(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.messages.push(DisplayMessage::System(
+                            "Usage: /plugin <list|install|uninstall|search|info>".to_string(),
+                        ));
+                    }
+                }
+            }
+            "/skill" => {
+                if self.skills.is_empty() {
+                    self.messages.push(DisplayMessage::System("No skills available.".to_string()));
+                } else if let Some(skill_name) = parts.get(1) {
+                    let trigger = if skill_name.starts_with('/') {
+                        skill_name.to_string()
+                    } else {
+                        format!("/{skill_name}")
+                    };
+                    if let Some(skill) = crate::skills::loader::find_skill_by_trigger(&self.skills, &trigger) {
+                        self.messages.push(DisplayMessage::System(
+                            format!("Skill '{}' activated. Content injected into context.", skill.name),
+                        ));
+                        self.engine.add_system_context(&format!(
+                            "# Skill: {}\n{}", skill.name, skill.content
+                        ));
+                    } else {
+                        self.messages.push(DisplayMessage::System(
+                            format!("Unknown skill: {skill_name}. Use /skill to list available skills."),
+                        ));
+                    }
+                } else {
+                    let mut info = String::from("Available skills:\n");
+                    for skill in &self.skills {
+                        info.push_str(&format!(
+                            "  {} — {} [{}]\n",
+                            skill.trigger, skill.description, skill.source
+                        ));
+                    }
+                    self.messages.push(DisplayMessage::System(info));
+                }
+            }
+            "/context" => {
+                match parts.get(1).copied() {
+                    Some("init") => {
+                        let ftai_dir = self.project_path.join(".ftai");
+                        let _ = std::fs::create_dir_all(&ftai_dir);
+                        let ftai_md = ftai_dir.join("FTAI.md");
+                        if ftai_md.exists() {
+                            self.messages.push(DisplayMessage::System(
+                                "FTAI.md already exists. Use /context edit to modify.".to_string(),
+                            ));
+                        } else {
+                            let project_name = self.project_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "my-project".to_string());
+                            let template = format!(
+                                "# Project: {project_name}\n\n\
+                                 ## Stack\n<!-- Languages, frameworks, build tools -->\n\n\
+                                 ## Conventions\n<!-- Code style, patterns, naming conventions -->\n\n\
+                                 ## Architecture\n<!-- Key directories, module structure, data flow -->\n\n\
+                                 ## Testing\n<!-- How to run tests, what frameworks, coverage expectations -->\n\n\
+                                 ## Gotchas\n<!-- Known issues, quirks, things to watch out for -->\n"
+                            );
+                            match std::fs::write(&ftai_md, &template) {
+                                Ok(_) => self.messages.push(DisplayMessage::System(
+                                    format!("Created {}", ftai_md.display()),
+                                )),
+                                Err(e) => self.messages.push(DisplayMessage::System(
+                                    format!("Error creating FTAI.md: {e}"),
+                                )),
+                            }
+                        }
+                    }
+                    Some("edit") => {
+                        let ftai_md = self.project_path.join(".ftai").join("FTAI.md");
+                        if !ftai_md.exists() {
+                            self.messages.push(DisplayMessage::System(
+                                "No FTAI.md found. Use /context init to create one.".to_string(),
+                            ));
+                        } else {
+                            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+                            let _ = terminal::disable_raw_mode();
+                            let _ = stdout().execute(LeaveAlternateScreen);
+                            let _ = std::process::Command::new(&editor).arg(&ftai_md).status();
+                            let _ = stdout().execute(EnterAlternateScreen);
+                            let _ = terminal::enable_raw_mode();
+                            self.messages.push(DisplayMessage::System("FTAI.md updated.".to_string()));
+                        }
+                    }
+                    _ => {
+                        // Show current FTAI.md content
+                        match prompt::load_ftai_context(&self.project_path) {
+                            Some(ctx) => self.messages.push(DisplayMessage::System(ctx)),
+                            None => self.messages.push(DisplayMessage::System(
+                                "No FTAI.md found. Use /context init to create one.".to_string(),
+                            )),
+                        }
+                    }
+                }
+            }
             "/quit" | "/exit" => {
                 self.should_quit = true;
             }
             _ => {
-                self.messages.push(DisplayMessage::System(
-                    format!("Unknown command: {cmd}. Type /help for available commands."),
-                ));
+                // Check if the command matches a skill trigger
+                if let Some(skill) = crate::skills::loader::find_skill_by_trigger(&self.skills, cmd) {
+                    self.messages.push(DisplayMessage::System(
+                        format!("Loaded skill: {}", skill.description),
+                    ));
+                    self.engine.add_system_context(&format!(
+                        "# Skill: {}\n{}", skill.name, skill.content
+                    ));
+                } else {
+                    self.messages.push(DisplayMessage::System(
+                        format!("Unknown command: {cmd}. Type /help for available commands."),
+                    ));
+                }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Produce a short summary of tool call arguments (first 80 chars of the JSON).
+fn summarize_args(args: &serde_json::Value) -> String {
+    let s = args.to_string();
+    if s == "{}" || s == "null" {
+        return String::new();
+    }
+    if s.len() <= 80 {
+        s
+    } else {
+        let mut truncated: String = s.chars().take(77).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ── Mode enum ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mode_label() {
+        assert_eq!(Mode::Coding.label(), "coding");
+        assert_eq!(Mode::Chat.label(), "chat");
+    }
+
+    #[test]
+    fn test_mode_equality() {
+        assert_eq!(Mode::Coding, Mode::Coding);
+        assert_eq!(Mode::Chat, Mode::Chat);
+        assert_ne!(Mode::Coding, Mode::Chat);
+    }
+
+    // ── Auto-detection ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_mode_with_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        assert_eq!(detect_mode(tmp.path()), Mode::Coding);
+    }
+
+    #[test]
+    fn test_detect_mode_with_ftai() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ftai")).unwrap();
+        assert_eq!(detect_mode(tmp.path()), Mode::Coding);
+    }
+
+    #[test]
+    fn test_detect_mode_empty_dir_is_chat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(detect_mode(tmp.path()), Mode::Chat);
+    }
+
+    #[test]
+    fn test_detect_mode_nonexistent_path_is_chat() {
+        let path = PathBuf::from("/tmp/ftai-test-nonexistent-12345xyz");
+        assert_eq!(detect_mode(&path), Mode::Chat);
+    }
+
+    #[test]
+    fn test_detect_mode_both_git_and_ftai_is_coding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ftai")).unwrap();
+        assert_eq!(detect_mode(tmp.path()), Mode::Coding);
+    }
+
+    // ── Security red tests (P0) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_mode_path_traversal_in_dir_name_stays_safe() {
+        // A directory literally named ".git" triggers Coding — that is correct behaviour.
+        // We verify that a path with traversal components does not panic or produce
+        // unexpected results (Rust's Path API normalises the components).
+        let path = PathBuf::from("/tmp/../tmp/ftai-no-git-here-xyz");
+        // This non-existent path has no .git or .ftai -> Chat
+        assert_eq!(detect_mode(&path), Mode::Chat);
+    }
+
+    #[test]
+    fn test_mode_switch_label_reflects_change() {
+        // Verify Mode variants switch correctly through the label
+        let mut m = Mode::Coding;
+        assert_eq!(m.label(), "coding");
+        m = Mode::Chat;
+        assert_eq!(m.label(), "chat");
+        m = Mode::Coding;
+        assert_eq!(m.label(), "coding");
     }
 }
