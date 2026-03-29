@@ -454,4 +454,82 @@ mode = "ask"
         assert!(!dir_name.contains('/'));
         assert!(!dir_name.starts_with('-'));
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_security_path_traversal_in_model_path() {
+        // P0 security red test
+        // Config with path traversal in model path loads without executing anything
+        let toml_str = r#"
+[model]
+path = "../../etc/passwd"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.model.path, Some("../../etc/passwd".to_string()));
+        // The path is stored but never executed at config-load time — verification
+        // happens at model-load time. This is safe by design.
+    }
+
+    #[test]
+    fn test_security_extremely_long_strings_no_panic() {
+        // P0 security red test
+        // Config with 1MB strings doesn't panic during parse
+        let long_string = "a".repeat(1_000_000);
+        let toml_str = format!(
+            r#"
+[model]
+path = "{long_string}"
+"#
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.model.path.as_ref().unwrap().len(), 1_000_000);
+    }
+
+    #[test]
+    fn test_security_yolo_mode_parses() {
+        // P0 security red test
+        // PermissionMode::Yolo loads correctly — hard block enforcement is tested
+        // at the permission gate layer, not here, but we verify it round-trips.
+        let toml_str = r#"
+[permissions]
+mode = "yolo"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.permissions.mode, PermissionMode::Yolo);
+    }
+
+    #[test]
+    fn test_security_null_bytes_in_project_path() {
+        // P0 security red test
+        // project_config_dir with null bytes in path doesn't panic
+        let path = Path::new("/some/path\x00with/null");
+        let result = project_config_dir(path);
+        // Should succeed — the null byte gets replaced during lossy conversion
+        assert!(result.is_ok());
+        let dir = result.unwrap();
+        let dir_name = dir.file_name().unwrap().to_string_lossy();
+        // Must not contain path separators
+        assert!(!dir_name.contains('/'));
+    }
+
+    #[test]
+    fn test_security_malformed_toml_returns_error() {
+        // P0 security red test
+        // Malformed TOML returns Err, never panics
+        let unclosed_string = "x = \"".to_string();
+        let bad_inputs = vec![
+            "[model",                           // unclosed section
+            "key = ",                            // missing value
+            "[[[nested]]]",                      // triple bracket
+            "= value",                           // missing key
+            "\x00\x01\x02",                      // binary garbage
+            &unclosed_string,                    // unclosed string
+            "[model]\nbackend = 42",             // wrong type for enum
+        ];
+        for input in bad_inputs {
+            let result: Result<Config, _> = toml::from_str(input);
+            assert!(result.is_err(), "Expected error for malformed TOML: {:?}", input);
+        }
+    }
 }

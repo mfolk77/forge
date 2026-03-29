@@ -19,7 +19,7 @@ use config::{ensure_ftai_dirs, load_config};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ftai", version, about = "FolkTech AI terminal coding harness")]
+#[command(name = "forge", version, about = "FolkTech AI terminal coding harness")]
 struct Cli {
     /// Project directory (defaults to current directory)
     #[arg(short, long)]
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
                 match status {
                     Ok(s) if s.success() => {
                         println!("Model installed to {}", dest.display());
-                        println!("Activate with: ftai model use {name}");
+                        println!("Activate with: forge model use {name}");
                     }
                     _ => {
                         // Clean up empty dir
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
                                 eprintln!("  {m}");
                             }
                         } else {
-                            eprintln!("No models installed. Use: ftai model install <name>");
+                            eprintln!("No models installed. Use: forge model install <name>");
                         }
                     }
                     std::process::exit(1);

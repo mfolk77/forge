@@ -52,7 +52,7 @@ impl BackendManager {
             .model
             .path
             .as_deref()
-            .context("No model path configured. Run `ftai model install` or set model.path in config.")?;
+            .context("No model path configured. Run `forge model install` or set model.path in config.")?;
 
         match self {
             BackendManager::LlamaCpp(server) => {

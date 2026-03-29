@@ -592,4 +592,98 @@ rule "no-wip" {
         assert!(summary.contains("no-wip"));
         assert!(summary.contains("REJECT"));
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_security_regex_catastrophic_backtracking() {
+        // P0 security red test
+        // A regex pattern designed for catastrophic backtracking must not hang
+        // the matches() builtin. The builtin uses regex::Regex which has linear-time
+        // guarantees, but we verify the engine doesn't hang.
+        let mut engine = RulesEngine::new();
+        engine
+            .load(r#"
+rule "evil-regex" {
+  on commit
+  reject matches(message, "(a+)+b")
+  reason "Blocked"
+}
+"#)
+            .unwrap();
+
+        let mut ctx = EvalContext::new(Event::Commit);
+        // Input designed to trigger catastrophic backtracking in naive engines
+        ctx.set_str("message", &"a".repeat(30));
+
+        // Should complete quickly — regex crate has linear-time guarantee
+        let result = engine.evaluate(&ctx, None);
+        // The pattern won't match (no trailing 'b'), so rule passes
+        assert_eq!(result, RuleAction::Allow);
+    }
+
+    #[test]
+    fn test_security_extremely_long_string_literals() {
+        // P0 security red test
+        // Rules with very long string literals must not crash the parser or evaluator
+        let long_string = "x".repeat(100_000);
+        let rule_text = format!(
+            r#"
+rule "long-rule" {{
+  on commit
+  reject contains(message, "{long_string}")
+  reason "Blocked"
+}}
+"#
+        );
+        let mut engine = RulesEngine::new();
+        let result = engine.load(&rule_text);
+        // Should either parse successfully or return a clean error
+        if let Ok(_) = result {
+            let mut ctx = EvalContext::new(Event::Commit);
+            ctx.set_str("message", "short");
+            let action = engine.evaluate(&ctx, None);
+            assert_eq!(action, RuleAction::Allow);
+        }
+        // No panic = pass
+    }
+
+    #[test]
+    fn test_security_deeply_nested_boolean_no_stack_overflow() {
+        // P0 security red test
+        // Deeply nested boolean expressions in the evaluator must not stack overflow.
+        // We build a deeply nested Expression tree manually since the parser may
+        // limit nesting depth.
+        let mut expr: Expression = Expression::BoolLit(true);
+        for _ in 0..100 {
+            expr = Expression::BinOp {
+                left: Box::new(expr),
+                op: BinOperator::And,
+                right: Box::new(Expression::BoolLit(true)),
+            };
+        }
+        let ctx = EvalContext::new(Event::Commit);
+        let result = eval_to_bool(&expr, &ctx);
+        assert!(result, "Deeply nested AND(true, true, ...) should evaluate to true");
+    }
+
+    #[test]
+    fn test_security_rule_name_with_brace_injection() {
+        // P0 security red test
+        // A rule "name" containing `}` must not break the parser
+        let rule_text = r#"
+rule "name-with-}-brace" {
+  on commit
+  reject false
+}
+"#;
+        let mut engine = RulesEngine::new();
+        let result = engine.load(rule_text);
+        // Parser may reject this or handle it — either is fine, no panic
+        // If it parses, the rule name should be preserved
+        if let Ok(count) = result {
+            assert!(count >= 1);
+        }
+        // No panic = pass
+    }
 }

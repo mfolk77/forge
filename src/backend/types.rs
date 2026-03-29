@@ -361,4 +361,68 @@ mod tests {
         assert!(json.contains("file_read"));
         assert!(json.contains("/foo/bar.rs"));
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_security_hardware_detect_no_panic() {
+        // P0 security red test
+        // HardwareInfo::detect() must never panic regardless of platform
+        let hw = HardwareInfo::detect();
+        // Sanity: ram_gb should be a reasonable value (not garbage)
+        assert!(hw.ram_gb <= 1024 * 1024, "RAM detection returned unreasonable value");
+    }
+
+    #[test]
+    fn test_security_recommended_model_always_valid_name() {
+        // P0 security red test
+        // recommended_model() must return a non-empty model name for every hardware combo
+        let combos = vec![
+            HardwareInfo { arch: CpuArch::AppleSilicon, gpu: GpuType::Metal, ram_gb: 8 },
+            HardwareInfo { arch: CpuArch::AppleSilicon, gpu: GpuType::Metal, ram_gb: 16 },
+            HardwareInfo { arch: CpuArch::AppleSilicon, gpu: GpuType::Metal, ram_gb: 32 },
+            HardwareInfo { arch: CpuArch::AppleSilicon, gpu: GpuType::Metal, ram_gb: 64 },
+            HardwareInfo { arch: CpuArch::X86_64, gpu: GpuType::Cuda { vram_gb: 8 }, ram_gb: 16 },
+            HardwareInfo { arch: CpuArch::X86_64, gpu: GpuType::Cuda { vram_gb: 24 }, ram_gb: 32 },
+            HardwareInfo { arch: CpuArch::X86_64, gpu: GpuType::None, ram_gb: 4 },
+            HardwareInfo { arch: CpuArch::X86_64, gpu: GpuType::None, ram_gb: 16 },
+            HardwareInfo { arch: CpuArch::Other("riscv".to_string()), gpu: GpuType::None, ram_gb: 8 },
+            HardwareInfo { arch: CpuArch::Other("".to_string()), gpu: GpuType::None, ram_gb: 0 },
+        ];
+        for hw in combos {
+            let rec = hw.recommended_model();
+            assert!(!rec.name.is_empty(), "Empty model name for {:?}", hw);
+            assert!(rec.size_gb > 0, "Zero size for {:?}", hw);
+        }
+    }
+
+    #[test]
+    fn test_security_chat_request_empty_messages_no_panic() {
+        // P0 security red test
+        // ChatRequest with empty messages vec must not panic on construction or access
+        let req = ChatRequest {
+            messages: vec![],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: None,
+            model_id: None,
+        };
+        assert!(req.messages.is_empty());
+        assert!(req.tools.is_empty());
+    }
+
+    #[test]
+    fn test_security_token_usage_overflow() {
+        // P0 security red test
+        // TokenUsage with usize::MAX values must not panic (wrapping behavior is acceptable)
+        let usage = TokenUsage {
+            prompt_tokens: usize::MAX,
+            completion_tokens: usize::MAX,
+        };
+        // This will wrap on overflow in release mode; in debug mode Rust panics on
+        // overflow by default. We use wrapping_add to verify the expected behavior.
+        let total = usage.prompt_tokens.wrapping_add(usage.completion_tokens);
+        // Just verify we can compute it without UB
+        assert!(total < usize::MAX, "wrapping addition should produce a smaller value");
+    }
 }

@@ -173,4 +173,62 @@ mod tests {
         assert!(!is_valid_skill_name("name\x00null"));
         assert!(!is_valid_skill_name("name\nnewline"));
     }
+
+    // ── P0 Security Red Tests (additional) ─────────────────────────────────
+
+    #[test]
+    fn test_security_all_skill_content_valid_utf8() {
+        // P0 security red test
+        // include_str! guarantees UTF-8 at compile time, but we explicitly verify
+        // that all content is valid UTF-8 strings at runtime too
+        let skills = builtin_skills();
+        for skill in &skills {
+            // .as_bytes() + from_utf8 is a runtime check
+            assert!(
+                std::str::from_utf8(skill.content.as_bytes()).is_ok(),
+                "Skill '{}' content is not valid UTF-8",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_security_skill_content_no_tool_call_markers() {
+        // P0 security red test
+        // Skill content must not contain patterns that could be confused with
+        // actual tool call invocations in the conversation stream
+        let skills = builtin_skills();
+        let dangerous_patterns = [
+            "<tool_call>",
+            "<function_call>",
+            "</tool_call>",
+            "</function_call>",
+            "\"type\": \"function\"",  // OpenAI-style function call JSON
+        ];
+        for skill in &skills {
+            for pattern in &dangerous_patterns {
+                assert!(
+                    !skill.content.contains(pattern),
+                    "Skill '{}' contains dangerous tool call marker: {}",
+                    skill.name,
+                    pattern
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_security_skill_content_size_limit() {
+        // P0 security red test
+        // No skill content should exceed 100KB to prevent context window stuffing
+        let skills = builtin_skills();
+        for skill in &skills {
+            assert!(
+                skill.content.len() <= 100 * 1024,
+                "Skill '{}' exceeds 100KB: {} bytes",
+                skill.name,
+                skill.content.len()
+            );
+        }
+    }
 }

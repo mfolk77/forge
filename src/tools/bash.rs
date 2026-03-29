@@ -363,4 +363,97 @@ mod tests {
         assert!(result.output.contains("safe"));
         assert!(result.output.contains("injected"));
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_security_backtick_injection_passes_to_shell() {
+        // P0 security red test
+        // Backticks are interpreted by the shell — this is by design since BashTool
+        // IS a shell. The permission system is the security boundary, not escaping.
+        let tool = BashTool::new();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo `echo nested`"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // The shell should have evaluated the backtick expression
+        assert!(result.output.contains("nested"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_security_null_byte_in_command() {
+        // P0 security red test
+        // Null byte in command string — bash should handle this gracefully
+        let tool = BashTool::new();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo before\x00after"}), &ctx())
+            .await
+            .unwrap();
+        // Should not panic — bash may truncate at null or pass through
+        // The important thing is no crash
+        assert!(result.output.contains("before") || result.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_security_cd_path_traversal_is_legitimate() {
+        // P0 security red test
+        // cd ../../.. is a legitimate shell operation — verify it works, not blocked
+        let tool = BashTool::new();
+        let result = tool
+            .execute(serde_json::json!({"command": "cd / && pwd"}), &ctx())
+            .await
+            .unwrap();
+        // cd to root is valid
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_security_empty_command_returns_error() {
+        // P0 security red test
+        // Empty command must return error, not panic
+        let tool = BashTool::new();
+
+        // Completely empty
+        let result = tool
+            .execute(serde_json::json!({"command": ""}), &ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+
+        // Missing command key
+        let result = tool
+            .execute(serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+
+        // Null command
+        let result = tool
+            .execute(serde_json::json!({"command": null}), &ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_security_very_long_command_no_hang() {
+        // P0 security red test
+        // 100KB command string doesn't hang or crash (with short timeout)
+        let tool = BashTool::new();
+        let long_cmd = format!("echo {}", "A".repeat(100_000));
+        let result = tool
+            .execute(
+                serde_json::json!({"command": long_cmd, "timeout_ms": 5000}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        // Should succeed or timeout — either is acceptable, no panic/hang
+        assert!(!result.output.is_empty());
+    }
 }

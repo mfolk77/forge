@@ -586,4 +586,112 @@ mod tests {
         let pos = render_input("hello", 100, area, &mut buf);
         assert_eq!(pos, None);
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_security_render_extremely_long_messages() {
+        // P0 security red test
+        // 100K character messages must not panic during render
+        let long_text = "x".repeat(100_000);
+        let messages = vec![
+            DisplayMessage::User("trigger".to_string()),
+            DisplayMessage::Assistant(long_text),
+        ];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_messages(&messages, "coding", area, &mut buf);
+        // No panic = pass
+    }
+
+    #[test]
+    fn test_security_render_unicode_emoji() {
+        // P0 security red test
+        // Unicode and emoji in messages must not panic
+        let messages = vec![
+            DisplayMessage::User("trigger".to_string()),
+            DisplayMessage::Assistant(
+                "Hello \u{1F600}\u{1F4A9} \u{1F680} \u{2764}\u{FE0F} \u{1F1FA}\u{1F1F8} \u{0000} \u{FFFF}".to_string()
+            ),
+        ];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_messages(&messages, "coding", area, &mut buf);
+    }
+
+    #[test]
+    fn test_security_render_ansi_escape_codes() {
+        // P0 security red test
+        // ANSI escape codes in message text must not break TUI rendering
+        let ansi_text = "\x1b[31mred\x1b[0m \x1b[1mbold\x1b[0m \x1b[38;2;255;0;0mrgb\x1b[0m \x1b[2J\x1b[H";
+        let messages = vec![
+            DisplayMessage::User("trigger".to_string()),
+            DisplayMessage::Assistant(ansi_text.to_string()),
+        ];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_messages(&messages, "coding", area, &mut buf);
+    }
+
+    #[test]
+    fn test_security_tool_call_empty_fields() {
+        // P0 security red test
+        // DisplayMessage::ToolCall with all empty fields must not panic
+        let messages = vec![
+            DisplayMessage::User("trigger".to_string()),
+            DisplayMessage::ToolCall {
+                name: String::new(),
+                args_summary: String::new(),
+                result: String::new(),
+                is_error: false,
+            },
+            DisplayMessage::ToolCall {
+                name: String::new(),
+                args_summary: String::new(),
+                result: String::new(),
+                is_error: true,
+            },
+        ];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_messages(&messages, "coding", area, &mut buf);
+    }
+
+    #[test]
+    fn test_security_malicious_markdown() {
+        // P0 security red test
+        // Malicious markdown patterns must not panic or hang
+        let long_bold = format!("**{}**", "a".repeat(50_000));
+        let many_headers = "# \n".repeat(1000);
+        let deep_bullets = "    - nested\n".repeat(500);
+        let test_cases = vec![
+            // Unclosed code block
+            "```\ncode without closing fence",
+            // Deeply nested headers (not real markdown but shouldn't crash)
+            "# # # # # # # # # # # # deeply nested",
+            // Many unclosed backticks
+            "` ` ` ` ` ` ` ` ` ` ` ` ` ` ` `",
+            // Unclosed bold markers
+            "**unclosed bold **another** more **",
+            // Mixed unclosed markers
+            "**bold `code **still bold`",
+            // Very long single line with markers
+            long_bold.as_str(),
+            // Many empty headers
+            many_headers.as_str(),
+            // Code block with special characters
+            "```\n\x1b[31m\x00\n```",
+            // Bullet list with deeply indented items
+            deep_bullets.as_str(),
+        ];
+
+        for (i, input) in test_cases.iter().enumerate() {
+            let lines = parse_markdown_lines(input);
+            // Just verify no panic — the output format doesn't matter
+            assert!(
+                lines.len() > 0 || input.is_empty(),
+                "Test case {i} produced no output for non-empty input"
+            );
+        }
+    }
 }

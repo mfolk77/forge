@@ -194,4 +194,94 @@ mod tests {
         assert!(reg.get("web_fetch").is_some());
         assert!(reg.get("ask_user").is_some());
     }
+
+    // ── P0 Security Red Tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_security_execute_unknown_tool_returns_error() {
+        // P0 security red test
+        // Executing a non-existent tool must return Err, not panic
+        let reg = ToolRegistry::new();
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        let result = reg.execute("does_not_exist", serde_json::json!({}), &ctx).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_security_execute_with_malformed_json_params() {
+        // P0 security red test
+        // Null and malformed JSON params must not panic
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool);
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        // null params
+        let result = reg.execute("dummy", serde_json::Value::Null, &ctx).await;
+        assert!(result.is_ok()); // DummyTool ignores params
+
+        // array instead of object
+        let result = reg.execute("dummy", serde_json::json!([1, 2, 3]), &ctx).await;
+        assert!(result.is_ok());
+
+        // deeply nested object
+        let deep = serde_json::json!({"a": {"b": {"c": {"d": {"e": "deep"}}}}});
+        let result = reg.execute("dummy", deep, &ctx).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_security_tool_name_with_path_traversal() {
+        // P0 security red test
+        // Tool names containing path traversal characters don't cause filesystem issues
+        let reg = ToolRegistry::new();
+        // Lookup of traversal names must return None
+        assert!(reg.get("../../../etc/passwd").is_none());
+        assert!(reg.get("tool/../../secret").is_none());
+        assert!(reg.get("").is_none());
+        assert!(reg.get("\x00").is_none());
+
+        // Verify default tools don't have suspicious names
+        let defaults = ToolRegistry::with_defaults();
+        for name in defaults.tool_names() {
+            assert!(!name.contains(".."), "Tool name contains path traversal: {}", name);
+            assert!(!name.contains('/'), "Tool name contains slash: {}", name);
+            assert!(!name.contains('\\'), "Tool name contains backslash: {}", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_security_concurrent_tool_execution() {
+        // P0 security red test
+        // Multiple concurrent executions of the same tool don't race
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool);
+        let reg = std::sync::Arc::new(reg);
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let reg = reg.clone();
+            handles.push(tokio::spawn(async move {
+                let ctx = ToolContext {
+                    cwd: PathBuf::from("/tmp"),
+                    project_path: PathBuf::from("/tmp"),
+                };
+                reg.execute("dummy", serde_json::json!({}), &ctx).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().output, "done");
+        }
+    }
 }
