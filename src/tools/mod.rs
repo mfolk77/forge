@@ -9,5 +9,7 @@ pub mod git;
 pub mod web_fetch;
 pub mod ask_user;
 pub mod request_permissions;
+pub mod execution_log;
+pub mod validator;
 
 pub use registry::{Tool, ToolContext, ToolResult, ToolRegistry};

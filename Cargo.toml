@@ -1,9 +1,13 @@
 [package]
-name = "ftai"
+name = "forge"
 version = "0.1.0"
 edition = "2021"
 description = "FolkTech AI terminal coding harness"
 license = "MIT"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
 
 [dependencies]
 # Async runtime
@@ -40,10 +44,26 @@ thiserror = "2"
 # Async streams
 futures-util = "0.3"
 
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# File watching
+notify = "7"
+ignore = "0.4"
+
+# Embeddings (search/indexing)
+fastembed = "4"
+
+# System / resource limits (Unix)
+libc = "0.2"
+
 # Misc
 dirs = "6"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+
+[features]
+llama-cpp = []
 
 [dev-dependencies]
 tempfile = "3"

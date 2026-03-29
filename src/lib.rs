@@ -1,8 +1,14 @@
 pub mod backend;
 pub mod config;
 pub mod conversation;
+pub mod evolution;
 pub mod formatting;
+pub mod inference;
 pub mod permissions;
+pub mod plugins;
 pub mod rules;
+pub mod search;
+pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod tui;

@@ -11,6 +11,7 @@ pub struct Config {
     pub permissions: PermissionConfig,
     pub paths: PathsConfig,
     pub formatting: FormattingConfig,
+    pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +31,8 @@ pub struct ModelConfig {
 pub enum BackendType {
     LlamaCpp,
     Mlx,
+    /// Direct FFI inference via llama.cpp — no HTTP server required
+    Direct,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +77,14 @@ pub struct PathsConfig {
     pub rules_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    pub registry_url: Option<String>,
+    pub auto_update: bool,
+}
+
 // Defaults
 
 impl Default for Config {
@@ -83,6 +94,17 @@ impl Default for Config {
             permissions: PermissionConfig::default(),
             paths: PathsConfig::default(),
             formatting: FormattingConfig::default(),
+            plugins: PluginsConfig::default(),
+        }
+    }
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry_url: None,
+            auto_update: false,
         }
     }
 }
@@ -146,7 +168,7 @@ pub fn project_config_dir(project_path: &Path) -> Result<PathBuf> {
     let global = global_config_dir()?;
     let encoded = project_path
         .to_string_lossy()
-        .replace('/', "-")
+        .replace(['/', '\\'], "-")
         .trim_start_matches('-')
         .to_string();
     Ok(global.join("projects").join(encoded))
@@ -158,6 +180,7 @@ pub fn ensure_ftai_dirs() -> Result<()> {
     std::fs::create_dir_all(global.join("models"))?;
     std::fs::create_dir_all(global.join("memory"))?;
     std::fs::create_dir_all(global.join("projects"))?;
+    std::fs::create_dir_all(global.join("plugins"))?;
 
     // Create default config if it doesn't exist
     let config_path = global.join("config.toml");
@@ -253,6 +276,11 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             } else {
                 override_cfg.formatting.enabled
             },
+        },
+        plugins: PluginsConfig {
+            enabled: override_cfg.plugins.enabled,
+            registry_url: override_cfg.plugins.registry_url.or(base.plugins.registry_url),
+            auto_update: override_cfg.plugins.auto_update,
         },
     }
 }
@@ -415,5 +443,15 @@ mode = "ask"
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.model.context_length, 4096);
         assert_eq!(config.permissions.mode, PermissionMode::Ask);
+    }
+
+    #[test]
+    fn test_project_config_dir_windows_style_path() {
+        let path = Path::new("C:\\Users\\foo\\project");
+        let dir = project_config_dir(path).unwrap();
+        let dir_name = dir.file_name().unwrap().to_string_lossy();
+        assert!(!dir_name.contains('\\'));
+        assert!(!dir_name.contains('/'));
+        assert!(!dir_name.starts_with('-'));
     }
 }

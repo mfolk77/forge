@@ -19,10 +19,24 @@ pub enum BackendManager {
 }
 
 impl BackendManager {
-    /// Create a backend manager based on config
+    /// Create a backend manager based on config.
+    /// Falls back to llama.cpp if MLX is requested on a non-Apple-Silicon platform.
     pub fn from_config(config: &Config) -> Self {
-        match config.model.backend {
-            BackendType::LlamaCpp => BackendManager::LlamaCpp(LlamaCppServer::new(LLAMACPP_PORT)),
+        let effective_backend = if config.model.backend == BackendType::Mlx
+            && !crate::backend::mlx::is_available()
+        {
+            eprintln!(
+                "Warning: MLX backend requires Apple Silicon Mac. Falling back to llama.cpp."
+            );
+            BackendType::LlamaCpp
+        } else {
+            config.model.backend.clone()
+        };
+
+        match effective_backend {
+            BackendType::LlamaCpp | BackendType::Direct => {
+                BackendManager::LlamaCpp(LlamaCppServer::new(LLAMACPP_PORT))
+            }
             BackendType::Mlx => BackendManager::Mlx(MlxServer::new(MLX_PORT)),
         }
     }
@@ -118,7 +132,11 @@ mod tests {
     fn test_from_config_mlx() {
         let config = Config::default();
         let manager = BackendManager::from_config(&config);
-        assert_eq!(manager.backend_name(), "MLX");
+        if crate::backend::mlx::is_available() {
+            assert_eq!(manager.backend_name(), "MLX");
+        } else {
+            assert_eq!(manager.backend_name(), "llama.cpp");
+        }
     }
 
     #[test]

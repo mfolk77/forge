@@ -8,6 +8,38 @@ use tokio::time::{timeout, Duration};
 
 use super::registry::{Tool, ToolContext, ToolResult};
 
+/// Returns the platform-appropriate shell executable and its prefix arguments.
+///
+/// On Unix: `("bash", &["-c"])` — commands are passed as a single string to bash.
+/// On Windows: `("cmd.exe", &["/C"])` — commands are passed as a single string to cmd.exe.
+///
+/// # Security note
+/// On both platforms the entire command string is interpreted by the shell, so
+/// shell metacharacters (`&`, `|`, `>`, `<`, `;`) are live. This is by design —
+/// the tool is a shell, not an exec wrapper. The timeout is the primary guard.
+pub fn shell_command() -> (&'static str, &'static [&'static str]) {
+    if cfg!(windows) {
+        ("cmd.exe", &["/C"])
+    } else {
+        ("bash", &["-c"])
+    }
+}
+
+/// Returns true if the given path string is absolute on the current platform.
+fn is_absolute_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    // Windows drive-letter paths like C:\ or D:/
+    if cfg!(windows) && path.len() >= 3 {
+        let bytes = path.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct BashTool {
     cwd: Mutex<Option<PathBuf>>,
 }
@@ -26,7 +58,11 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command. Working directory persists between calls."
+        if cfg!(windows) {
+            "Execute a shell command via cmd.exe. Working directory persists between calls."
+        } else {
+            "Execute a bash command. Working directory persists between calls."
+        }
     }
 
     fn parameters(&self) -> Value {
@@ -65,15 +101,30 @@ impl Tool for BashTool {
                 guard.clone().unwrap_or(project_path)
             };
 
+            let (shell, prefix_args) = shell_command();
+
+            let mut cmd = Command::new(shell);
+            for arg in prefix_args {
+                cmd.arg(arg);
+            }
+            cmd.arg(&command)
+                .current_dir(&working_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            // On Windows, set CREATE_BREAKAWAY_FROM_JOB to allow child process
+            // management. Resource limits (RLIMIT_CPU) are Unix-only; on Windows
+            // the timeout is the primary execution guard.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+                cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+            }
+
             let result = timeout(
                 Duration::from_millis(timeout_ms),
-                Command::new("bash")
-                    .arg("-c")
-                    .arg(&command)
-                    .current_dir(&working_dir)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output(),
+                cmd.output(),
             )
             .await;
 
@@ -85,7 +136,7 @@ impl Tool for BashTool {
                     // Update cwd if the command was a cd
                     if command.starts_with("cd ") {
                         let dir = command.trim_start_matches("cd ").trim();
-                        let new_dir = if dir.starts_with('/') {
+                        let new_dir = if is_absolute_path(dir) {
                             PathBuf::from(dir)
                         } else {
                             working_dir.join(dir)
@@ -135,10 +186,52 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext {
-            cwd: PathBuf::from("/tmp"),
-            project_path: PathBuf::from("/tmp"),
+            cwd: PathBuf::from(if cfg!(windows) { "C:\\Windows\\Temp" } else { "/tmp" }),
+            project_path: PathBuf::from(if cfg!(windows) { "C:\\Windows\\Temp" } else { "/tmp" }),
         }
     }
+
+    // -----------------------------------------------------------
+    // shell_command() returns the correct shell for each platform
+    // -----------------------------------------------------------
+
+    #[test]
+    fn test_shell_command_returns_correct_shell() {
+        let (shell, args) = shell_command();
+        if cfg!(windows) {
+            assert_eq!(shell, "cmd.exe");
+            assert_eq!(args, &["/C"]);
+        } else {
+            assert_eq!(shell, "bash");
+            assert_eq!(args, &["-c"]);
+        }
+    }
+
+    // -----------------------------------------------------------
+    // is_absolute_path — unit tests for cross-platform detection
+    // -----------------------------------------------------------
+
+    #[test]
+    fn test_unix_absolute_path() {
+        assert!(is_absolute_path("/usr/bin"));
+        assert!(is_absolute_path("/"));
+        assert!(!is_absolute_path("relative/path"));
+    }
+
+    #[test]
+    fn test_windows_absolute_path_detection() {
+        // Drive-letter detection only activates on Windows builds,
+        // but is_absolute_path("/foo") should always be true.
+        if cfg!(windows) {
+            assert!(is_absolute_path("C:\\Users"));
+            assert!(is_absolute_path("D:/Projects"));
+            assert!(!is_absolute_path("relative\\path"));
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Existing tests — run on all platforms
+    // -----------------------------------------------------------
 
     #[tokio::test]
     async fn test_echo() {
@@ -151,6 +244,7 @@ mod tests {
         assert!(result.output.contains("hello"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_failing_command() {
         let tool = BashTool::new();
@@ -171,6 +265,7 @@ mod tests {
         assert!(result.is_error);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_timeout() {
         let tool = BashTool::new();
@@ -183,5 +278,89 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.output.contains("timed out"));
+    }
+
+    // -----------------------------------------------------------
+    // Windows-specific tests
+    // -----------------------------------------------------------
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_echo() {
+        let tool = BashTool::new();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo hello"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.output.contains("hello"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_cd_drive_letter() {
+        // Verify that cd with a drive letter is detected as absolute
+        let tool = BashTool::new();
+        // Just test the path detection logic directly
+        assert!(is_absolute_path("C:\\Users"));
+        assert!(is_absolute_path("D:\\Projects\\foo"));
+        assert!(!is_absolute_path("Users\\test"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_timeout() {
+        let tool = BashTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "ping -n 10 127.0.0.1", "timeout_ms": 100}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.output.contains("timed out"));
+    }
+
+    // -----------------------------------------------------------
+    // P0 Security: command injection via shell metacharacters
+    // -----------------------------------------------------------
+    // NOTE: On both platforms, the command string is passed to the shell
+    // interpreter (bash -c / cmd.exe /C) as a single argument. This means
+    // metacharacters (&, |, >, <, ;) ARE interpreted by the shell. This is
+    // intentional — the tool IS a shell. The security boundary is the
+    // timeout + the permission system, not argument escaping.
+    //
+    // Rust's Command API passes arguments safely to the OS, but the shell
+    // itself will parse the string. This is identical behaviour on Unix and
+    // Windows.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_security_metacharacters_execute_in_shell() {
+        let tool = BashTool::new();
+        // The pipe should be interpreted by bash — this is expected behaviour
+        let result = tool
+            .execute(serde_json::json!({"command": "echo injected | cat"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.output.contains("injected"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_security_windows_cmd_metacharacters() {
+        // On Windows, & is a command separator in cmd.exe.
+        // "echo safe & echo injected" should produce both outputs.
+        // This documents that cmd.exe /C is equivalent to bash -c in risk profile.
+        let tool = BashTool::new();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo safe & echo injected"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.output.contains("safe"));
+        assert!(result.output.contains("injected"));
     }
 }

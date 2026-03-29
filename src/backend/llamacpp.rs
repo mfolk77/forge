@@ -26,19 +26,36 @@ impl LlamaCppServer {
 
     /// Find the llama-server binary
     fn find_server_binary() -> Result<PathBuf> {
-        // Check common locations
-        let candidates = [
-            "llama-server",
-            "llama.cpp/build/bin/llama-server",
-            "/usr/local/bin/llama-server",
-            "/opt/homebrew/bin/llama-server",
-        ];
+        // Check common locations (platform-specific)
+        let candidates: Vec<&str> = if cfg!(windows) {
+            vec![
+                "llama-server.exe",
+                "llama-server",
+            ]
+        } else {
+            vec![
+                "llama-server",
+                "llama.cpp/build/bin/llama-server",
+                "/usr/local/bin/llama-server",
+                "/opt/homebrew/bin/llama-server",
+            ]
+        };
+
+        // Use `where` on Windows, `which` on Unix
+        let which_cmd = if cfg!(windows) { "where" } else { "which" };
 
         for candidate in &candidates {
-            if let Ok(output) = Command::new("which").arg(candidate).output() {
+            if let Ok(output) = Command::new(which_cmd).arg(candidate).output() {
                 if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    return Ok(PathBuf::from(path));
+                    let path = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !path.is_empty() {
+                        return Ok(PathBuf::from(path));
+                    }
                 }
             }
             let path = PathBuf::from(candidate);
@@ -47,10 +64,15 @@ impl LlamaCppServer {
             }
         }
 
-        anyhow::bail!(
+        let install_hint = if cfg!(windows) {
+            "llama-server not found. Download llama.cpp from https://github.com/ggerganov/llama.cpp/releases\n\
+             and add it to your PATH."
+        } else {
             "llama-server not found. Install llama.cpp: brew install llama.cpp\n\
              Or build from source: https://github.com/ggerganov/llama.cpp"
-        )
+        };
+
+        anyhow::bail!(install_hint)
     }
 
     /// Start the llama-server process with the given model

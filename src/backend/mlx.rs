@@ -4,6 +4,11 @@ use tokio::time::{sleep, Duration};
 
 use super::http_client::HttpModelClient;
 
+/// Returns true if MLX is available on this platform (Apple Silicon only)
+pub fn is_available() -> bool {
+    cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")
+}
+
 /// Manages an MLX LM server process for Apple Silicon inference
 pub struct MlxServer {
     process: Option<Child>,
