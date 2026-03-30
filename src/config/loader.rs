@@ -19,6 +19,7 @@ pub struct Config {
     pub paths: PathsConfig,
     pub formatting: FormattingConfig,
     pub plugins: PluginsConfig,
+    pub theme: ThemeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,72 @@ pub struct PluginsConfig {
     pub auto_update: bool,
 }
 
+/// Theme configuration. Pick a preset or override individual colors.
+///
+/// In config.toml:
+/// ```toml
+/// [theme]
+/// preset = "dark"     # "dark", "light", "high-contrast", "solarized", "dracula"
+///
+/// # Optional: override any individual color (hex "#RRGGBB" or named color)
+/// # accent = "#E89C38"
+/// # user_input = "#B4C8FF"
+/// # assistant_text = "#DCDCE1"
+/// # system_text = "#C8C8D2"
+/// # error = "#DC5050"
+/// # warning = "#DCB43C"
+/// # tool_border = "#64A0DC"
+/// # status_bar_fg = "#000000"
+/// # status_bar_bg = "#00CCCC"
+/// # status_line_fg = "#FFFFFF"
+/// # status_line_bg = "#404040"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub preset: ThemePreset,
+    pub accent: Option<String>,
+    pub user_input: Option<String>,
+    pub assistant_text: Option<String>,
+    pub system_text: Option<String>,
+    pub error: Option<String>,
+    pub warning: Option<String>,
+    pub tool_border: Option<String>,
+    pub status_bar_fg: Option<String>,
+    pub status_bar_bg: Option<String>,
+    pub status_line_fg: Option<String>,
+    pub status_line_bg: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemePreset {
+    Dark,
+    Light,
+    HighContrast,
+    Solarized,
+    Dracula,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            preset: ThemePreset::Dark,
+            accent: None,
+            user_input: None,
+            assistant_text: None,
+            system_text: None,
+            error: None,
+            warning: None,
+            tool_border: None,
+            status_bar_fg: None,
+            status_bar_bg: None,
+            status_line_fg: None,
+            status_line_bg: None,
+        }
+    }
+}
+
 // Defaults
 
 impl Default for Config {
@@ -103,6 +170,7 @@ impl Default for Config {
             paths: PathsConfig::default(),
             formatting: FormattingConfig::default(),
             plugins: PluginsConfig::default(),
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -290,6 +358,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             registry_url: override_cfg.plugins.registry_url.or(base.plugins.registry_url),
             auto_update: override_cfg.plugins.auto_update,
         },
+        theme: override_cfg.theme,
     }
 }
 

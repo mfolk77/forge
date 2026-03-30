@@ -80,6 +80,8 @@ pub struct TuiApp {
     stream_handle: Option<tokio::task::JoinHandle<Result<ChatResponse>>>,
     /// Scroll offset — lines from the bottom (0 = pinned to bottom)
     scroll_offset: u16,
+    /// Resolved color theme
+    theme: render::Theme,
 }
 
 impl TuiApp {
@@ -200,6 +202,8 @@ impl TuiApp {
             mode.label(),
         );
 
+        let theme = render::Theme::from_config(&config.theme);
+
         Self {
             config,
             backend,
@@ -221,6 +225,7 @@ impl TuiApp {
             token_rx: None,
             stream_handle: None,
             scroll_offset: 0,
+            theme,
         }
     }
 
@@ -381,6 +386,7 @@ impl TuiApp {
                 .unwrap_or("no model"),
             self.backend.backend_name(),
             &self.project_path.to_string_lossy(),
+            &self.theme,
             layout[0],
             frame.buffer_mut(),
         );
@@ -392,13 +398,14 @@ impl TuiApp {
                 format!("{}▊", self.streaming_text),
             ));
         }
-        render::render_messages(&display_msgs, self.mode.label(), layout[1], frame.buffer_mut());
+        render::render_messages(&display_msgs, self.mode.label(), &self.theme, layout[1], frame.buffer_mut());
 
         // Status line
         render::render_status_line(
             self.engine.estimated_tokens(),
             self.config.model.context_length,
             self.rules.rule_count(),
+            &self.theme,
             layout[2],
             frame.buffer_mut(),
         );
@@ -493,7 +500,7 @@ impl TuiApp {
     const SLASH_COMMANDS: &'static [&'static str] = &[
         "/help", "/clear", "/compact", "/rules", "/permissions", "/templates",
         "/config", "/model", "/project", "/memory", "/context", "/plugin",
-        "/hardware", "/chat", "/code", "/skill", "/quit", "/exit",
+        "/hardware", "/chat", "/code", "/skill", "/theme", "/quit", "/exit",
     ];
 
     async fn handle_submit(&mut self, text: String) -> Result<()> {
@@ -980,7 +987,7 @@ impl TuiApp {
         match cmd {
             "/help" => {
                 self.messages.push(DisplayMessage::System(
-                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /chat /code /quit".to_string(),
+                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /theme /chat /code /quit".to_string(),
                 ));
             }
             "/chat" => {
@@ -1359,6 +1366,36 @@ impl TuiApp {
                             )),
                         }
                     }
+                }
+            }
+            "/theme" => {
+                if let Some(name) = parts.get(1) {
+                    let preset = match *name {
+                        "dark" => Some(crate::config::ThemePreset::Dark),
+                        "light" => Some(crate::config::ThemePreset::Light),
+                        "high-contrast" => Some(crate::config::ThemePreset::HighContrast),
+                        "solarized" => Some(crate::config::ThemePreset::Solarized),
+                        "dracula" => Some(crate::config::ThemePreset::Dracula),
+                        _ => None,
+                    };
+                    if let Some(preset) = preset {
+                        self.config.theme.preset = preset;
+                        self.theme = render::Theme::from_config(&self.config.theme);
+                        self.messages.push(DisplayMessage::System(
+                            format!("Theme switched to: {name}"),
+                        ));
+                    } else {
+                        self.messages.push(DisplayMessage::System(
+                            format!("Unknown theme: {name}. Available: dark, light, high-contrast, solarized, dracula"),
+                        ));
+                    }
+                } else {
+                    self.messages.push(DisplayMessage::System(
+                        format!(
+                            "Current theme: {:?}\nAvailable: dark, light, high-contrast, solarized, dracula\n\nUsage: /theme <name>\nPersist in config.toml: [theme] preset = \"dracula\"",
+                            self.config.theme.preset
+                        ),
+                    ));
                 }
             }
             "/quit" | "/exit" => {
