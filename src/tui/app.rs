@@ -195,12 +195,7 @@ impl TuiApp {
         let parser = ToolCallParser::new(config.model.tool_calling.clone());
         let backend = BackendManager::from_config(&config);
 
-        let startup_msg = format!(
-            "Forge v{} | Project: {} | mode: {}",
-            env!("CARGO_PKG_VERSION"),
-            project_path.display(),
-            mode.label(),
-        );
+        let startup_msg = format!("Forge v{}", env!("CARGO_PKG_VERSION"));
 
         let theme = render::Theme::from_config(&config.theme);
 
@@ -256,10 +251,7 @@ impl TuiApp {
             }
             Err(StartErr::BackendFailed(e)) => {
                 self.messages
-                    .push(DisplayMessage::System(format!("Backend error: {e}")));
-                self.messages.push(DisplayMessage::System(
-                    "Running in offline mode. Use /model to configure.".to_string(),
-                ));
+                    .push(DisplayMessage::System(format!("Backend error: {e}\nRunning offline. Use /model to configure.")));
             }
         }
 
@@ -288,7 +280,7 @@ impl TuiApp {
         }
 
         self.messages.push(DisplayMessage::System(
-            "Loading model... (Ctrl+C to cancel)".to_string(),
+            "Connecting to backend...".to_string(),
         ));
 
         // Use tokio::select to race backend start against Ctrl+C signal

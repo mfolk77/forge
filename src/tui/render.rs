@@ -448,7 +448,7 @@ pub fn render_messages(
         lines.push(Line::from(""));
     }
 
-    // Word-wrap-aware scroll: estimate how many visual rows each line occupies
+    // Bottom-align: pad with empty lines so content sits near the input
     let total_visual_rows: usize = lines
         .iter()
         .map(|line| {
@@ -457,11 +457,25 @@ pub fn render_messages(
         })
         .sum();
     let visible_rows = area.height as usize;
-    let scroll_offset = total_visual_rows.saturating_sub(visible_rows) as u16;
+
+    if total_visual_rows < visible_rows {
+        // Pad top with empty lines to push messages to the bottom
+        let pad = visible_rows - total_visual_rows;
+        let mut padded = vec![Line::from(""); pad];
+        padded.append(&mut lines);
+        lines = padded;
+    } else {
+        // More content than fits — scroll to show latest
+        let scroll_offset = total_visual_rows.saturating_sub(visible_rows) as u16;
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset, 0));
+        para.render(area, buf);
+        return;
+    }
 
     let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+        .wrap(Wrap { trim: false });
     para.render(area, buf);
 }
 
@@ -475,7 +489,7 @@ fn render_splash(
 ) {
     let mut lines: Vec<Line> = Vec::new();
 
-    // System messages (startup info)
+    // System messages (startup info) — compact
     for msg in messages {
         if let DisplayMessage::System(text) = msg {
             for line in text.lines() {
@@ -488,29 +502,29 @@ fn render_splash(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(""));
 
-    // Mode indicator
+    // Keyboard shortcuts hint
     let mode_color = match mode {
         "coding" => Color::Green,
         "chat" => Color::Blue,
         _ => theme.assistant_text,
     };
     lines.push(Line::from(vec![
-        Span::styled("  Mode: ", Style::default().fg(theme.system_text)),
-        Span::styled(
-            mode,
-            Style::default().fg(mode_color).bold(),
-        ),
+        Span::styled("mode: ", Style::default().fg(theme.dim)),
+        Span::styled(mode, Style::default().fg(mode_color).bold()),
+        Span::styled("  /help", Style::default().fg(theme.dim)),
+        Span::styled(" for commands", Style::default().fg(theme.dim)),
     ]));
 
-    lines.push(Line::from(""));
-
-    // Keyboard shortcuts
-    lines.push(Line::from(Span::styled(
-        "  Enter: submit | Shift+Enter: newline | Ctrl+C: cancel | Ctrl+D: quit | /help: commands",
-        Style::default().fg(theme.dim),
-    )));
+    // Bottom-align the splash content
+    let visible_rows = area.height as usize;
+    let content_rows = lines.len();
+    if content_rows < visible_rows {
+        let pad = visible_rows - content_rows;
+        let mut padded = vec![Line::from(""); pad];
+        padded.append(&mut lines);
+        lines = padded;
+    }
 
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false });
