@@ -290,7 +290,7 @@ pub fn render_messages(
                 ]));
             }
             DisplayMessage::System(text) => {
-                let sys_color = Color::Rgb(160, 160, 175);
+                let sys_color = Color::Rgb(200, 200, 210);
                 for line in text.lines() {
                     lines.push(Line::from(Span::styled(
                         line,
@@ -329,7 +329,7 @@ fn render_splash(
     let mut lines: Vec<Line> = Vec::new();
 
     // System messages (startup info)
-    let sys_color = Color::Rgb(160, 160, 175);
+    let sys_color = Color::Rgb(200, 200, 210);
     for msg in messages {
         if let DisplayMessage::System(text) = msg {
             for line in text.lines() {
@@ -363,7 +363,7 @@ fn render_splash(
     // Keyboard shortcuts
     lines.push(Line::from(Span::styled(
         "  Enter: submit | Shift+Enter: newline | Ctrl+C: cancel | Ctrl+D: quit | /help: commands",
-        Style::default().fg(Color::Rgb(120, 120, 135)),
+        Style::default().fg(Color::Rgb(160, 160, 175)),
     )));
 
     let para = Paragraph::new(lines)
