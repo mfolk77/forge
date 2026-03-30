@@ -37,8 +37,7 @@ impl MlxServer {
 
         if !output.status.success() {
             anyhow::bail!(
-                "mlx_lm not installed. Install it: pip install mlx-lm\n\
-                 Requires Apple Silicon Mac."
+                "mlx_lm not installed. Install it: pip install mlx-lm\nRequires Apple Silicon Mac."
             );
         }
         Ok(())

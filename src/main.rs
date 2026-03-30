@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
             ModelAction::Info => {
                 println!("Backend: {:?}", config.model.backend);
                 println!("Context length: {}", config.model.context_length);
-                println!("Temperature: {}", config.model.temperature);
+                println!("Temperature: {:.2}", config.model.temperature);
                 if let Some(path) = &config.model.path {
                     println!("Model path: {path}");
                 } else {

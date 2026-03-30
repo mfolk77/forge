@@ -183,7 +183,7 @@ pub fn render_status_bar(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let status = format!(" ftai | {model_name} ({backend}) | {cwd}");
+    let status = format!(" forge | {model_name} ({backend}) | {cwd}");
     let bar = Paragraph::new(status)
         .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     bar.render(area, buf);
@@ -290,10 +290,13 @@ pub fn render_messages(
                 ]));
             }
             DisplayMessage::System(text) => {
-                lines.push(Line::from(Span::styled(
-                    text.as_str(),
-                    Style::default().fg(Color::DarkGray).italic(),
-                )));
+                let sys_color = Color::Rgb(160, 160, 175);
+                for line in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line,
+                        Style::default().fg(sys_color),
+                    )));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -326,12 +329,15 @@ fn render_splash(
     let mut lines: Vec<Line> = Vec::new();
 
     // System messages (startup info)
+    let sys_color = Color::Rgb(160, 160, 175);
     for msg in messages {
         if let DisplayMessage::System(text) = msg {
-            lines.push(Line::from(Span::styled(
-                text.as_str(),
-                Style::default().fg(Color::DarkGray).italic(),
-            )));
+            for line in text.lines() {
+                lines.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(sys_color),
+                )));
+            }
         }
     }
 
@@ -357,7 +363,7 @@ fn render_splash(
     // Keyboard shortcuts
     lines.push(Line::from(Span::styled(
         "  Enter: submit | Shift+Enter: newline | Ctrl+C: cancel | Ctrl+D: quit | /help: commands",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Rgb(120, 120, 135)),
     )));
 
     let para = Paragraph::new(lines)

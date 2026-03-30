@@ -1,8 +1,15 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
 use crate::formatting::FormattingConfig;
+
+/// Serialize f64 with limited precision to avoid IEEE 754 noise (e.g. 0.3 → 0.30000001192092896)
+fn serialize_f64_clean<S: Serializer>(val: &f64, ser: S) -> std::result::Result<S::Ok, S::Error> {
+    // Round to 4 decimal places for clean display
+    let rounded = (*val * 10000.0).round() / 10000.0;
+    ser.serialize_f64(rounded)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +27,7 @@ pub struct ModelConfig {
     pub backend: BackendType,
     pub path: Option<String>,
     pub context_length: usize,
+    #[serde(serialize_with = "serialize_f64_clean")]
     pub temperature: f64,
     pub llamacpp: LlamaCppConfig,
     pub mlx: MlxConfig,
