@@ -19,8 +19,12 @@ use crate::plugins::PluginManager;
 use crate::skills::LoadedSkill;
 use crate::tools::{ToolContext, ToolRegistry};
 
+use super::autocomplete::{Autocomplete, AutocompleteResult, CommandEntry};
 use super::input::InputState;
+use super::modal::{Modal, ModalAction};
+use super::plugin_modal::{InstalledPluginEntry, PluginModal};
 use super::render::{self, DisplayMessage};
+use super::skill_modal::{SkillEntry, SkillModal};
 
 /// Error type for interruptible backend startup.
 enum StartErr {
@@ -82,6 +86,10 @@ pub struct TuiApp {
     scroll_offset: u16,
     /// Resolved color theme
     theme: render::Theme,
+    /// Active modal overlay (plugin browser, skill browser, etc.)
+    active_modal: Option<Box<dyn Modal>>,
+    /// Slash-command autocomplete dropdown
+    autocomplete: Autocomplete,
 }
 
 impl TuiApp {
@@ -199,6 +207,35 @@ impl TuiApp {
 
         let theme = render::Theme::from_config(&config.theme);
 
+        // Build autocomplete command list from slash commands + skill triggers
+        let mut ac_commands: Vec<CommandEntry> = vec![
+            CommandEntry { trigger: "/help".into(), description: "Show help and available commands".into() },
+            CommandEntry { trigger: "/clear".into(), description: "Clear conversation and grants".into() },
+            CommandEntry { trigger: "/compact".into(), description: "Compact context window".into() },
+            CommandEntry { trigger: "/rules".into(), description: "Show or reload rules".into() },
+            CommandEntry { trigger: "/permissions".into(), description: "View permission grants".into() },
+            CommandEntry { trigger: "/templates".into(), description: "Show loaded templates".into() },
+            CommandEntry { trigger: "/config".into(), description: "Show current configuration".into() },
+            CommandEntry { trigger: "/model".into(), description: "Show or switch model".into() },
+            CommandEntry { trigger: "/project".into(), description: "Show or switch project path".into() },
+            CommandEntry { trigger: "/memory".into(), description: "View or add memory notes".into() },
+            CommandEntry { trigger: "/context".into(), description: "Manage FTAI.md project context".into() },
+            CommandEntry { trigger: "/plugin".into(), description: "Open plugin browser".into() },
+            CommandEntry { trigger: "/hardware".into(), description: "Show hardware info".into() },
+            CommandEntry { trigger: "/chat".into(), description: "Switch to chat mode".into() },
+            CommandEntry { trigger: "/code".into(), description: "Switch to coding mode".into() },
+            CommandEntry { trigger: "/skill".into(), description: "Open skill browser".into() },
+            CommandEntry { trigger: "/theme".into(), description: "Switch color theme".into() },
+            CommandEntry { trigger: "/quit".into(), description: "Exit forge".into() },
+        ];
+        for skill in &skills {
+            ac_commands.push(CommandEntry {
+                trigger: skill.trigger.clone(),
+                description: skill.description.clone(),
+            });
+        }
+        let autocomplete = Autocomplete::new(ac_commands);
+
         Self {
             config,
             backend,
@@ -221,6 +258,8 @@ impl TuiApp {
             stream_handle: None,
             scroll_offset: 0,
             theme,
+            active_modal: None,
+            autocomplete,
         }
     }
 
@@ -383,14 +422,18 @@ impl TuiApp {
             frame.buffer_mut(),
         );
 
-        // Messages — include streaming text as a live assistant message
-        let mut display_msgs = self.messages.clone();
-        if self.is_generating && !self.streaming_text.is_empty() {
-            display_msgs.push(DisplayMessage::Assistant(
-                format!("{}▊", self.streaming_text),
-            ));
+        // Messages area — show modal if active, otherwise normal messages
+        if let Some(ref modal) = self.active_modal {
+            modal.render(&self.theme, layout[1], frame.buffer_mut());
+        } else {
+            let mut display_msgs = self.messages.clone();
+            if self.is_generating && !self.streaming_text.is_empty() {
+                display_msgs.push(DisplayMessage::Assistant(
+                    format!("{}▊", self.streaming_text),
+                ));
+            }
+            render::render_messages(&display_msgs, self.mode.label(), &self.theme, layout[1], frame.buffer_mut());
         }
-        render::render_messages(&display_msgs, self.mode.label(), &self.theme, layout[1], frame.buffer_mut());
 
         // Status line
         render::render_status_line(
@@ -415,6 +458,11 @@ impl TuiApp {
             frame.buffer_mut(),
         );
 
+        // Render autocomplete overlay above the input area if active
+        if self.autocomplete.active {
+            self.autocomplete.render(&self.theme, layout[3], frame.buffer_mut());
+        }
+
         // Position the terminal cursor inside the input area
         if !self.is_generating {
             if let Some((cx, cy)) = cursor_pos {
@@ -427,6 +475,43 @@ impl TuiApp {
         if self.is_generating {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.is_generating = false;
+            }
+            return Ok(());
+        }
+
+        // Route to active modal if present
+        if self.active_modal.is_some() {
+            let action = self.active_modal.as_mut().unwrap().handle_key(key);
+            self.process_modal_action(action).await?;
+            return Ok(());
+        }
+
+        // Route to autocomplete if active
+        if self.autocomplete.active {
+            let result = self.autocomplete.handle_key(key);
+            match result {
+                AutocompleteResult::Selected(trigger) => {
+                    // Replace input with the selected command and submit
+                    self.input = InputState::new();
+                    for c in trigger.chars() {
+                        self.input.insert_char(c);
+                    }
+                    let text = self.input.submit();
+                    if !text.trim().is_empty() {
+                        self.handle_submit(text).await?;
+                    }
+                }
+                AutocompleteResult::Dismiss => {
+                    // Keep input text as-is
+                }
+                AutocompleteResult::Continue => {
+                    // Update input to reflect query: "/" + query
+                    let new_text = format!("/{}", self.autocomplete.query);
+                    self.input = InputState::new();
+                    for c in new_text.chars() {
+                        self.input.insert_char(c);
+                    }
+                }
             }
             return Ok(());
         }
@@ -480,11 +565,184 @@ impl TuiApp {
             }
             KeyCode::Char(c) => {
                 self.input.insert_char(c);
+                // Activate autocomplete when '/' is typed as first char
+                if c == '/' && self.input.text() == "/" {
+                    self.autocomplete.activate("");
+                }
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    /// Process a ModalAction returned from the active modal.
+    async fn process_modal_action(&mut self, action: ModalAction) -> Result<()> {
+        match action {
+            ModalAction::Continue => {}
+            ModalAction::Close => {
+                self.active_modal = None;
+            }
+            ModalAction::InstallPlugin(name) => {
+                self.active_modal = None;
+                if let Some(entry) = crate::plugins::catalog::find_in_catalog(&name) {
+                    match self.plugin_manager.install_from_git(&entry.repo) {
+                        Ok(installed_name) => {
+                            self.messages.push(DisplayMessage::System(
+                                format!("Installed plugin: {installed_name}"),
+                            ));
+                        }
+                        Err(e) => {
+                            self.messages.push(DisplayMessage::System(
+                                format!("Install failed: {e}"),
+                            ));
+                        }
+                    }
+                } else {
+                    self.messages.push(DisplayMessage::System(
+                        format!("Plugin '{name}' not found in catalog."),
+                    ));
+                }
+            }
+            ModalAction::UninstallPlugin(name) => {
+                self.active_modal = None;
+                match self.plugin_manager.uninstall(&name) {
+                    Ok(_) => {
+                        self.messages.push(DisplayMessage::System(
+                            format!("Uninstalled plugin: {name}"),
+                        ));
+                    }
+                    Err(e) => {
+                        self.messages.push(DisplayMessage::System(
+                            format!("Uninstall failed: {e}"),
+                        ));
+                    }
+                }
+            }
+            ModalAction::TogglePlugin(name) => {
+                // Toggle enabled/disabled in the modal's installed list
+                // For now, display a message — full config persistence is a follow-up
+                self.messages.push(DisplayMessage::System(
+                    format!("Toggled plugin: {name}"),
+                ));
+            }
+            ModalAction::CreatePlugin(name) => {
+                self.active_modal = None;
+                self.scaffold_plugin(&name);
+            }
+            ModalAction::ActivateSkill { name, content } => {
+                self.active_modal = None;
+                self.messages.push(DisplayMessage::System(
+                    format!("Skill '{}' activated. Content injected into context.", name),
+                ));
+                self.engine.add_system_context(&format!(
+                    "# Skill: {}\n{}", name, content
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Scaffold a new plugin directory at ~/.ftai/plugins/<name>/.
+    fn scaffold_plugin(&mut self, name: &str) {
+        // Validate name using shared validation
+        if !crate::plugins::catalog::is_valid_plugin_name(name) {
+            self.messages.push(DisplayMessage::System(
+                format!("Invalid plugin name: '{name}'. Use alphanumeric, hyphen, and underscore only."),
+            ));
+            return;
+        }
+
+        let plugins_dir = crate::config::global_config_dir()
+            .map(|d| d.join("plugins"))
+            .unwrap_or_else(|_| PathBuf::from("~/.ftai/plugins"));
+
+        let plugin_dir = plugins_dir.join(name);
+        if plugin_dir.exists() {
+            self.messages.push(DisplayMessage::System(
+                format!("Plugin directory already exists: {}", plugin_dir.display()),
+            ));
+            return;
+        }
+
+        let subdirs = ["tools", "skills", "hooks"];
+        for dir in &subdirs {
+            if let Err(e) = std::fs::create_dir_all(plugin_dir.join(dir)) {
+                self.messages.push(DisplayMessage::System(
+                    format!("Failed to create {dir} directory: {e}"),
+                ));
+                return;
+            }
+        }
+
+        let manifest = format!(
+            r#"[plugin]
+name = "{name}"
+version = "0.1.0"
+description = "A custom forge plugin"
+author = ""
+
+# [[tools]]
+# name = "my-tool"
+# description = "What this tool does"
+# command = "tools/my-tool.sh"
+
+# [[skills]]
+# name = "my-skill"
+# file = "skills/my-skill.md"
+# description = "What this skill provides"
+# trigger = "/my-skill"
+
+# [[hooks]]
+# event = "pre:bash"
+# command = "hooks/pre-bash.sh"
+"#
+        );
+
+        if let Err(e) = std::fs::write(plugin_dir.join("plugin.toml"), &manifest) {
+            self.messages.push(DisplayMessage::System(
+                format!("Failed to write plugin.toml: {e}"),
+            ));
+            return;
+        }
+
+        let readme = format!(
+            "# {name}\n\nA custom forge plugin.\n\n## Structure\n\n- `plugin.toml` — plugin manifest\n- `tools/` — tool scripts\n- `skills/` — skill markdown files\n- `hooks/` — pre/post hook scripts\n"
+        );
+        let _ = std::fs::write(plugin_dir.join("README.md"), &readme);
+
+        self.messages.push(DisplayMessage::System(
+            format!("Created plugin scaffold at {}\nEdit plugin.toml to configure.", plugin_dir.display()),
+        ));
+    }
+
+    /// Build the list of installed plugin entries for the plugin modal.
+    fn build_installed_entries(&self) -> Vec<InstalledPluginEntry> {
+        self.plugin_manager
+            .list()
+            .iter()
+            .map(|p| InstalledPluginEntry {
+                name: p.manifest.plugin.name.clone(),
+                source: p.manifest.plugin.name.clone(),
+                plugin_type: "Plugin".to_string(),
+                enabled: true,
+                description: p.manifest.plugin.description.clone(),
+            })
+            .collect()
+    }
+
+    /// Build skill entries for the skill modal.
+    fn build_skill_entries(&self) -> Vec<SkillEntry> {
+        self.skills
+            .iter()
+            .map(|s| SkillEntry {
+                name: s.name.clone(),
+                source: s.source.clone(),
+                description: s.description.clone(),
+                content: s.content.clone(),
+                token_estimate: s.content.len() / 4,
+            })
+            .collect()
     }
 
     /// Known slash commands — anything starting with / that isn't in this
@@ -1144,6 +1402,15 @@ impl TuiApp {
             }
             "/plugin" => {
                 match parts.get(1).copied() {
+                    Some("create") => {
+                        if let Some(name) = parts.get(2) {
+                            self.scaffold_plugin(name);
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /plugin create <name>".to_string(),
+                            ));
+                        }
+                    }
                     Some("list") => {
                         let plugins = self.plugin_manager.list();
                         if plugins.is_empty() {
@@ -1262,9 +1529,10 @@ impl TuiApp {
                         }
                     }
                     _ => {
-                        self.messages.push(DisplayMessage::System(
-                            "Usage: /plugin <list|install|uninstall|search|info>".to_string(),
-                        ));
+                        // Open the interactive plugin browser modal
+                        let installed = self.build_installed_entries();
+                        let modal = PluginModal::new(installed);
+                        self.active_modal = Some(Box::new(modal));
                     }
                 }
             }
@@ -1290,14 +1558,10 @@ impl TuiApp {
                         ));
                     }
                 } else {
-                    let mut info = String::from("Available skills:\n");
-                    for skill in &self.skills {
-                        info.push_str(&format!(
-                            "  {} — {} [{}]\n",
-                            skill.trigger, skill.description, skill.source
-                        ));
-                    }
-                    self.messages.push(DisplayMessage::System(info));
+                    // Open the interactive skill browser modal
+                    let entries = self.build_skill_entries();
+                    let modal = SkillModal::new(entries);
+                    self.active_modal = Some(Box::new(modal));
                 }
             }
             "/context" => {

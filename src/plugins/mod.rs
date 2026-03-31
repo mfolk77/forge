@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod hooks;
 pub mod manifest;
 pub mod manager;
