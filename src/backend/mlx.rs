@@ -28,31 +28,50 @@ impl MlxServer {
         }
     }
 
-    /// Check if mlx_lm is installed
-    fn check_mlx_installed() -> Result<()> {
+    /// Find the mlx_lm.server executable.
+    /// Tries: standalone binary (Homebrew) first, then python3 module fallback.
+    fn find_server() -> Result<(String, Vec<String>)> {
+        // 1. Standalone binary (Homebrew: brew install mlx-lm)
+        let brew_path = "/opt/homebrew/bin/mlx_lm.server";
+        if std::path::Path::new(brew_path).exists() {
+            return Ok((brew_path.to_string(), vec![]));
+        }
+
+        // 2. In PATH
+        if let Ok(output) = Command::new("which").arg("mlx_lm.server").output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok((path, vec![]));
+                }
+            }
+        }
+
+        // 3. Python module fallback
         let output = Command::new("python3")
             .args(["-c", "import mlx_lm"])
-            .output()
-            .context("python3 not found")?;
+            .output();
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "mlx_lm not installed. Install it: pip install mlx-lm\nRequires Apple Silicon Mac."
-            );
+        if let Ok(out) = output {
+            if out.status.success() {
+                return Ok(("python3".to_string(), vec!["-m".to_string(), "mlx_lm.server".to_string()]));
+            }
         }
-        Ok(())
+
+        anyhow::bail!(
+            "mlx_lm not found. Install it:\n  brew install mlx-lm  (recommended)\n  pip install mlx-lm   (alternative)\nRequires Apple Silicon Mac."
+        )
     }
 
     /// Start the MLX LM server with the given model
     pub async fn start(&mut self, model_path: &str, context_length: usize) -> Result<()> {
         self.stop();
 
-        Self::check_mlx_installed()?;
+        let (exe, prefix_args) = Self::find_server()?;
 
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(&exe);
+        cmd.args(&prefix_args);
         cmd.args([
-            "-m",
-            "mlx_lm.server",
             "--model",
             model_path,
             "--port",
@@ -60,11 +79,6 @@ impl MlxServer {
             "--host",
             "127.0.0.1",
         ]);
-
-        // Pass context length if supported
-        if context_length > 0 {
-            cmd.args(["--max-tokens", &context_length.to_string()]);
-        }
 
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
