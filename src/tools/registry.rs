@@ -112,6 +112,9 @@ impl ToolRegistry {
         reg.register(super::request_permissions::RequestPermissionsTool);
         reg.register(super::memory_tool::MemoryReadTool);
         reg.register(super::memory_tool::MemoryWriteTool);
+        reg.register(super::agent_spawn::AgentSpawnTool);
+        reg.register(super::task_tool::TaskTool);
+        reg.register(super::research_tool::ResearchTool);
         reg
     }
 }
@@ -197,6 +200,9 @@ mod tests {
         assert!(reg.get("ask_user").is_some());
         assert!(reg.get("memory_read").is_some());
         assert!(reg.get("memory_write").is_some());
+        assert!(reg.get("agent_spawn").is_some());
+        assert!(reg.get("task").is_some());
+        assert!(reg.get("research").is_some());
     }
 
     // ── P0 Security Red Tests ──────────────────────────────────────────────

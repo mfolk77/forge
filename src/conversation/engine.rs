@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use crate::backend::types::{ChatRequest, ChatResponse, Message, Role, ToolDefinition};
 use crate::config::Config;
+use crate::conversation::compactor;
 
 /// Manages the conversation state and context window
 pub struct ConversationEngine {
@@ -9,6 +11,7 @@ pub struct ConversationEngine {
     tools: Vec<ToolDefinition>,
     max_context_tokens: usize,
     estimated_tokens: usize,
+    project_path: Option<PathBuf>,
 }
 
 impl ConversationEngine {
@@ -19,7 +22,13 @@ impl ConversationEngine {
             tools,
             max_context_tokens,
             estimated_tokens: 0,
+            project_path: None,
         }
+    }
+
+    /// Set the project path for transcript saving during compaction.
+    pub fn set_project_path(&mut self, path: PathBuf) {
+        self.project_path = Some(path);
     }
 
     /// Add a user message
@@ -69,13 +78,70 @@ impl ConversationEngine {
         }
     }
 
-    /// Compress old messages to fit within context window
+    /// Run Tier 1 microcompact: replace old tool_result content with placeholders.
+    /// This is cheap (no model calls) and should run before every LLM call.
+    pub fn micro_compact(&mut self) -> usize {
+        let compacted = compactor::micro_compact(&mut self.messages);
+        if compacted > 0 {
+            self.recalculate_tokens();
+        }
+        compacted
+    }
+
+    /// Check if compaction is needed based on token thresholds.
+    /// Returns the tier (2 or 3) or None.
+    pub fn should_compact(&self) -> Option<u8> {
+        compactor::should_compact(self.estimated_tokens, self.max_context_tokens)
+    }
+
+    /// Three-tier compaction system:
+    /// - Always runs Tier 1 (micro) first
+    /// - If tokens > 70%: Tier 2 (snip — remove oldest, keep last 10)
+    /// - If tokens > 85%: Tier 3 (summarize — replace all with summary)
     pub fn compact(&mut self) {
-        if self.estimated_tokens <= self.max_context_tokens {
-            return;
+        // Tier 1 always runs
+        self.micro_compact();
+
+        let project_path = self.project_path.clone();
+
+        match self.should_compact() {
+            Some(3) => {
+                // Tier 3: summarize compact
+                if let Some(ref path) = project_path {
+                    let _ = compactor::summarize_compact(&mut self.messages, path);
+                    // Reinject system identity as first message
+                    self.messages.insert(0, Message {
+                        role: Role::System,
+                        content: format!(
+                            "[System context reinjected after compaction]\nTools available: {}",
+                            self.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                } else {
+                    // Fallback: simple snip if no project path
+                    self.snip_compact_fallback();
+                }
+            }
+            Some(2) => {
+                // Tier 2: snip compact
+                if let Some(ref path) = project_path {
+                    let _ = compactor::snip_compact(&mut self.messages, path, 10);
+                } else {
+                    self.snip_compact_fallback();
+                }
+            }
+            _ => {
+                // No compaction needed beyond tier 1
+            }
         }
 
-        // Strategy: keep system prompt + last N messages, summarize the rest
+        self.recalculate_tokens();
+    }
+
+    /// Fallback snip when no project path is available (no transcript saving).
+    fn snip_compact_fallback(&mut self) {
         let keep_recent = 10.min(self.messages.len());
         if self.messages.len() <= keep_recent {
             return;
@@ -93,15 +159,9 @@ impl ConversationEngine {
         new_messages.extend_from_slice(&self.messages[self.messages.len() - keep_recent..]);
 
         self.messages = new_messages;
-        self.estimated_tokens = self
-            .messages
-            .iter()
-            .map(|m| estimate_tokens(&m.content))
-            .sum();
     }
 
     fn summarize_messages(messages: &[Message]) -> String {
-        // Simple summary — extract key actions taken
         let mut summary_parts = Vec::new();
         for msg in messages {
             match msg.role {
@@ -125,6 +185,15 @@ impl ConversationEngine {
         } else {
             summary_parts.join("; ")
         }
+    }
+
+    /// Recalculate estimated token count from current messages.
+    fn recalculate_tokens(&mut self) {
+        self.estimated_tokens = self
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content))
+            .sum();
     }
 
     /// Clear all messages

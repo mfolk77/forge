@@ -12,5 +12,8 @@ pub mod request_permissions;
 pub mod execution_log;
 pub mod validator;
 pub mod memory_tool;
+pub mod agent_spawn;
+pub mod task_tool;
+pub mod research_tool;
 
 pub use registry::{Tool, ToolContext, ToolResult, ToolRegistry};

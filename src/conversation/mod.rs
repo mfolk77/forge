@@ -7,6 +7,7 @@ pub mod validator;
 pub mod recovery;
 pub mod grammar;
 pub mod facts;
+pub mod compactor;
 
 #[cfg(test)]
 mod security_tests;

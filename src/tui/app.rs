@@ -90,6 +90,8 @@ pub struct TuiApp {
     active_modal: Option<Box<dyn Modal>>,
     /// Slash-command autocomplete dropdown
     autocomplete: Autocomplete,
+    /// Progress tracking: rounds since last task tool call (for nag injection)
+    rounds_since_task_update: usize,
 }
 
 impl TuiApp {
@@ -194,11 +196,12 @@ impl TuiApp {
             ),
         };
 
-        let engine = ConversationEngine::new(
+        let mut engine = ConversationEngine::new(
             system_prompt,
             tool_defs,
             config.model.context_length,
         );
+        engine.set_project_path(project_path.clone());
 
         let parser = ToolCallParser::new(config.model.tool_calling.clone());
         let backend = BackendManager::from_config(&config);
@@ -260,6 +263,7 @@ impl TuiApp {
             theme,
             active_modal: None,
             autocomplete,
+            rounds_since_task_update: 0,
         }
     }
 
@@ -789,6 +793,8 @@ author = ""
         const MAX_TURNS: usize = 25;
 
         for turn in 0..MAX_TURNS {
+            // Run compaction before each LLM call
+            self.engine.micro_compact();
             self.engine.compact();
             self.is_generating = true;
             let request = self.engine.build_request(&self.config);
@@ -852,6 +858,7 @@ author = ""
         if has_tool_calls {
             const MAX_CONTINUATION_TURNS: usize = 24;
             for _ in 0..MAX_CONTINUATION_TURNS {
+                self.engine.micro_compact();
                 self.engine.compact();
                 let request = self.engine.build_request(&self.config);
 
@@ -918,12 +925,38 @@ author = ""
             .chain(parsed_calls)
             .collect::<Vec<_>>();
 
+        // Track whether any task tool was called this round (for nag injection)
+        let mut task_tool_called = false;
+
         for call in all_calls {
             // Handle request_permissions specially (pre-flight batch approval)
             if call.name == "request_permissions" {
                 let result = self.handle_permission_request(&call.arguments);
                 self.engine.add_tool_result(&call.id, &result);
                 continue;
+            }
+
+            // Handle agent_spawn specially — run subagent loop inline
+            if call.name == "agent_spawn" {
+                let result = self.handle_agent_spawn(&call.arguments).await;
+                self.engine.add_tool_result(&call.id, &result);
+                self.messages.push(DisplayMessage::ToolCall {
+                    name: "agent_spawn".to_string(),
+                    args_summary: call.arguments["task"]
+                        .as_str()
+                        .unwrap_or("(task)")
+                        .chars()
+                        .take(80)
+                        .collect(),
+                    result: result.clone(),
+                    is_error: false,
+                });
+                continue;
+            }
+
+            // Track task tool calls for nag injection
+            if call.name == "task" {
+                task_tool_called = true;
             }
 
             // Step 1: Hard-block check (compile-time constants, no override)
@@ -1069,7 +1102,126 @@ author = ""
             }
         }
 
+        // Progress tracking: nag injection
+        if task_tool_called {
+            self.rounds_since_task_update = 0;
+        } else {
+            self.rounds_since_task_update += 1;
+            if self.rounds_since_task_update >= 3 {
+                // Inject a reminder alongside tool results
+                self.engine.add_system_context(
+                    "<reminder>Consider updating your task progress.</reminder>"
+                );
+                self.rounds_since_task_update = 0;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Handle agent_spawn tool call: run a subagent loop and return its final text.
+    async fn handle_agent_spawn(&mut self, params: &serde_json::Value) -> String {
+        use crate::tools::agent_spawn;
+        use crate::backend::types::{ChatRequest, Message, Role, StopReason};
+
+        // Validate parameters
+        if let Some(err) = agent_spawn::validate_params(params) {
+            return format!("agent_spawn error: {err}");
+        }
+
+        let task = params["task"].as_str().unwrap_or("");
+
+        // Build subagent messages
+        let mut messages = agent_spawn::build_subagent_messages(task);
+
+        // Filter tools for the subagent (no agent_spawn)
+        let all_tool_defs = self.tools.tool_definitions();
+        let requested_tools: Option<Vec<String>> = params["tools"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+        let subagent_tools = agent_spawn::filter_tools(
+            &all_tool_defs,
+            requested_tools.as_deref(),
+        );
+
+        self.messages.push(DisplayMessage::System(
+            format!("Subagent started: {}", task.chars().take(80).collect::<String>()),
+        ));
+
+        // Run the subagent loop
+        let mut last_text = String::new();
+        for _iteration in 0..agent_spawn::SUBAGENT_MAX_ITERATIONS {
+            let request = ChatRequest {
+                messages: messages.clone(),
+                tools: subagent_tools.clone(),
+                temperature: self.config.model.temperature,
+                max_tokens: Some(4096),
+                model_id: self.config.model.path.clone(),
+            };
+
+            let response = match self.backend.generate(&request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return format!("Subagent backend error: {e}");
+                }
+            };
+
+            let content = Self::clean_model_output(&response.message.content);
+            let has_tool_calls = response.message.tool_calls.as_ref()
+                .map_or(false, |tc| !tc.is_empty());
+
+            if !content.is_empty() {
+                last_text = content.clone();
+            }
+
+            // Add assistant message to subagent conversation
+            messages.push(response.message.clone());
+
+            if !has_tool_calls || response.stop_reason == StopReason::EndOfText {
+                break;
+            }
+
+            // Execute tool calls
+            if let Some(ref tool_calls) = response.message.tool_calls {
+                for tc in tool_calls {
+                    // Skip agent_spawn (safety)
+                    if tc.name == "agent_spawn" {
+                        messages.push(Message {
+                            role: Role::Tool,
+                            content: "agent_spawn not available in subagent context.".to_string(),
+                            tool_calls: None,
+                            tool_call_id: Some(tc.id.clone()),
+                        });
+                        continue;
+                    }
+
+                    let ctx = ToolContext {
+                        cwd: self.project_path.clone(),
+                        project_path: self.project_path.clone(),
+                    };
+
+                    let result = match self.tools.execute(&tc.name, tc.arguments.clone(), &ctx).await {
+                        Ok(r) => r.output,
+                        Err(e) => format!("Tool error: {e}"),
+                    };
+
+                    messages.push(Message {
+                        role: Role::Tool,
+                        content: result,
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                }
+            }
+        }
+
+        self.messages.push(DisplayMessage::System("Subagent completed.".to_string()));
+
+        if last_text.is_empty() {
+            "Subagent completed without producing a final summary.".to_string()
+        } else {
+            last_text
+        }
     }
 
     /// Temporarily exit raw mode, prompt user via stderr, return to raw mode.
