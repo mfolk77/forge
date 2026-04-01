@@ -89,6 +89,22 @@ impl RulesEngine {
         self.load(content)
     }
 
+    /// Load glob-matched rules from a directory.
+    ///
+    /// Scans `dir` for `.ftai` rule files with optional YAML frontmatter,
+    /// filters by glob match against `file_path`, and loads matching rules
+    /// via `load_string()`. Returns the total count of rules loaded.
+    pub fn load_glob_rules(&mut self, dir: &Path, file_path: Option<&str>) -> Result<usize, String> {
+        let glob_rules = super::glob_matcher::load_rules_for_context(dir, file_path);
+        let mut total = 0;
+        for gr in &glob_rules {
+            if !gr.rule_content.trim().is_empty() {
+                total += self.load_string(&gr.rule_content)?;
+            }
+        }
+        Ok(total)
+    }
+
     /// Clear all loaded rules
     pub fn clear(&mut self) {
         self.global_rules.clear();

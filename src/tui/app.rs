@@ -203,6 +203,11 @@ impl TuiApp {
         );
         engine.set_project_path(project_path.clone());
 
+        // Inject dream context from last dream analysis (if fresh)
+        if let Some(dream_ctx) = crate::dream::runner::dream_context_for_session(&project_path) {
+            engine.add_system_context(&dream_ctx);
+        }
+
         let parser = ToolCallParser::new(config.model.tool_calling.clone());
         let backend = BackendManager::from_config(&config);
 
@@ -229,6 +234,7 @@ impl TuiApp {
             CommandEntry { trigger: "/code".into(), description: "Switch to coding mode".into() },
             CommandEntry { trigger: "/skill".into(), description: "Open skill browser".into() },
             CommandEntry { trigger: "/theme".into(), description: "Switch color theme".into() },
+            CommandEntry { trigger: "/dream".into(), description: "Show or run dream analysis".into() },
             CommandEntry { trigger: "/quit".into(), description: "Exit forge".into() },
         ];
         for skill in &skills {
@@ -754,7 +760,7 @@ author = ""
     const SLASH_COMMANDS: &'static [&'static str] = &[
         "/help", "/clear", "/compact", "/rules", "/permissions", "/templates",
         "/config", "/model", "/project", "/memory", "/context", "/plugin",
-        "/hardware", "/chat", "/code", "/skill", "/theme", "/quit", "/exit",
+        "/hardware", "/chat", "/code", "/skill", "/theme", "/dream", "/quit", "/exit",
     ];
 
     async fn handle_submit(&mut self, text: String) -> Result<()> {
@@ -1389,7 +1395,7 @@ author = ""
         match cmd {
             "/help" => {
                 self.messages.push(DisplayMessage::System(
-                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /theme /chat /code /quit".to_string(),
+                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /theme /dream /chat /code /quit".to_string(),
                 ));
             }
             "/chat" => {
@@ -1858,6 +1864,69 @@ author = ""
                             self.config.theme.preset
                         ),
                     ));
+                }
+            }
+            "/dream" => {
+                let scheduler = crate::dream::scheduler::DreamScheduler::new(&self.project_path);
+                match parts.get(1).copied() {
+                    Some("run") => {
+                        // Force a dream run now (bypass time/session gates)
+                        match scheduler.acquire_lock() {
+                            Ok(_lock) => {
+                                let runner = crate::dream::runner::DreamRunner::new(&self.project_path);
+                                match runner.run(Some(0)) {
+                                    Ok(path) => {
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            self.messages.push(DisplayMessage::System(
+                                                format!("Dream complete. Output: {}\n\n{content}", path.display()),
+                                            ));
+                                        } else {
+                                            self.messages.push(DisplayMessage::System(
+                                                format!("Dream complete. Saved to: {}", path.display()),
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.messages.push(DisplayMessage::System(
+                                            format!("Dream failed: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.messages.push(DisplayMessage::System(
+                                    format!("Could not acquire dream lock: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    Some("list") => {
+                        let dreams = scheduler.list_dreams();
+                        if dreams.is_empty() {
+                            self.messages.push(DisplayMessage::System(
+                                "No dream files found.".to_string(),
+                            ));
+                        } else {
+                            let mut out = String::from("Dream files:\n");
+                            for d in &dreams {
+                                out.push_str(&format!("  {} (modified: {})\n", d.filename, d.modified));
+                            }
+                            self.messages.push(DisplayMessage::System(out));
+                        }
+                    }
+                    _ => {
+                        // /dream — show latest dream summary
+                        match scheduler.latest_dream() {
+                            Some(content) => {
+                                self.messages.push(DisplayMessage::System(content));
+                            }
+                            None => {
+                                self.messages.push(DisplayMessage::System(
+                                    "No dream results available. Use /dream run to trigger a dream analysis.".to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             "/quit" | "/exit" => {

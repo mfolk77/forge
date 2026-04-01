@@ -1,8 +1,10 @@
 mod backend;
 mod config;
 mod conversation;
+mod dream;
 mod evolution;
 mod formatting;
+mod hooks;
 mod inference;
 mod permissions;
 mod plugins;

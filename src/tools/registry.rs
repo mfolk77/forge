@@ -2,7 +2,10 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::future::Future;
 use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 use crate::backend::types::ToolDefinition;
 
 /// Result of a tool execution
@@ -28,6 +31,61 @@ impl ToolResult {
     }
 }
 
+/// Progress updates emitted by tools during execution
+#[derive(Debug, Clone)]
+pub enum ToolProgress {
+    /// Completion percentage (0-100)
+    Percent(u8),
+    /// Human-readable status message
+    Status(String),
+    /// Partial output streamed during execution
+    PartialOutput(String),
+}
+
+/// A cancellation token backed by a `tokio::sync::watch` channel.
+///
+/// The owner calls `cancel()` to signal; any holder of a cloned receiver
+/// can poll `is_cancelled()` without overhead.
+#[derive(Debug)]
+pub struct CancelToken {
+    sender: watch::Sender<bool>,
+    receiver: watch::Receiver<bool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        let (sender, receiver) = watch::channel(false);
+        Self { sender, receiver }
+    }
+
+    /// Signal cancellation. Idempotent.
+    pub fn cancel(&self) {
+        self.sender.send(true).ok();
+    }
+
+    /// Check whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    /// Clone the receiver half so another task can observe the signal.
+    pub fn clone_receiver(&self) -> watch::Receiver<bool> {
+        self.receiver.clone()
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle returned when launching a cancellable tool execution.
+pub struct ToolExecution {
+    pub cancel: CancelToken,
+    pub progress_rx: mpsc::Receiver<ToolProgress>,
+}
+
 /// Context available to tools during execution
 pub struct ToolContext {
     pub cwd: PathBuf,
@@ -43,7 +101,30 @@ pub trait Tool: Send + Sync {
         &self,
         params: Value,
         ctx: &ToolContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>;
+
+    /// Execute with cancellation and progress support. Default delegates to `execute()`.
+    fn execute_with_cancel(
+        &self,
+        params: Value,
+        ctx: &ToolContext,
+        _cancel: &CancelToken,
+        _progress: Option<mpsc::Sender<ToolProgress>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+        self.execute(params, ctx)
+    }
+
+    /// Short summary of this tool call for logging/display.
+    /// Default: `"tool_name({truncated_args})"`.
+    fn classify_summary(&self, args: &Value) -> String {
+        let s = args.to_string();
+        let truncated = if s.len() > 80 {
+            format!("{}...", &s[..77])
+        } else {
+            s
+        };
+        format!("{}({})", self.name(), truncated)
+    }
 }
 
 /// Registry of all available tools
@@ -68,11 +149,31 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
+        let cancel = CancelToken::new();
+        self.execute_cancellable(name, params, ctx, &cancel, None).await
+    }
+
+    /// Create a cancellation token and progress channel for an execution.
+    pub fn create_execution_context(&self) -> (CancelToken, mpsc::Receiver<ToolProgress>) {
+        let cancel = CancelToken::new();
+        let (_tx, rx) = mpsc::channel(64);
+        (cancel, rx)
+    }
+
+    /// Execute a tool with external cancellation and optional progress.
+    pub async fn execute_cancellable(
+        &self,
+        name: &str,
+        params: Value,
+        ctx: &ToolContext,
+        cancel: &CancelToken,
+        progress: Option<mpsc::Sender<ToolProgress>>,
+    ) -> Result<ToolResult> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {name}"))?;
-        tool.execute(params, ctx).await
+        tool.execute_with_cancel(params, ctx, cancel, progress).await
     }
 
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -139,7 +240,7 @@ mod tests {
             &self,
             _params: Value,
             _ctx: &ToolContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>>
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>
         {
             Box::pin(async { Ok(ToolResult::success("done")) })
         }
@@ -293,5 +394,124 @@ mod tests {
             assert!(result.is_ok());
             assert_eq!(result.unwrap().output, "done");
         }
+    }
+
+    // ── WS2: Tool Abort Signals + Progress Callbacks ──────────────────────
+
+    #[test]
+    fn test_classify_summary_truncates_long_args() {
+        let tool = DummyTool;
+        let long_val = "x".repeat(200);
+        let args = serde_json::json!({"data": long_val});
+        let summary = tool.classify_summary(&args);
+        // Total arg string is >80 chars so it should be truncated with "..."
+        assert!(summary.ends_with("...)"), "expected truncated summary, got: {summary}");
+        assert!(summary.starts_with("dummy("));
+        // The inner portion is 77 chars + "..."
+        let inner = &summary["dummy(".len()..summary.len() - 1]; // strip trailing )
+        // inner = first 77 chars of json + "..."
+        assert_eq!(inner.len(), 80); // 77 + "..."
+    }
+
+    #[test]
+    fn test_classify_summary_with_empty_args() {
+        let tool = DummyTool;
+        let args = serde_json::json!({});
+        let summary = tool.classify_summary(&args);
+        assert_eq!(summary, "dummy({})");
+    }
+
+    #[test]
+    fn test_cancel_token_starts_uncancelled() {
+        let token = CancelToken::new();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_token_cancel_sets_flag() {
+        let token = CancelToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_token_clone_receiver_sees_cancellation() {
+        let token = CancelToken::new();
+        let mut rx = token.clone_receiver();
+        assert!(!*rx.borrow());
+        token.cancel();
+        // The cloned receiver should see the updated value
+        assert!(*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn test_create_execution_context_returns_working_pair() {
+        let reg = ToolRegistry::new();
+        let (cancel, _rx) = reg.create_execution_context();
+        assert!(!cancel.is_cancelled());
+        cancel.cancel();
+        assert!(cancel.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bash_tool_cancel_mid_execution() {
+        use crate::tools::bash::BashTool;
+
+        let tool = BashTool::new();
+        let cancel = CancelToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        // Spawn cancellation after a short delay
+        let cancel_clone_rx = cancel.clone_receiver();
+        let cancel_sender = CancelToken {
+            sender: cancel.sender.clone(),
+            receiver: cancel_clone_rx,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_sender.cancel();
+        });
+
+        let result = tool
+            .execute_with_cancel(
+                serde_json::json!({"command": "sleep 10"}),
+                &ctx,
+                &cancel,
+                Some(tx),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("Cancelled"),
+            "expected cancel message, got: {}",
+            result.output
+        );
+
+        // Drain any partial output from the progress channel
+        rx.close();
+    }
+
+    #[tokio::test]
+    async fn test_execute_cancellable_unknown_tool_returns_error() {
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::new();
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        let result = reg
+            .execute_cancellable("nonexistent", serde_json::json!({}), &ctx, &cancel, None)
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Unknown tool"));
     }
 }

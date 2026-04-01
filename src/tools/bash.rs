@@ -6,7 +6,8 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-use super::registry::{Tool, ToolContext, ToolResult};
+use super::registry::{CancelToken, Tool, ToolContext, ToolProgress, ToolResult};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Returns the platform-appropriate shell executable and its prefix arguments.
 ///
@@ -174,6 +175,161 @@ impl Tool for BashTool {
                 Err(_) => Ok(ToolResult::error(format!(
                     "Command timed out after {timeout_ms}ms"
                 ))),
+            }
+        })
+    }
+
+    fn execute_with_cancel(
+        &self,
+        params: Value,
+        ctx: &ToolContext,
+        cancel: &CancelToken,
+        progress: Option<tokio::sync::mpsc::Sender<ToolProgress>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>> {
+        let command = params["command"].as_str().unwrap_or("").to_string();
+        let timeout_ms = params["timeout_ms"].as_u64().unwrap_or(120_000).min(600_000);
+        let project_path = ctx.cwd.clone();
+        let cancel_rx = cancel.clone_receiver();
+
+        Box::pin(async move {
+            if command.is_empty() {
+                return Ok(ToolResult::error("No command provided"));
+            }
+
+            let working_dir = {
+                let guard = self.cwd.lock().unwrap();
+                guard.clone().unwrap_or(project_path)
+            };
+
+            let (shell, prefix_args) = shell_command();
+
+            let mut cmd = Command::new(shell);
+            for arg in prefix_args {
+                cmd.arg(arg);
+            }
+            cmd.arg(&command)
+                .current_dir(&working_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+                cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return Ok(ToolResult::error(format!("Failed to execute: {e}"))),
+            };
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let mut collected_stdout = String::new();
+            let mut collected_stderr = String::new();
+
+            // Read stdout line-by-line, checking for cancellation
+            if let Some(out) = stdout {
+                let mut reader = BufReader::new(out).lines();
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(timeout_ms);
+
+                loop {
+                    // Check cancellation
+                    if *cancel_rx.borrow() {
+                        let _ = child.kill().await;
+                        return Ok(ToolResult::error("Cancelled by user"));
+                    }
+
+                    let line_result = tokio::select! {
+                        line = reader.next_line() => line,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let _ = child.kill().await;
+                            return Ok(ToolResult::error(
+                                format!("Command timed out after {timeout_ms}ms"),
+                            ));
+                        }
+                    };
+
+                    match line_result {
+                        Ok(Some(line)) => {
+                            if let Some(ref tx) = progress {
+                                let _ = tx.try_send(ToolProgress::PartialOutput(line.clone()));
+                            }
+                            if !collected_stdout.is_empty() {
+                                collected_stdout.push('\n');
+                            }
+                            collected_stdout.push_str(&line);
+                        }
+                        Ok(None) => break, // EOF
+                        Err(e) => {
+                            collected_stderr
+                                .push_str(&format!("Error reading stdout: {e}"));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Read remaining stderr
+            if let Some(err_out) = stderr {
+                let mut reader = BufReader::new(err_out).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if !collected_stderr.is_empty() {
+                        collected_stderr.push('\n');
+                    }
+                    collected_stderr.push_str(&line);
+                }
+            }
+
+            // Final cancel check before waiting on exit status
+            if *cancel_rx.borrow() {
+                let _ = child.kill().await;
+                return Ok(ToolResult::error("Cancelled by user"));
+            }
+
+            let status = match child.wait().await {
+                Ok(s) => s,
+                Err(e) => return Ok(ToolResult::error(format!("Failed to wait: {e}"))),
+            };
+
+            // Update cwd if the command was a cd
+            if command.starts_with("cd ") {
+                let dir = command.trim_start_matches("cd ").trim();
+                let new_dir = if is_absolute_path(dir) {
+                    PathBuf::from(dir)
+                } else {
+                    working_dir.join(dir)
+                };
+                if new_dir.exists() {
+                    *self.cwd.lock().unwrap() = Some(new_dir);
+                }
+            }
+
+            let mut result = String::new();
+            if !collected_stdout.is_empty() {
+                result.push_str(&collected_stdout);
+            }
+            if !collected_stderr.is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&format!("stderr: {collected_stderr}"));
+            }
+
+            if status.success() {
+                Ok(ToolResult::success(if result.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    result
+                }))
+            } else {
+                Ok(ToolResult::error(format!(
+                    "Exit code {}\n{result}",
+                    status.code().unwrap_or(-1)
+                )))
             }
         })
     }

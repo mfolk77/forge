@@ -16,4 +16,6 @@ pub mod agent_spawn;
 pub mod task_tool;
 pub mod research_tool;
 
-pub use registry::{Tool, ToolContext, ToolResult, ToolRegistry};
+pub use registry::{
+    CancelToken, Tool, ToolContext, ToolExecution, ToolProgress, ToolRegistry, ToolResult,
+};

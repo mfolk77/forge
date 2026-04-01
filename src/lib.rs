@@ -1,8 +1,10 @@
 pub mod backend;
 pub mod config;
 pub mod conversation;
+pub mod dream;
 pub mod evolution;
 pub mod formatting;
+pub mod hooks;
 pub mod inference;
 pub mod permissions;
 pub mod plugins;

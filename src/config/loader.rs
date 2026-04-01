@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
 use crate::formatting::FormattingConfig;
+use crate::hooks::HookConfig;
 
 /// Serialize f64 with limited precision to avoid IEEE 754 noise (e.g. 0.3 → 0.30000001192092896)
 fn serialize_f64_clean<S: Serializer>(val: &f64, ser: S) -> std::result::Result<S::Ok, S::Error> {
@@ -20,6 +21,8 @@ pub struct Config {
     pub formatting: FormattingConfig,
     pub plugins: PluginsConfig,
     pub theme: ThemeConfig,
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +174,7 @@ impl Default for Config {
             formatting: FormattingConfig::default(),
             plugins: PluginsConfig::default(),
             theme: ThemeConfig::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -359,6 +363,11 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             auto_update: override_cfg.plugins.auto_update,
         },
         theme: override_cfg.theme,
+        hooks: if override_cfg.hooks.is_empty() {
+            base.hooks
+        } else {
+            override_cfg.hooks
+        },
     }
 }
 
