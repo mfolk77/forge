@@ -235,6 +235,7 @@ impl TuiApp {
             CommandEntry { trigger: "/templates".into(), description: "Show loaded templates".into() },
             CommandEntry { trigger: "/config".into(), description: "Show current configuration".into() },
             CommandEntry { trigger: "/model".into(), description: "Show or switch model".into() },
+            CommandEntry { trigger: "/api".into(), description: "Show or configure cloud API backend".into() },
             CommandEntry { trigger: "/project".into(), description: "Show or switch project path".into() },
             CommandEntry { trigger: "/memory".into(), description: "View or add memory notes".into() },
             CommandEntry { trigger: "/context".into(), description: "Manage FTAI.md project context".into() },
@@ -854,7 +855,7 @@ author = ""
     const SLASH_COMMANDS: &'static [&'static str] = &[
         "/help", "/clear", "/compact", "/rules", "/permissions", "/templates",
         "/config", "/model", "/project", "/memory", "/context", "/plugin",
-        "/hardware", "/chat", "/code", "/skill", "/theme", "/dream", "/doctor", "/quit", "/exit",
+        "/hardware", "/chat", "/code", "/skill", "/theme", "/dream", "/doctor", "/api", "/quit", "/exit",
     ];
 
     async fn handle_submit(&mut self, text: String) -> Result<()> {
@@ -1596,7 +1597,7 @@ author = ""
         match cmd {
             "/help" => {
                 self.messages.push(DisplayMessage::System(
-                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /project /memory /context /plugin /hardware /skill /theme /dream /chat /code /quit".to_string(),
+                    "Commands: /help /clear /compact /rules /permissions /templates /config /model /api /project /memory /context /plugin /hardware /skill /theme /dream /chat /code /quit".to_string(),
                 ));
             }
             "/chat" => {
@@ -2149,6 +2150,100 @@ author = ""
                     info.push_str("\nModel: (none configured)");
                 }
                 self.messages.push(DisplayMessage::System(info));
+            }
+            "/api" => {
+                match parts.get(1).copied() {
+                    Some("on") => {
+                        if self.backend.backend_name() == "api" {
+                            self.messages.push(DisplayMessage::System("API backend is already active.".to_string()));
+                        } else {
+                            match crate::backend::api_client::ApiClient::from_config(&self.config.api) {
+                                Ok(client) => {
+                                    let model = client.model().to_string();
+                                    let provider = format!("{:?}", client.provider());
+                                    self.backend = BackendManager::Api(client);
+                                    self.config.api.enabled = true;
+                                    self.messages.push(DisplayMessage::System(
+                                        format!("Switched to API backend: {provider} / {model}"),
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.messages.push(DisplayMessage::System(
+                                        format!("Failed to enable API backend: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some("off") => {
+                        if self.backend.backend_name() != "api" {
+                            self.messages.push(DisplayMessage::System("API backend is not active.".to_string()));
+                        } else {
+                            self.config.api.enabled = false;
+                            self.backend = BackendManager::from_config(&self.config);
+                            self.messages.push(DisplayMessage::System(
+                                format!("Switched to local backend: {}", self.backend.backend_name()),
+                            ));
+                        }
+                    }
+                    Some("model") => {
+                        if let Some(model_name) = parts.get(2) {
+                            if let Some(client) = self.backend.api_client_mut() {
+                                client.set_model(model_name);
+                                self.config.api.model = model_name.to_string();
+                                self.messages.push(DisplayMessage::System(
+                                    format!("API model set to: {model_name}"),
+                                ));
+                            } else {
+                                self.messages.push(DisplayMessage::System(
+                                    "API backend is not active. Use /api on first.".to_string(),
+                                ));
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /api model <name>".to_string(),
+                            ));
+                        }
+                    }
+                    Some("provider") => {
+                        if let Some(provider_name) = parts.get(2) {
+                            let provider = crate::backend::api_client::ApiProvider::from_str_loose(provider_name);
+                            if let Some(client) = self.backend.api_client_mut() {
+                                client.set_provider(provider);
+                                self.config.api.provider = provider_name.to_string();
+                                self.messages.push(DisplayMessage::System(
+                                    format!("API provider set to: {provider_name}"),
+                                ));
+                            } else {
+                                self.messages.push(DisplayMessage::System(
+                                    "API backend is not active. Use /api on first.".to_string(),
+                                ));
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System(
+                                "Usage: /api provider <name>".to_string(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // Show API status
+                        let enabled = self.config.api.enabled && self.backend.backend_name() == "api";
+                        let key_status = if let Some(key) = crate::backend::api_client::resolve_api_key(&self.config.api) {
+                            crate::backend::api_client::mask_api_key(&key)
+                        } else {
+                            "(not set)".to_string()
+                        };
+                        self.messages.push(DisplayMessage::System(format!(
+                            "API Backend\n  Status: {}\n  Provider: {}\n  Model: {}\n  Key: {}\n  Base URL: {}\n  Max tokens: {}\n\nUsage: /api on | off | model <name> | provider <name>",
+                            if enabled { "active" } else { "inactive" },
+                            self.config.api.provider,
+                            self.config.api.model,
+                            key_status,
+                            self.config.api.base_url.as_deref().unwrap_or("(default)"),
+                            self.config.api.max_tokens,
+                        )));
+                    }
+                }
             }
             "/quit" | "/exit" => {
                 self.should_quit = true;

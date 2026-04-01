@@ -23,6 +23,37 @@ pub struct Config {
     pub theme: ThemeConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub provider: String,
+    /// Direct API key (not recommended — use api_key_env instead)
+    pub api_key: Option<String>,
+    /// Name of environment variable containing the API key (recommended)
+    pub api_key_env: Option<String>,
+    pub model: String,
+    /// Override the provider's default base URL
+    pub base_url: Option<String>,
+    pub max_tokens: usize,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "anthropic".into(),
+            api_key: None,
+            api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            model: "claude-sonnet-4-20250514".into(),
+            base_url: None,
+            max_tokens: 8192,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +206,7 @@ impl Default for Config {
             plugins: PluginsConfig::default(),
             theme: ThemeConfig::default(),
             hooks: Vec::new(),
+            api: ApiConfig::default(),
         }
     }
 }
@@ -367,6 +399,15 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             base.hooks
         } else {
             override_cfg.hooks
+        },
+        api: ApiConfig {
+            enabled: override_cfg.api.enabled,
+            provider: override_cfg.api.provider,
+            api_key: override_cfg.api.api_key.or(base.api.api_key),
+            api_key_env: override_cfg.api.api_key_env.or(base.api.api_key_env),
+            model: override_cfg.api.model,
+            base_url: override_cfg.api.base_url.or(base.api.base_url),
+            max_tokens: override_cfg.api.max_tokens,
         },
     }
 }
