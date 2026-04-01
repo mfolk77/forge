@@ -2,6 +2,7 @@ pub mod backend;
 pub mod config;
 pub mod conversation;
 pub mod dream;
+#[cfg(feature = "evolution")]
 pub mod evolution;
 pub mod formatting;
 pub mod hooks;
@@ -9,6 +10,7 @@ pub mod inference;
 pub mod permissions;
 pub mod plugins;
 pub mod rules;
+#[cfg(feature = "search")]
 pub mod search;
 pub mod session;
 pub mod skills;

@@ -129,6 +129,39 @@ pub fn build_system_prompt(
         parts.push(format!("# Available Skills\n{skills}\n"));
     }
 
+    // Git context
+    if let Some(git_ctx) = build_git_context(project_path) {
+        parts.push(format!("# Environment\n{git_ctx}\n"));
+    }
+
+    // False-claims mitigation
+    parts.push(
+        "# Accuracy\n\
+         Report outcomes faithfully: if tests fail, say so with the relevant output; if you \
+         did not run a verification step, say that rather than implying it succeeded. Never \
+         claim \"all tests pass\" when output shows failures. Equally, when a check did pass, \
+         state it plainly — do not hedge confirmed results with unnecessary disclaimers.\n"
+            .to_string(),
+    );
+
+    // Thoroughness anchor
+    parts.push(
+        "# Verification\n\
+         Before reporting a task complete, verify it actually works: run the test, execute \
+         the script, check the output. If you can't verify (no test exists, can't run the \
+         code), say so explicitly rather than claiming success.\n"
+            .to_string(),
+    );
+
+    // Output efficiency (for local models)
+    parts.push(
+        "# Output Efficiency\n\
+         Go straight to the point. Lead with the action, not the reasoning. Skip filler \
+         words and preamble. Do not narrate each step or list every file you read. \
+         If you can say it in one sentence, don't use three.\n"
+            .to_string(),
+    );
+
     parts.join("\n")
 }
 
@@ -233,6 +266,63 @@ fn load_memory_layer(dir: &std::path::Path) -> Option<String> {
     } else {
         Some(entries.join("\n"))
     }
+}
+
+/// Build git context string for the system prompt (branch name, dirty status).
+/// Returns None if not a git repository or git is unavailable.
+pub fn build_git_context(project_path: &Path) -> Option<String> {
+    // Find .git directory
+    let mut dir = project_path.to_path_buf();
+    let git_root = loop {
+        if dir.join(".git").exists() {
+            break dir;
+        }
+        if !dir.pop() {
+            return None;
+        }
+    };
+
+    // Read HEAD for branch name
+    let head_path = git_root.join(".git").join("HEAD");
+    let head_content = std::fs::read_to_string(&head_path).ok()?;
+    let branch = if let Some(ref_line) = head_content.strip_prefix("ref: refs/heads/") {
+        ref_line.trim().to_string()
+    } else {
+        // Detached HEAD — use short hash
+        head_content.trim().chars().take(8).collect()
+    };
+
+    // Get dirty status via git diff --quiet HEAD
+    let is_dirty = std::process::Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .current_dir(&git_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    let diff_stats = if is_dirty {
+        let output = std::process::Command::new("git")
+            .args(["diff", "HEAD", "--shortstat"])
+            .current_dir(&git_root)
+            .output()
+            .ok()?;
+        let stats = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stats.is_empty() {
+            "dirty (untracked changes)".to_string()
+        } else {
+            stats
+        }
+    } else {
+        "clean".to_string()
+    };
+
+    Some(format!(
+        "Git: branch={branch}, status={diff_stats}, root={}",
+        git_root.display()
+    ))
 }
 
 #[cfg(test)]
@@ -587,5 +677,79 @@ mod tests {
         if let Some(c) = &ctx {
             assert!(!c.contains("Project Memory"));
         }
+    }
+
+    // ── Appendix B: System prompt additions ─────────────────────────────
+
+    #[test]
+    fn test_system_prompt_includes_false_claims_block() {
+        let path = PathBuf::from("/tmp/test-project");
+        let prompt = build_system_prompt(&path, &[], None, None, None, &[], None, None);
+        assert!(prompt.contains("Report outcomes faithfully"));
+        assert!(prompt.contains("# Accuracy"));
+    }
+
+    #[test]
+    fn test_system_prompt_includes_thoroughness_block() {
+        let path = PathBuf::from("/tmp/test-project");
+        let prompt = build_system_prompt(&path, &[], None, None, None, &[], None, None);
+        assert!(prompt.contains("Before reporting a task complete"));
+        assert!(prompt.contains("# Verification"));
+    }
+
+    #[test]
+    fn test_system_prompt_includes_output_efficiency_block() {
+        let path = PathBuf::from("/tmp/test-project");
+        let prompt = build_system_prompt(&path, &[], None, None, None, &[], None, None);
+        assert!(prompt.contains("Go straight to the point"));
+        assert!(prompt.contains("# Output Efficiency"));
+    }
+
+    // ── Appendix G: Git context ─────────────────────────────────────────
+
+    #[test]
+    fn test_git_context_returns_branch_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Initialize a git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        // Create initial commit so HEAD is valid
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let ctx = build_git_context(tmp.path());
+        assert!(ctx.is_some(), "should return context for git repo");
+        let ctx = ctx.unwrap();
+        // Default branch is usually main or master
+        assert!(
+            ctx.contains("branch=main") || ctx.contains("branch=master"),
+            "expected branch name in: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_git_context_returns_none_for_non_git_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = build_git_context(tmp.path());
+        assert!(ctx.is_none(), "non-git dir should return None");
+    }
+
+    #[test]
+    fn test_git_context_no_panic_on_bare_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a bare repo (no working tree, HEAD might not point to a branch)
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        // Should not panic — may return None or Some
+        let _ctx = build_git_context(tmp.path());
     }
 }

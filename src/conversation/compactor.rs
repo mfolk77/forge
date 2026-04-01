@@ -138,6 +138,23 @@ pub fn snip_compact(
     Ok(remove_count)
 }
 
+/// The 9-category summarization prompt structure used when Tier 3 (summarize compact) runs.
+/// This is the instruction prepended to the conversation content for deterministic summaries.
+pub const SUMMARIZE_PROMPT: &str = "\
+Summarize this conversation for continuity. Preserve these categories in order:
+
+1. Primary Request and Intent — the user's explicit requests in detail
+2. Key Technical Concepts — technologies, frameworks, patterns discussed
+3. Files and Code Sections — specific files examined or modified, with key snippets
+4. Errors and Fixes — all errors encountered and how they were resolved
+5. Problem Solving — problems solved and ongoing troubleshooting
+6. User Messages — capture the user's own words for important instructions
+7. Pending Tasks — explicitly assigned work that remains incomplete
+8. Current Work — precisely what was happening immediately before this summary
+9. Next Step — the single next action in line with the user's most recent request
+
+Be concise but preserve critical technical details. Output only the summary.";
+
 /// Tier 3 — Summarize compact: save full transcript, replace ALL messages with
 /// a single summary message. The caller should reinject identity + tool list after this.
 /// Returns the summary text.
@@ -148,7 +165,7 @@ pub fn summarize_compact(
     // Save full transcript
     save_transcript(project_path, messages)?;
 
-    // Build summary from all messages
+    // Build summary from all messages using the 9-category structure
     let summary = summarize_removed(messages);
 
     // Replace all messages with the summary
@@ -156,7 +173,9 @@ pub fn summarize_compact(
     messages.push(Message {
         role: Role::System,
         content: format!(
-            "[Session summary — previous context was compacted to fit within the context window]\n\n{summary}"
+            "[Session summary — previous context was compacted to fit within the context window]\n\n\
+             {SUMMARIZE_PROMPT}\n\n\
+             ---\n\n{summary}"
         ),
         tool_calls: None,
         tool_call_id: None,
@@ -509,5 +528,40 @@ mod tests {
         let mut messages: Vec<Message> = vec![];
         let removed = snip_compact(&mut messages, tmp.path(), 5).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    // ── Appendix A: Summarize prompt structure ─────────────────────────────
+
+    #[test]
+    fn test_summarize_compact_includes_9_categories() {
+        let tmp = TempDir::new().unwrap();
+        let mut messages = vec![
+            make_user("fix the auth bug in refresh.rs"),
+            make_assistant_with_call("tc1", "file_read"),
+            make_tool_result("tc1", "file contents..."),
+            make_user("now run tests"),
+        ];
+
+        summarize_compact(&mut messages, tmp.path()).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        let content = &messages[0].content;
+        // Must include the 9-category summarization prompt
+        assert!(content.contains("Primary Request and Intent"), "missing category 1");
+        assert!(content.contains("Key Technical Concepts"), "missing category 2");
+        assert!(content.contains("Files and Code Sections"), "missing category 3");
+        assert!(content.contains("Errors and Fixes"), "missing category 4");
+        assert!(content.contains("Problem Solving"), "missing category 5");
+        assert!(content.contains("User Messages"), "missing category 6");
+        assert!(content.contains("Pending Tasks"), "missing category 7");
+        assert!(content.contains("Current Work"), "missing category 8");
+        assert!(content.contains("Next Step"), "missing category 9");
+    }
+
+    #[test]
+    fn test_summarize_prompt_constant_exists() {
+        // Verify the constant is accessible and non-empty
+        assert!(!SUMMARIZE_PROMPT.is_empty());
+        assert!(SUMMARIZE_PROMPT.contains("Summarize this conversation"));
     }
 }

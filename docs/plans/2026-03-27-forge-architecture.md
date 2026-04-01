@@ -24,6 +24,14 @@
 
 ---
 
+> **2026-03-31 UPDATE:** Nine architecture amendments based on Claude Code source analysis
+> have been approved. See [`2026-03-31-claude-code-lessons-learned.md`](2026-03-31-claude-code-lessons-learned.md)
+> for: context compaction (P0), tool abort/progress signals (P0), JSONL transcripts,
+> glob-matched rule loading, skills system, inference fallback chain, cargo feature gates,
+> hook system, and permission denial tracking.
+
+---
+
 ## 1. Executive Summary
 
 Forge is a local-first AI development assistant. Single Rust binary. No cloud dependency. It replaces Claude Code for users who want full control over their AI tooling, running Qwen 3.5 models on consumer hardware.
@@ -1901,7 +1909,9 @@ forge/                              # Renamed from ftai/
 │   └── plans/
 │       ├── 2026-03-02-ftai-terminal-harness-design.md
 │       ├── 2026-03-02-ftai-implementation-plan.md
-│       └── 2026-03-27-forge-architecture.md          # This document
+│       ├── 2026-03-27-forge-architecture.md          # This document
+│       ├── 2026-03-31-claude-code-lessons-learned.md # Amendments from CC analysis
+│       └── 2026-03-31-agent-loop-anatomy.md          # Agent loop deep-dive from learn-claude-code
 ├── scripts/
 │   └── mlx_server.py              # MLX inference subprocess script
 ├── vendor/
@@ -1981,7 +1991,16 @@ forge/                              # Renamed from ftai/
 │   │
 │   ├── session/                   # NEW -- AKE adaptation
 │   │   ├── mod.rs                 # SessionManager
-│   │   └── budget.rs              # Token budget management
+│   │   ├── budget.rs              # Token budget management
+│   │   ├── compact.rs             # NEW (CC-amendment) -- Three-tier context compaction
+│   │   └── transcript.rs          # NEW (CC-amendment) -- JSONL append-only transcript
+│   │
+│   ├── skills/                    # NEW (CC-amendment) -- On-demand domain knowledge
+│   │   ├── mod.rs                 # SkillRegistry, trigger matching
+│   │   └── loader.rs              # YAML frontmatter parser, lazy loading
+│   │
+│   ├── hooks/                     # NEW (CC-amendment) -- Event-driven shell automation
+│   │   └── mod.rs                 # HookRunner, event dispatch
 │   │
 │   ├── permissions/               # REUSED from FTAI
 │   │   ├── mod.rs

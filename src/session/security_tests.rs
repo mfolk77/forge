@@ -255,6 +255,7 @@ mod security_tests {
     // ===================================================================
     // Evolution Store Security Tests
     // ===================================================================
+    #[cfg(feature = "evolution")]
     mod evolution_store {
         use crate::evolution::analyzer::*;
         use crate::evolution::generator::*;
@@ -407,6 +408,7 @@ mod security_tests {
     // ===================================================================
     // Evolution Generator Security Tests -- DSL INJECTION
     // ===================================================================
+    #[cfg(feature = "evolution")]
     mod evolution_generator {
         use crate::evolution::analyzer::*;
         use crate::evolution::generator::*;

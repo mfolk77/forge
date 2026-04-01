@@ -12,10 +12,12 @@ use crate::conversation::engine::ConversationEngine;
 use crate::conversation::parser::ToolCallParser;
 use crate::conversation::prompt;
 use crate::formatting::{self, TemplateSet};
-use crate::permissions::{self, GrantCache, GrantScope, PermissionGrant, PermissionVerdict};
+use crate::hooks::HookRunner;
+use crate::permissions::{self, DenialTracker, GrantCache, GrantScope, PermissionGrant, PermissionVerdict};
 use crate::rules::{EvalContext, RuleAction, RulesEngine};
 use crate::rules::parser::Event as RuleEvent;
 use crate::plugins::PluginManager;
+use crate::session::budget::TokenBudgetTracker;
 use crate::skills::LoadedSkill;
 use crate::tools::{ToolContext, ToolRegistry};
 
@@ -92,6 +94,12 @@ pub struct TuiApp {
     autocomplete: Autocomplete,
     /// Progress tracking: rounds since last task tool call (for nag injection)
     rounds_since_task_update: usize,
+    /// User-level hook runner (from config.toml [[hooks]])
+    hook_runner: HookRunner,
+    /// Denial streak tracker for permission escalation
+    denial_tracker: DenialTracker,
+    /// Diminishing-returns tracker for the agentic loop
+    budget_tracker: TokenBudgetTracker,
 }
 
 impl TuiApp {
@@ -244,6 +252,9 @@ impl TuiApp {
             });
         }
         let autocomplete = Autocomplete::new(ac_commands);
+        let hook_runner = HookRunner::from_config(&config);
+        let denial_tracker = DenialTracker::new();
+        let budget_tracker = TokenBudgetTracker::new();
 
         Self {
             config,
@@ -270,6 +281,9 @@ impl TuiApp {
             active_modal: None,
             autocomplete,
             rounds_since_task_update: 0,
+            hook_runner,
+            denial_tracker,
+            budget_tracker,
         }
     }
 
@@ -304,7 +318,21 @@ impl TuiApp {
             }
         }
 
+        // Run session_start hook
+        {
+            let mut env = std::collections::HashMap::new();
+            env.insert("FORGE_PROJECT".to_string(), self.project_path.display().to_string());
+            let _ = self.hook_runner.run("session_start", &env).await;
+        }
+
         let result = self.main_loop(&mut terminal).await;
+
+        // Run session_end hook
+        {
+            let mut env = std::collections::HashMap::new();
+            env.insert("FORGE_PROJECT".to_string(), self.project_path.display().to_string());
+            let _ = self.hook_runner.run("session_end", &env).await;
+        }
 
         // Restore terminal
         terminal::disable_raw_mode()?;
@@ -996,12 +1024,14 @@ author = ""
                 }
                 PermissionVerdict::NeedsConfirmation(desc) => {
                     if !self.prompt_user_permission(&desc) {
+                        self.denial_tracker.record_denial(&call.name, &call.arguments);
                         self.messages.push(DisplayMessage::PermissionDenied {
                             tool: call.name.clone(),
                         });
                         self.engine.add_tool_result(&call.id, "DENIED: User declined permission");
                         continue;
                     }
+                    self.denial_tracker.reset_denials(&call.name, &call.arguments);
                 }
                 PermissionVerdict::Approved => {}
             }
@@ -1072,15 +1102,31 @@ author = ""
                     let args_summary = summarize_args(&call.arguments);
                     match self.tools.execute(&call.name, call.arguments.clone(), &ctx).await {
                         Ok(result) => {
+                            // Persist large results to disk (Appendix C)
+                            let output = crate::tools::result_storage::maybe_persist_result(
+                                &result.output,
+                                &call.name,
+                                &self.project_path,
+                            );
+
                             self.messages.push(DisplayMessage::ToolCall {
                                 name: call.name.clone(),
                                 args_summary: args_summary.clone(),
-                                result: result.output.clone(),
+                                result: output.clone(),
                                 is_error: result.is_error,
                             });
-                            self.engine.add_tool_result(&call.id, &result.output);
+                            self.engine.add_tool_result(&call.id, &output);
 
-                            // Run post-hooks
+                            // Run after_file_edit user hook for file tools
+                            if call.name == "file_edit" || call.name == "file_write" {
+                                if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
+                                    let mut env = std::collections::HashMap::new();
+                                    env.insert("FORGE_FILE_PATH".to_string(), path.to_string());
+                                    let _ = self.hook_runner.run("after_file_edit", &env).await;
+                                }
+                            }
+
+                            // Run post-hooks (plugin hooks)
                             let post_event = format!("post:{}", call.name);
                             let post_hooks = self.plugin_manager.get_hooks(&post_event);
                             for hook in &post_hooks {
@@ -1088,7 +1134,7 @@ author = ""
                                     hook,
                                     &call.name,
                                     &params_json,
-                                    &result.output,
+                                    &output,
                                     &self.project_path,
                                 ).await;
                             }

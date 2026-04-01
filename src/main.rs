@@ -2,6 +2,7 @@ mod backend;
 mod config;
 mod conversation;
 mod dream;
+#[cfg(feature = "evolution")]
 mod evolution;
 mod formatting;
 mod hooks;
@@ -9,6 +10,7 @@ mod inference;
 mod permissions;
 mod plugins;
 mod rules;
+#[cfg(feature = "search")]
 mod search;
 mod session;
 mod skills;
@@ -43,6 +45,8 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Check system health: backends, config, hardware
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -232,6 +236,52 @@ async fn main() -> Result<()> {
                     .status()?;
             }
         },
+        Some(Commands::Doctor) => {
+            println!("Forge Doctor");
+            println!("============\n");
+
+            // Backend probe
+            let probe = backend::BackendProbeResults::probe();
+            println!("{}\n", probe.display());
+
+            // Hardware info
+            let hw = backend::manager::BackendManager::hardware_info();
+            println!("Hardware");
+            println!("--------");
+            println!("{hw:?}\n");
+
+            // Config validity
+            println!("Configuration");
+            println!("-------------");
+            println!("Backend: {:?}", config.model.backend);
+            println!("Context length: {}", config.model.context_length);
+            match &config.model.path {
+                Some(path) => {
+                    let exists = std::path::Path::new(path).exists();
+                    println!(
+                        "Model path: {path} ({})",
+                        if exists { "exists" } else { "NOT FOUND" }
+                    );
+                }
+                None => println!("Model path: (none configured)"),
+            }
+
+            // Config file locations
+            let global = config::global_config_dir()?;
+            println!(
+                "Global config: {} ({})",
+                global.join("config.toml").display(),
+                if global.join("config.toml").exists() { "exists" } else { "missing" }
+            );
+            let project_ftai = project_path.join(".ftai").join("config.toml");
+            println!(
+                "Project config: {} ({})",
+                project_ftai.display(),
+                if project_ftai.exists() { "exists" } else { "not present" }
+            );
+
+            println!("\nAll checks complete.");
+        }
         None => {
             // Default: start interactive TUI session
             let mut app = tui::TuiApp::new(config, project_path);

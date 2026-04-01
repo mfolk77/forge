@@ -15,6 +15,7 @@ pub mod memory_tool;
 pub mod agent_spawn;
 pub mod task_tool;
 pub mod research_tool;
+pub mod result_storage;
 
 pub use registry::{
     CancelToken, Tool, ToolContext, ToolExecution, ToolProgress, ToolRegistry, ToolResult,

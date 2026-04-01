@@ -1,16 +1,48 @@
-# FTAI
+# Forge (formerly FTAI)
 
 ## Build & Test
 - `cargo build` — build debug binary
 - `cargo test` — 212 tests (182 lib + 30 integration)
-- `cargo install --path . --root ~/.local --force` — install globally as `ftai`
-- Binary location: `~/.local/bin/ftai`
+- `cargo install --path . --root ~/.local --force` — install globally as `forge`
+- Binary location: `~/.local/bin/forge`
 
 ## Architecture
 - Rust monolithic binary, TUI via ratatui + crossterm
-- Modules: backend, config, conversation, formatting, permissions, plugins, rules, tools, tui
+- Existing modules: backend, config, conversation, formatting, permissions, plugins, rules, tools, tui
+- New modules (planned): inference, search, evolution, session, skills, hooks
 - Config precedence: defaults → ~/.ftai/config.toml → ~/.ftai/projects/<encoded>/config.toml → <project>/.ftai/config.toml
-- System prompt order: identity → FTAI.md → tools → rules → memory → formatting → project rules → plugin skills
+- System prompt order: identity → FTAI.md → tools → rules → memory → formatting → project rules → plugin skills → active skills (on-demand)
+
+## Architecture Docs
+- Main: `docs/plans/2026-03-27-forge-architecture.md`
+- Tool calling: `docs/plans/2026-03-27-tool-calling-subsystem-design.md`
+- Claude Code amendments: `docs/plans/2026-03-31-claude-code-lessons-learned.md`
+- Agent loop deep-dive: `docs/plans/2026-03-31-agent-loop-anatomy.md`
+
+## Agent Loop Design (from learn-claude-code analysis)
+- Loop is stateless — exits on `stop_reason != tool_use`, model decides when to stop
+- Tool results are user messages — conversation always alternates user/assistant
+- Errors are tool results — never crash from tool error, let model decide next action
+- Pre-LLM-call checklist: drain background → micro_compact → check budget → reinject identity → call model
+- Subagents get fresh `Vec<Message>`, restricted tool set, return summary only
+- Persistent state (tasks, team) lives on disk, survives context compaction
+- Background execution: fire-and-forget spawn, drain notification queue at top of loop
+
+## Context Management (from CC analysis)
+- 32K context window, ~26K available for conversation after system overhead
+- Three-tier compaction: microcompact (truncate tool results) → snip (deterministic old message removal) → summarize (emergency model call)
+- Post-compaction reinject: FTAI rules, active skills, tool definitions re-attached after snip
+- All tools support CancellationToken (Ctrl+C abort) and progress callbacks
+
+## Session Storage
+- Live transcripts: JSONL append-only at `~/.ftai/sessions/<project>/<session>.jsonl`
+- Cross-session analytics: SQLite at `~/.ftai/evolution/evolution.db` (feeds Mitosis)
+- Resume filtering: skip progress/stale-context entries on replay
+
+## Skills vs Rules
+- Rules: always-on or glob-matched, small (<200 tokens), enforce conventions via FTAI DSL
+- Skills: on-demand via trigger keywords, can be large (500-2000 tokens), markdown with YAML frontmatter
+- Skills loaded lazily — only metadata at session start, full content when triggers match
 
 ## Model System
 - Models stored in `~/.ftai/models/<name>/`

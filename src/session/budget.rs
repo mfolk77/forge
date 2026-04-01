@@ -99,6 +99,72 @@ impl TokenBudget {
     }
 }
 
+// ─── Diminishing Returns Tracker ──────────────────────────────────────────
+
+const COMPLETION_THRESHOLD: f32 = 0.9; // 90% = consider stopping
+const DIMINISHING_THRESHOLD: usize = 500; // <500 new tokens/turn = diminishing returns
+const MAX_DIMINISHING_CONTINUATIONS: u32 = 3;
+
+/// Tracks whether the agentic loop is making diminishing progress.
+///
+/// Returns `should_stop = true` when:
+/// - Token usage exceeds 90% of budget, OR
+/// - The last 3 consecutive turns each produced <500 new tokens (spinning)
+#[derive(Debug, Clone)]
+pub struct TokenBudgetTracker {
+    pub continuation_count: u32,
+    pub last_delta_tokens: usize,
+}
+
+impl TokenBudgetTracker {
+    pub fn new() -> Self {
+        Self {
+            continuation_count: 0,
+            last_delta_tokens: 0,
+        }
+    }
+
+    /// Check if the loop should stop. Call after each turn with the turn's
+    /// token count and the total budget.
+    pub fn should_stop(&mut self, turn_tokens: usize, budget: usize) -> bool {
+        if budget == 0 {
+            return true;
+        }
+
+        let pct = turn_tokens as f32 / budget as f32;
+        if pct >= COMPLETION_THRESHOLD {
+            return true;
+        }
+
+        if turn_tokens > 0 && turn_tokens < DIMINISHING_THRESHOLD {
+            self.continuation_count += 1;
+            if self.continuation_count >= MAX_DIMINISHING_CONTINUATIONS {
+                return true;
+            }
+        } else {
+            self.continuation_count = 0;
+        }
+        self.last_delta_tokens = turn_tokens;
+        false
+    }
+
+    /// Build the stop message injected when the tracker triggers.
+    pub fn stop_message(turn_tokens: usize, budget: usize) -> String {
+        let pct = if budget > 0 {
+            (turn_tokens as f64 / budget as f64 * 100.0) as u32
+        } else {
+            100
+        };
+        format!("Stopped at {pct}% of token target. Keep working — do not summarize.")
+    }
+}
+
+impl Default for TokenBudgetTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +287,62 @@ mod tests {
     fn test_estimate_tokens_empty() {
         // Edge case: (0 + 3) / 4 = 0 via integer division.
         assert_eq!(TokenBudget::estimate_tokens(""), 0);
+    }
+
+    // ── TokenBudgetTracker tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_tracker_new_state() {
+        let tracker = TokenBudgetTracker::new();
+        assert_eq!(tracker.continuation_count, 0);
+        assert_eq!(tracker.last_delta_tokens, 0);
+    }
+
+    #[test]
+    fn test_tracker_stops_at_90_percent() {
+        let mut tracker = TokenBudgetTracker::new();
+        // 9500 / 10000 = 0.95 >= 0.9
+        assert!(tracker.should_stop(9500, 10000));
+    }
+
+    #[test]
+    fn test_tracker_does_not_stop_below_threshold() {
+        let mut tracker = TokenBudgetTracker::new();
+        // 5000 / 10000 = 0.5 < 0.9
+        assert!(!tracker.should_stop(5000, 10000));
+    }
+
+    #[test]
+    fn test_tracker_diminishing_returns_after_three() {
+        let mut tracker = TokenBudgetTracker::new();
+        // Each call with 100 < 500 tokens increments the count
+        assert!(!tracker.should_stop(100, 10000)); // count=1
+        assert!(!tracker.should_stop(100, 10000)); // count=2
+        assert!(tracker.should_stop(100, 10000));  // count=3 => stop
+    }
+
+    #[test]
+    fn test_tracker_resets_on_large_delta() {
+        let mut tracker = TokenBudgetTracker::new();
+        assert!(!tracker.should_stop(100, 10000));
+        assert!(!tracker.should_stop(100, 10000));
+        // Now produce a large delta — resets count
+        assert!(!tracker.should_stop(1000, 10000));
+        // Count should be back to 0
+        assert_eq!(tracker.continuation_count, 0);
+    }
+
+    #[test]
+    fn test_tracker_stop_message_format() {
+        let msg = TokenBudgetTracker::stop_message(9000, 10000);
+        assert!(msg.contains("90%"));
+        assert!(msg.contains("Keep working"));
+    }
+
+    #[test]
+    fn test_tracker_zero_budget() {
+        let mut tracker = TokenBudgetTracker::new();
+        // Zero budget should return true immediately (div-by-zero guard)
+        assert!(tracker.should_stop(100, 0));
     }
 }

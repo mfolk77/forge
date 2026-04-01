@@ -1680,6 +1680,28 @@ mod cli_commands {
     }
 
     #[test]
+    fn test_doctor_exits_zero() {
+        let output = forge_cmd()
+            .arg("doctor")
+            .output()
+            .expect("failed to execute forge doctor");
+        assert!(output.status.success(), "forge doctor should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Forge Doctor"),
+            "doctor output should contain header: {stdout}"
+        );
+        assert!(
+            stdout.contains("Backend Probe Results"),
+            "doctor output should contain probe results: {stdout}"
+        );
+        assert!(
+            stdout.contains("Configuration"),
+            "doctor output should contain config section: {stdout}"
+        );
+    }
+
+    #[test]
     fn test_model_install_invalid_name_fails() {
         // huggingface-cli is unlikely to be present in CI and this repo ID is invalid
         let output = forge_cmd()
