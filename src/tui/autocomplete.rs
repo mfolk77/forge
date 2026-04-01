@@ -90,7 +90,7 @@ impl Autocomplete {
                 self.dismiss();
                 AutocompleteResult::Dismiss
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Tab => {
                 if let Some(&idx) = self.filtered.get(self.selected) {
                     let trigger = self.commands[idx].trigger.clone();
                     self.dismiss();
@@ -103,12 +103,14 @@ impl Autocomplete {
             KeyCode::Up => {
                 if self.selected > 0 {
                     self.selected -= 1;
+                } else if !self.filtered.is_empty() {
+                    self.selected = self.filtered.len() - 1; // wrap around
                 }
                 AutocompleteResult::Continue
             }
             KeyCode::Down => {
-                if !self.filtered.is_empty() && self.selected < self.filtered.len() - 1 {
-                    self.selected += 1;
+                if !self.filtered.is_empty() {
+                    self.selected = (self.selected + 1) % self.filtered.len(); // wrap around
                 }
                 AutocompleteResult::Continue
             }
@@ -122,29 +124,53 @@ impl Autocomplete {
                     AutocompleteResult::Continue
                 }
             }
+            KeyCode::Char(' ') => {
+                // Space with a single filtered result = select it
+                if self.filtered.len() == 1 {
+                    let idx = self.filtered[0];
+                    let trigger = self.commands[idx].trigger.clone();
+                    self.dismiss();
+                    AutocompleteResult::Selected(trigger)
+                } else {
+                    // Dismiss autocomplete, let the space go to input
+                    self.dismiss();
+                    AutocompleteResult::Dismiss
+                }
+            }
             KeyCode::Char(c) => {
                 self.query.push(c);
                 self.update_filter();
+                // Auto-select if exactly one match and query matches trigger exactly
+                if self.filtered.len() == 1 {
+                    let idx = self.filtered[0];
+                    let trigger_name = self.commands[idx].trigger.trim_start_matches('/');
+                    if trigger_name == self.query {
+                        let trigger = self.commands[idx].trigger.clone();
+                        self.dismiss();
+                        return AutocompleteResult::Selected(trigger);
+                    }
+                }
                 AutocompleteResult::Continue
             }
             _ => AutocompleteResult::Continue,
         }
     }
 
-    /// Render the autocomplete dropdown as an overlay above the input area.
-    /// `input_area` is the Rect of the input widget — the dropdown renders above it.
-    pub fn render(&self, theme: &Theme, input_area: Rect, buf: &mut Buffer) {
+    /// Render the autocomplete dropdown at the bottom of the given area.
+    /// `area` should be the message area — the dropdown renders at its bottom edge.
+    pub fn render(&self, theme: &Theme, area: Rect, buf: &mut Buffer) {
         if !self.active || self.filtered.is_empty() {
             return;
         }
 
         let max_visible = 8.min(self.filtered.len());
         let dropdown_height = max_visible as u16 + 2; // +2 for border
-        let dropdown_width = (input_area.width).min(60);
+        let dropdown_width = area.width.min(70);
 
-        // Position above the input area
-        let y = input_area.y.saturating_sub(dropdown_height);
-        let area = Rect::new(input_area.x, y, dropdown_width, dropdown_height);
+        // Position at the bottom of the area
+        let y = (area.y + area.height).saturating_sub(dropdown_height);
+        let dropdown = Rect::new(area.x + 1, y, dropdown_width, dropdown_height);
+        let area = dropdown;
 
         // Determine scroll window
         let scroll_start = if self.selected >= max_visible {

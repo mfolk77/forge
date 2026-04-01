@@ -562,9 +562,9 @@ impl TuiApp {
             frame.buffer_mut(),
         );
 
-        // Render autocomplete overlay above the input area if active
+        // Render autocomplete overlay in the message area (bottom-aligned)
         if self.autocomplete.active {
-            self.autocomplete.render(&self.theme, layout[3], frame.buffer_mut());
+            self.autocomplete.render(&self.theme, layout[1], frame.buffer_mut());
         }
 
         // Position the terminal cursor inside the input area
