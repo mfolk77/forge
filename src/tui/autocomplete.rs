@@ -125,31 +125,13 @@ impl Autocomplete {
                 }
             }
             KeyCode::Char(' ') => {
-                // Space with a single filtered result = select it
-                if self.filtered.len() == 1 {
-                    let idx = self.filtered[0];
-                    let trigger = self.commands[idx].trigger.clone();
-                    self.dismiss();
-                    AutocompleteResult::Selected(trigger)
-                } else {
-                    // Dismiss autocomplete, let the space go to input
-                    self.dismiss();
-                    AutocompleteResult::Dismiss
-                }
+                // Space dismisses autocomplete — user is typing arguments
+                self.dismiss();
+                AutocompleteResult::Dismiss
             }
             KeyCode::Char(c) => {
                 self.query.push(c);
                 self.update_filter();
-                // Auto-select if exactly one match and query matches trigger exactly
-                if self.filtered.len() == 1 {
-                    let idx = self.filtered[0];
-                    let trigger_name = self.commands[idx].trigger.trim_start_matches('/');
-                    if trigger_name == self.query {
-                        let trigger = self.commands[idx].trigger.clone();
-                        self.dismiss();
-                        return AutocompleteResult::Selected(trigger);
-                    }
-                }
                 AutocompleteResult::Continue
             }
             _ => AutocompleteResult::Continue,
