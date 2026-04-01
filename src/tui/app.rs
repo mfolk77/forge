@@ -1360,8 +1360,44 @@ author = ""
                 }
             }
             "/memory" => {
-                if parts.len() > 1 {
-                    // /memory <text> — append to project memory
+                if parts.len() > 1 && parts[1] == "delete" {
+                    // /memory delete <name> — delete a specific memory file
+                    if parts.len() < 3 {
+                        self.messages.push(DisplayMessage::System(
+                            "Usage: /memory delete <name>".to_string(),
+                        ));
+                    } else {
+                        let name = parts[2];
+                        // Validate name before constructing path
+                        if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+                            self.messages.push(DisplayMessage::System(
+                                "Invalid memory name.".to_string(),
+                            ));
+                        } else {
+                            let memory_dir = self.project_path.join(".ftai").join("memory");
+                            let file = memory_dir.join(format!("{name}.md"));
+                            if file.exists() {
+                                match std::fs::remove_file(&file) {
+                                    Ok(_) => {
+                                        self.messages.push(DisplayMessage::System(
+                                            format!("Deleted memory: {name}"),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.messages.push(DisplayMessage::System(
+                                            format!("Error deleting memory: {e}"),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                self.messages.push(DisplayMessage::System(
+                                    format!("Memory \"{name}\" not found."),
+                                ));
+                            }
+                        }
+                    }
+                } else if parts.len() > 1 {
+                    // /memory <text> — append to project memory (legacy MEMORY.md)
                     let note = parts[1..].join(" ");
                     let memory_dir = self.project_path.join(".ftai").join("memory");
                     let _ = std::fs::create_dir_all(&memory_dir);
@@ -1384,11 +1420,29 @@ author = ""
                         }
                     }
                 } else {
-                    // /memory — show current memory
-                    let memory = crate::conversation::prompt::load_memory_context(&self.project_path);
-                    match memory {
-                        Some(m) => self.messages.push(DisplayMessage::System(m)),
-                        None => self.messages.push(DisplayMessage::System("No memory notes found.".to_string())),
+                    // /memory — list all memory files with previews
+                    let memory_dir = self.project_path.join(".ftai").join("memory");
+                    let has_files = memory_dir.exists() && std::fs::read_dir(&memory_dir)
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(false);
+
+                    if has_files {
+                        if let Ok(entries) = crate::tools::memory_tool::read_memory_dir(&memory_dir, None) {
+                            if entries.is_empty() {
+                                self.messages.push(DisplayMessage::System("No memory notes found.".to_string()));
+                            } else {
+                                let mut output = String::from("Memory files:\n");
+                                for (name, content) in &entries {
+                                    let preview: String = content.lines().next().unwrap_or("(empty)").chars().take(80).collect();
+                                    output.push_str(&format!("  {name} — {preview}\n"));
+                                }
+                                self.messages.push(DisplayMessage::System(output));
+                            }
+                        } else {
+                            self.messages.push(DisplayMessage::System("Error reading memory directory.".to_string()));
+                        }
+                    } else {
+                        self.messages.push(DisplayMessage::System("No memory notes found.".to_string()));
                     }
                 }
             }

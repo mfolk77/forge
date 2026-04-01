@@ -11,5 +11,6 @@ pub mod ask_user;
 pub mod request_permissions;
 pub mod execution_log;
 pub mod validator;
+pub mod memory_tool;
 
 pub use registry::{Tool, ToolContext, ToolResult, ToolRegistry};

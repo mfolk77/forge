@@ -163,34 +163,75 @@ pub fn build_chat_system_prompt(
     parts.join("\n")
 }
 
-/// Load memory context from ~/.ftai/memory/ and project memory
+/// Load memory context from ~/.ftai/memory/ and project memory directories.
+///
+/// Reads individual `.md` files from each memory directory layer, strips
+/// YAML frontmatter, and formats them with the filename as a heading.
+/// Also supports the legacy MEMORY.md single-file format.
 pub fn load_memory_context(project_path: &Path) -> Option<String> {
-    let mut memory_parts = Vec::new();
+    let mut parts = Vec::new();
 
-    // Global memory
+    // Global memories (~/.ftai/memory/)
     if let Ok(global_dir) = crate::config::global_config_dir() {
-        let global_memory = global_dir.join("memory").join("MEMORY.md");
-        if global_memory.exists() {
-            if let Ok(content) = std::fs::read_to_string(&global_memory) {
-                memory_parts.push(content);
-            }
+        let global_memory_dir = global_dir.join("memory");
+        if let Some(content) = load_memory_layer(&global_memory_dir) {
+            parts.push(format!("## Global Memory\n{content}"));
         }
     }
 
-    // Project memory
+    // Project memories (<project>/.ftai/memory/)
+    let project_memory_dir = project_path.join(".ftai").join("memory");
+    if let Some(content) = load_memory_layer(&project_memory_dir) {
+        parts.push(format!("## Project Memory\n{content}"));
+    }
+
+    // User-specific project memories (~/.ftai/projects/<encoded>/memory/)
     if let Ok(project_dir) = crate::config::project_config_dir(project_path) {
-        let project_memory = project_dir.join("memory").join("MEMORY.md");
-        if project_memory.exists() {
-            if let Ok(content) = std::fs::read_to_string(&project_memory) {
-                memory_parts.push(content);
-            }
+        let user_project_memory = project_dir.join("memory");
+        if let Some(content) = load_memory_layer(&user_project_memory) {
+            parts.push(format!("## User Project Memory\n{content}"));
         }
     }
 
-    if memory_parts.is_empty() {
+    if parts.is_empty() {
         None
     } else {
-        Some(memory_parts.join("\n---\n"))
+        Some(parts.join("\n---\n"))
+    }
+}
+
+/// Load memories from a single directory layer.
+/// Reads all `.md` files and also supports legacy `MEMORY.md` bullet format.
+fn load_memory_layer(dir: &std::path::Path) -> Option<String> {
+    use crate::tools::memory_tool::{read_memory_dir, strip_frontmatter};
+
+    if !dir.exists() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+
+    // Read individual memory files
+    if let Ok(files) = read_memory_dir(dir, None) {
+        for (name, content) in files {
+            // Skip MEMORY.md here — we handle it separately for legacy compat
+            if name == "MEMORY" {
+                // Legacy format: include as-is without heading transformation
+                if !content.trim().is_empty() {
+                    entries.push(content);
+                }
+                continue;
+            }
+            if !content.trim().is_empty() {
+                entries.push(format!("### {name}\n{content}"));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join("\n"))
     }
 }
 
@@ -457,5 +498,94 @@ mod tests {
         // Identity and restraint directive must still be present at the top
         assert!(prompt.starts_with("You are Forge"),
             "Identity must come first, before any injected memory");
+    }
+
+    // ── Memory loading tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_load_memory_context_reads_individual_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory_dir = tmp.path().join(".ftai").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        std::fs::write(
+            memory_dir.join("auth-design.md"),
+            "---\ncategory: decision\ncreated: 2026-03-29T00:00:00Z\n---\n\nJWT with RS256.",
+        ).unwrap();
+
+        std::fs::write(
+            memory_dir.join("db-choice.md"),
+            "---\ncategory: project\ncreated: 2026-03-29T00:00:00Z\n---\n\nUsing PostgreSQL.",
+        ).unwrap();
+
+        let ctx = load_memory_context(tmp.path());
+        assert!(ctx.is_some());
+        let ctx = ctx.unwrap();
+        assert!(ctx.contains("auth-design"), "should contain memory name as heading");
+        assert!(ctx.contains("JWT with RS256"), "should contain memory content");
+        assert!(ctx.contains("db-choice"));
+        assert!(ctx.contains("Using PostgreSQL"));
+        // Frontmatter should be stripped
+        assert!(!ctx.contains("category: decision"), "frontmatter should be stripped");
+    }
+
+    #[test]
+    fn test_load_memory_context_strips_frontmatter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory_dir = tmp.path().join(".ftai").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        std::fs::write(
+            memory_dir.join("note.md"),
+            "---\ncategory: user\ncreated: 2026-01-01T00:00:00Z\n---\n\nClean content here.",
+        ).unwrap();
+
+        let ctx = load_memory_context(tmp.path()).unwrap();
+        assert!(ctx.contains("Clean content here."));
+        assert!(!ctx.contains("category: user"));
+        assert!(!ctx.contains("created: 2026"));
+    }
+
+    #[test]
+    fn test_load_memory_context_legacy_memory_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory_dir = tmp.path().join(".ftai").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        // Legacy format: bullet points in MEMORY.md
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "- User prefers Rust\n- Always use snake_case\n",
+        ).unwrap();
+
+        let ctx = load_memory_context(tmp.path());
+        assert!(ctx.is_some());
+        let ctx = ctx.unwrap();
+        assert!(ctx.contains("User prefers Rust"));
+        assert!(ctx.contains("Always use snake_case"));
+    }
+
+    #[test]
+    fn test_load_memory_context_empty_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory_dir = tmp.path().join(".ftai").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let ctx = load_memory_context(tmp.path());
+        // Empty memory dir may or may not return None depending on global config.
+        // The key invariant is no crash and no project memory content.
+        if let Some(c) = &ctx {
+            assert!(!c.contains("Project Memory"), "empty project memory dir should not produce a section");
+        }
+    }
+
+    #[test]
+    fn test_load_memory_context_no_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No .ftai/memory dir at all — should be None (unless global config exists)
+        let ctx = load_memory_context(tmp.path());
+        if let Some(c) = &ctx {
+            assert!(!c.contains("Project Memory"));
+        }
     }
 }

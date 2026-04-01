@@ -110,6 +110,8 @@ impl ToolRegistry {
         reg.register(super::web_fetch::WebFetchTool);
         reg.register(super::ask_user::AskUserTool);
         reg.register(super::request_permissions::RequestPermissionsTool);
+        reg.register(super::memory_tool::MemoryReadTool);
+        reg.register(super::memory_tool::MemoryWriteTool);
         reg
     }
 }
@@ -193,6 +195,8 @@ mod tests {
         assert!(reg.get("git").is_some());
         assert!(reg.get("web_fetch").is_some());
         assert!(reg.get("ask_user").is_some());
+        assert!(reg.get("memory_read").is_some());
+        assert!(reg.get("memory_write").is_some());
     }
 
     // ── P0 Security Red Tests ──────────────────────────────────────────────
