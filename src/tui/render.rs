@@ -341,6 +341,7 @@ pub fn render_messages(
     messages: &[DisplayMessage],
     mode: &str,
     theme: &Theme,
+    user_scroll: u16,
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -458,18 +459,20 @@ pub fn render_messages(
         .sum();
     let visible_rows = area.height as usize;
 
-    if total_visual_rows < visible_rows {
+    if total_visual_rows < visible_rows && user_scroll == 0 {
         // Pad top with empty lines to push messages to the bottom
         let pad = visible_rows - total_visual_rows;
         let mut padded = vec![Line::from(""); pad];
         padded.append(&mut lines);
         lines = padded;
-    } else {
-        // More content than fits — scroll to show latest
-        let scroll_offset = total_visual_rows.saturating_sub(visible_rows) as u16;
+    } else if total_visual_rows > visible_rows {
+        // More content than fits — scroll to show latest, adjusted by user scroll
+        let auto_scroll = total_visual_rows.saturating_sub(visible_rows) as u16;
+        // user_scroll scrolls UP from the bottom (0 = pinned to latest)
+        let effective_scroll = auto_scroll.saturating_sub(user_scroll);
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((scroll_offset, 0));
+            .scroll((effective_scroll, 0));
         para.render(area, buf);
         return;
     }
@@ -662,7 +665,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
     }
 
     #[test]
@@ -679,7 +682,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
         // Just verifying no panic
     }
 
@@ -705,7 +708,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
     }
 
     #[test]
@@ -727,7 +730,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, 60);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
         // Check the buffer contains the truncation text
         let mut content = String::new();
         for y in 0..area.height {
@@ -772,7 +775,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
         // No panic = pass
     }
 
@@ -789,7 +792,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
     }
 
     #[test]
@@ -804,7 +807,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
     }
 
     #[test]
@@ -829,7 +832,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let theme = Theme::from_config(&crate::config::ThemeConfig::default());
-        render_messages(&messages, "coding", &theme, area, &mut buf);
+        render_messages(&messages, "coding", &theme, 0, area, &mut buf);
     }
 
     #[test]

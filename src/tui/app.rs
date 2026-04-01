@@ -358,6 +358,8 @@ impl TuiApp {
         // Enter TUI mode FIRST so the user can see the splash and exit
         terminal::enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
+        // Enable mouse capture to intercept scroll events (prevents terminal scrollback bleed)
+        stdout().execute(crossterm::event::EnableMouseCapture)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
         // Show splash immediately
@@ -402,6 +404,7 @@ impl TuiApp {
         }
 
         // Restore terminal
+        stdout().execute(crossterm::event::DisableMouseCapture)?;
         terminal::disable_raw_mode()?;
         stdout().execute(LeaveAlternateScreen)?;
 
@@ -448,10 +451,24 @@ impl TuiApp {
             // Render
             terminal.draw(|frame| self.render(frame))?;
 
-            // Poll for key events (non-blocking)
+            // Poll for events (non-blocking)
             if event::poll(std::time::Duration::from_millis(16))? {
-                if let Event::Key(key) = event::read()? {
-                    self.handle_key(key).await?;
+                match event::read()? {
+                    Event::Key(key) => {
+                        self.handle_key(key).await?;
+                    }
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -537,7 +554,7 @@ impl TuiApp {
                     format!("{}▊", self.streaming_text),
                 ));
             }
-            render::render_messages(&display_msgs, self.mode.label(), &self.theme, layout[1], frame.buffer_mut());
+            render::render_messages(&display_msgs, self.mode.label(), &self.theme, self.scroll_offset, layout[1], frame.buffer_mut());
         }
 
         // Status line
