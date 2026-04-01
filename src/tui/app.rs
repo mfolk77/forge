@@ -744,8 +744,35 @@ impl TuiApp {
                     "# Skill: {}\n{}", name, content
                 ));
             }
+            ModalAction::SelectTheme(name) => {
+                self.active_modal = None;
+                self.apply_theme(&name);
+            }
         }
         Ok(())
+    }
+
+    /// Apply a theme by name.
+    fn apply_theme(&mut self, name: &str) {
+        let preset = match name {
+            "dark" => Some(crate::config::ThemePreset::Dark),
+            "light" => Some(crate::config::ThemePreset::Light),
+            "high-contrast" => Some(crate::config::ThemePreset::HighContrast),
+            "solarized" => Some(crate::config::ThemePreset::Solarized),
+            "dracula" => Some(crate::config::ThemePreset::Dracula),
+            _ => None,
+        };
+        if let Some(preset) = preset {
+            self.config.theme.preset = preset;
+            self.theme = render::Theme::from_config(&self.config.theme);
+            self.messages.push(DisplayMessage::System(
+                format!("Theme switched to: {name}"),
+            ));
+        } else {
+            self.messages.push(DisplayMessage::System(
+                format!("Unknown theme: {name}"),
+            ));
+        }
     }
 
     /// Scaffold a new plugin directory at ~/.ftai/plugins/<name>/.
@@ -2040,32 +2067,13 @@ author = ""
             }
             "/theme" => {
                 if let Some(name) = parts.get(1) {
-                    let preset = match *name {
-                        "dark" => Some(crate::config::ThemePreset::Dark),
-                        "light" => Some(crate::config::ThemePreset::Light),
-                        "high-contrast" => Some(crate::config::ThemePreset::HighContrast),
-                        "solarized" => Some(crate::config::ThemePreset::Solarized),
-                        "dracula" => Some(crate::config::ThemePreset::Dracula),
-                        _ => None,
-                    };
-                    if let Some(preset) = preset {
-                        self.config.theme.preset = preset;
-                        self.theme = render::Theme::from_config(&self.config.theme);
-                        self.messages.push(DisplayMessage::System(
-                            format!("Theme switched to: {name}"),
-                        ));
-                    } else {
-                        self.messages.push(DisplayMessage::System(
-                            format!("Unknown theme: {name}. Available: dark, light, high-contrast, solarized, dracula"),
-                        ));
-                    }
+                    // Direct: /theme dracula
+                    self.apply_theme(name);
                 } else {
-                    self.messages.push(DisplayMessage::System(
-                        format!(
-                            "Current theme: {:?}\nAvailable: dark, light, high-contrast, solarized, dracula\n\nUsage: /theme <name>\nPersist in config.toml: [theme] preset = \"dracula\"",
-                            self.config.theme.preset
-                        ),
-                    ));
+                    // Interactive picker
+                    let current = format!("{:?}", self.config.theme.preset).to_lowercase();
+                    let modal = super::theme_modal::ThemeModal::new(&current);
+                    self.active_modal = Some(Box::new(modal));
                 }
             }
             "/dream" => {

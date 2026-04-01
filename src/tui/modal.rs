@@ -20,6 +20,8 @@ pub enum ModalAction {
     CreatePlugin(String),
     /// Inject skill content into the conversation context.
     ActivateSkill { name: String, content: String },
+    /// Switch the color theme.
+    SelectTheme(String),
 }
 
 /// Trait implemented by all modal overlays (plugin browser, skill browser, etc.).
