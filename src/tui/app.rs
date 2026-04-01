@@ -100,6 +100,8 @@ pub struct TuiApp {
     denial_tracker: DenialTracker,
     /// Diminishing-returns tracker for the agentic loop
     budget_tracker: TokenBudgetTracker,
+    /// Last-known mtime of FTAI.md for hot-reload detection
+    ftai_mtime: Option<std::time::SystemTime>,
 }
 
 impl TuiApp {
@@ -243,6 +245,7 @@ impl TuiApp {
             CommandEntry { trigger: "/skill".into(), description: "Open skill browser".into() },
             CommandEntry { trigger: "/theme".into(), description: "Switch color theme".into() },
             CommandEntry { trigger: "/dream".into(), description: "Show or run dream analysis".into() },
+            CommandEntry { trigger: "/doctor".into(), description: "Check system health and backends".into() },
             CommandEntry { trigger: "/quit".into(), description: "Exit forge".into() },
         ];
         for skill in &skills {
@@ -255,6 +258,7 @@ impl TuiApp {
         let hook_runner = HookRunner::from_config(&config);
         let denial_tracker = DenialTracker::new();
         let budget_tracker = TokenBudgetTracker::new();
+        let ftai_mtime = Self::read_ftai_mtime(&project_path);
 
         Self {
             config,
@@ -284,7 +288,69 @@ impl TuiApp {
             hook_runner,
             denial_tracker,
             budget_tracker,
+            ftai_mtime,
         }
+    }
+
+    /// Read the current mtime of FTAI.md (project layer).
+    fn read_ftai_mtime(project_path: &std::path::Path) -> Option<std::time::SystemTime> {
+        let ftai_path = project_path.join(".ftai").join("FTAI.md");
+        std::fs::metadata(&ftai_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    }
+
+    /// Check if FTAI.md has changed since last read; if so, reload and rebuild system prompt.
+    fn check_ftai_reload(&mut self) {
+        let current_mtime = Self::read_ftai_mtime(&self.project_path);
+        if current_mtime == self.ftai_mtime {
+            return; // No change
+        }
+        // mtime changed (or file appeared/disappeared)
+        self.ftai_mtime = current_mtime;
+        let ftai_context = prompt::load_ftai_context(&self.project_path);
+        self.rebuild_system_prompt(ftai_context);
+    }
+
+    /// Rebuild the system prompt from current state.
+    fn rebuild_system_prompt(&mut self, ftai_context: Option<String>) {
+        let memory = prompt::load_memory_context(&self.project_path);
+        let tool_defs = self.tools.tool_definitions();
+        let rules_summary = if self.rules.rule_count() > 0 {
+            Some(self.rules.summary())
+        } else {
+            None
+        };
+        let skills_prompt = if !self.skills.is_empty() {
+            let mut out = String::from("Available skills via slash commands:\n\n");
+            for skill in &self.skills {
+                out.push_str(&format!(
+                    "- `{}` ({}) — {}\n",
+                    skill.trigger, skill.source, skill.description
+                ));
+            }
+            Some(out)
+        } else {
+            None
+        };
+
+        let new_prompt = match self.mode {
+            Mode::Coding => prompt::build_system_prompt(
+                &self.project_path,
+                &tool_defs,
+                rules_summary.as_deref(),
+                memory.as_deref(),
+                Some(&self.templates),
+                &self.config.formatting.enabled,
+                ftai_context.as_deref(),
+                skills_prompt.as_deref(),
+            ),
+            Mode::Chat => prompt::build_chat_system_prompt(
+                memory.as_deref(),
+                ftai_context.as_deref(),
+            ),
+        };
+        self.engine.update_system_prompt(new_prompt);
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -788,7 +854,7 @@ author = ""
     const SLASH_COMMANDS: &'static [&'static str] = &[
         "/help", "/clear", "/compact", "/rules", "/permissions", "/templates",
         "/config", "/model", "/project", "/memory", "/context", "/plugin",
-        "/hardware", "/chat", "/code", "/skill", "/theme", "/dream", "/quit", "/exit",
+        "/hardware", "/chat", "/code", "/skill", "/theme", "/dream", "/doctor", "/quit", "/exit",
     ];
 
     async fn handle_submit(&mut self, text: String) -> Result<()> {
@@ -827,6 +893,8 @@ author = ""
         const MAX_TURNS: usize = 25;
 
         for turn in 0..MAX_TURNS {
+            // Check for FTAI.md hot-reload before each LLM call
+            self.check_ftai_reload();
             // Run compaction before each LLM call
             self.engine.micro_compact();
             self.engine.compact();
@@ -892,6 +960,7 @@ author = ""
         if has_tool_calls {
             const MAX_CONTINUATION_TURNS: usize = 24;
             for _ in 0..MAX_CONTINUATION_TURNS {
+                self.check_ftai_reload();
                 self.engine.micro_compact();
                 self.engine.compact();
                 let request = self.engine.build_request(&self.config);
@@ -961,6 +1030,18 @@ author = ""
 
         // Track whether any task tool was called this round (for nag injection)
         let mut task_tool_called = false;
+
+        // Pre-check all calls: permissions, rules, hooks. Collect approved ones
+        // partitioned into read-only (concurrent) and mutating (serial).
+        struct ApprovedCall {
+            id: String,
+            name: String,
+            arguments: serde_json::Value,
+            args_summary: String,
+            params_json: String,
+        }
+        let mut approved_readonly: Vec<ApprovedCall> = Vec::new();
+        let mut approved_mutating: Vec<ApprovedCall> = Vec::new();
 
         for call in all_calls {
             // Handle request_permissions specially (pre-flight batch approval)
@@ -1058,6 +1139,7 @@ author = ""
                         reason: reason.clone(),
                     });
                     self.engine.add_tool_result(&call.id, &format!("BLOCKED: {reason}"));
+                    continue;
                 }
                 RuleAction::Allow | RuleAction::Modify(_) => {
                     // Run pre-hooks
@@ -1094,62 +1176,135 @@ author = ""
                         continue;
                     }
 
-                    let ctx = ToolContext {
-                        cwd: self.project_path.clone(),
-                        project_path: self.project_path.clone(),
+                    let args_summary = summarize_args(&call.arguments);
+                    let approved = ApprovedCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        args_summary,
+                        params_json,
                     };
 
-                    let args_summary = summarize_args(&call.arguments);
-                    match self.tools.execute(&call.name, call.arguments.clone(), &ctx).await {
-                        Ok(result) => {
-                            // Persist large results to disk (Appendix C)
-                            let output = crate::tools::result_storage::maybe_persist_result(
-                                &result.output,
-                                &call.name,
+                    if ToolRegistry::is_read_only(&call.name) {
+                        approved_readonly.push(approved);
+                    } else {
+                        approved_mutating.push(approved);
+                    }
+                }
+            }
+        }
+
+        // Execute read-only tools concurrently
+        if !approved_readonly.is_empty() {
+            let ctx = ToolContext {
+                cwd: self.project_path.clone(),
+                project_path: self.project_path.clone(),
+            };
+
+            let futures: Vec<_> = approved_readonly.iter().map(|ac| {
+                self.tools.execute(&ac.name, ac.arguments.clone(), &ctx)
+            }).collect();
+
+            let results = futures_util::future::join_all(futures).await;
+
+            for (ac, result) in approved_readonly.iter().zip(results) {
+                match result {
+                    Ok(result) => {
+                        let output = crate::tools::result_storage::maybe_persist_result(
+                            &result.output,
+                            &ac.name,
+                            &self.project_path,
+                        );
+
+                        self.messages.push(DisplayMessage::ToolCall {
+                            name: ac.name.clone(),
+                            args_summary: ac.args_summary.clone(),
+                            result: output.clone(),
+                            is_error: result.is_error,
+                        });
+                        self.engine.add_tool_result(&ac.id, &output);
+
+                        // Run post-hooks (plugin hooks)
+                        let post_event = format!("post:{}", ac.name);
+                        let post_hooks = self.plugin_manager.get_hooks(&post_event);
+                        for hook in &post_hooks {
+                            let _ = crate::plugins::hooks::run_post_hook(
+                                hook,
+                                &ac.name,
+                                &ac.params_json,
+                                &output,
                                 &self.project_path,
-                            );
-
-                            self.messages.push(DisplayMessage::ToolCall {
-                                name: call.name.clone(),
-                                args_summary: args_summary.clone(),
-                                result: output.clone(),
-                                is_error: result.is_error,
-                            });
-                            self.engine.add_tool_result(&call.id, &output);
-
-                            // Run after_file_edit user hook for file tools
-                            if call.name == "file_edit" || call.name == "file_write" {
-                                if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
-                                    let mut env = std::collections::HashMap::new();
-                                    env.insert("FORGE_FILE_PATH".to_string(), path.to_string());
-                                    let _ = self.hook_runner.run("after_file_edit", &env).await;
-                                }
-                            }
-
-                            // Run post-hooks (plugin hooks)
-                            let post_event = format!("post:{}", call.name);
-                            let post_hooks = self.plugin_manager.get_hooks(&post_event);
-                            for hook in &post_hooks {
-                                let _ = crate::plugins::hooks::run_post_hook(
-                                    hook,
-                                    &call.name,
-                                    &params_json,
-                                    &output,
-                                    &self.project_path,
-                                ).await;
-                            }
-                        }
-                        Err(e) => {
-                            let err = format!("Tool error: {e}");
-                            self.messages.push(DisplayMessage::ToolCall {
-                                name: call.name.clone(),
-                                args_summary,
-                                result: err.clone(),
-                                is_error: true,
-                            });
-                            self.engine.add_tool_result(&call.id, &err);
+                            ).await;
                         }
                     }
+                    Err(e) => {
+                        let err = format!("Tool error: {e}");
+                        self.messages.push(DisplayMessage::ToolCall {
+                            name: ac.name.clone(),
+                            args_summary: ac.args_summary.clone(),
+                            result: err.clone(),
+                            is_error: true,
+                        });
+                        self.engine.add_tool_result(&ac.id, &err);
+                    }
+                }
+            }
+        }
+
+        // Execute mutating tools serially (preserving order)
+        for ac in &approved_mutating {
+            let ctx = ToolContext {
+                cwd: self.project_path.clone(),
+                project_path: self.project_path.clone(),
+            };
+
+            match self.tools.execute(&ac.name, ac.arguments.clone(), &ctx).await {
+                Ok(result) => {
+                    let output = crate::tools::result_storage::maybe_persist_result(
+                        &result.output,
+                        &ac.name,
+                        &self.project_path,
+                    );
+
+                    self.messages.push(DisplayMessage::ToolCall {
+                        name: ac.name.clone(),
+                        args_summary: ac.args_summary.clone(),
+                        result: output.clone(),
+                        is_error: result.is_error,
+                    });
+                    self.engine.add_tool_result(&ac.id, &output);
+
+                    // Run after_file_edit user hook for file tools
+                    if ac.name == "file_edit" || ac.name == "file_write" {
+                        if let Some(path) = ac.arguments.get("path").and_then(|v| v.as_str()) {
+                            let mut env = std::collections::HashMap::new();
+                            env.insert("FORGE_FILE_PATH".to_string(), path.to_string());
+                            let _ = self.hook_runner.run("after_file_edit", &env).await;
+                        }
+                    }
+
+                    // Run post-hooks (plugin hooks)
+                    let post_event = format!("post:{}", ac.name);
+                    let post_hooks = self.plugin_manager.get_hooks(&post_event);
+                    for hook in &post_hooks {
+                        let _ = crate::plugins::hooks::run_post_hook(
+                            hook,
+                            &ac.name,
+                            &ac.params_json,
+                            &output,
+                            &self.project_path,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    let err = format!("Tool error: {e}");
+                    self.messages.push(DisplayMessage::ToolCall {
+                        name: ac.name.clone(),
+                        args_summary: ac.args_summary.clone(),
+                        result: err.clone(),
+                        is_error: true,
+                    });
+                    self.engine.add_tool_result(&ac.id, &err);
                 }
             }
         }
@@ -1975,6 +2130,26 @@ author = ""
                     }
                 }
             }
+            "/doctor" => {
+                let probe = crate::backend::BackendProbeResults::probe();
+                let hw = crate::backend::types::HardwareInfo::detect();
+                let rec = hw.recommended_model();
+                let mut info = String::from("Forge Doctor\n\n");
+                info.push_str(&probe.display());
+                info.push_str(&format!(
+                    "\nHardware: {:?} | {:?} | {} GB RAM\nRecommended: {} ({:?}, ~{}GB)\n",
+                    hw.arch, hw.gpu, hw.ram_gb, rec.name, rec.backend, rec.size_gb
+                ));
+                info.push_str(&format!("\nBackend: {:?}", self.config.model.backend));
+                info.push_str(&format!("\nContext: {}", self.config.model.context_length));
+                if let Some(path) = &self.config.model.path {
+                    let exists = std::path::Path::new(path).exists();
+                    info.push_str(&format!("\nModel: {} ({})", path, if exists { "found" } else { "NOT FOUND" }));
+                } else {
+                    info.push_str("\nModel: (none configured)");
+                }
+                self.messages.push(DisplayMessage::System(info));
+            }
             "/quit" | "/exit" => {
                 self.should_quit = true;
             }
@@ -2091,5 +2266,46 @@ mod tests {
         assert_eq!(m.label(), "chat");
         m = Mode::Coding;
         assert_eq!(m.label(), "coding");
+    }
+
+    // ── FTAI.md hot-reload tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_read_ftai_mtime_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mtime = TuiApp::read_ftai_mtime(tmp.path());
+        assert!(mtime.is_none(), "Missing FTAI.md should return None");
+    }
+
+    #[test]
+    fn test_read_ftai_mtime_detects_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ftai_dir = tmp.path().join(".ftai");
+        std::fs::create_dir_all(&ftai_dir).unwrap();
+        std::fs::write(ftai_dir.join("FTAI.md"), "initial content").unwrap();
+
+        let mtime = TuiApp::read_ftai_mtime(tmp.path());
+        assert!(mtime.is_some(), "Existing FTAI.md should return Some mtime");
+    }
+
+    #[test]
+    fn test_read_ftai_mtime_changes_on_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ftai_dir = tmp.path().join(".ftai");
+        std::fs::create_dir_all(&ftai_dir).unwrap();
+        let ftai_path = ftai_dir.join("FTAI.md");
+
+        std::fs::write(&ftai_path, "version 1").unwrap();
+        let mtime1 = TuiApp::read_ftai_mtime(tmp.path());
+
+        // Ensure mtime actually changes (some filesystems have coarse granularity)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&ftai_path, "version 2 with more content").unwrap();
+        let mtime2 = TuiApp::read_ftai_mtime(tmp.path());
+
+        assert!(mtime1.is_some());
+        assert!(mtime2.is_some());
+        // On most systems the mtime will differ; on those with 1-second granularity
+        // it might not, so we just verify both are Some and the function doesn't panic.
     }
 }

@@ -94,10 +94,12 @@ impl ConversationEngine {
         compactor::should_compact(self.estimated_tokens, self.max_context_tokens)
     }
 
-    /// Three-tier compaction system:
+    /// Five-tier compaction system:
     /// - Always runs Tier 1 (micro) first
     /// - If tokens > 70%: Tier 2 (snip — remove oldest, keep last 10)
     /// - If tokens > 85%: Tier 3 (summarize — replace all with summary)
+    /// - Tier 4 (session memory extraction) runs as part of tier 5
+    /// - If tokens > 95%: Tier 5 (emergency truncation — keep system + last 3)
     pub fn compact(&mut self) {
         // Tier 1 always runs
         self.micro_compact();
@@ -105,9 +107,20 @@ impl ConversationEngine {
         let project_path = self.project_path.clone();
 
         match self.should_compact() {
+            Some(5) => {
+                // Tier 5: emergency truncation (includes tier 4 checkpoint)
+                if let Some(ref path) = project_path {
+                    compactor::emergency_truncate(&mut self.messages, path);
+                } else {
+                    // Fallback: aggressive snip
+                    self.snip_compact_fallback();
+                }
+            }
             Some(3) => {
                 // Tier 3: summarize compact
                 if let Some(ref path) = project_path {
+                    // Tier 4: extract session memory before summarize
+                    let _ = compactor::extract_session_memory(&self.messages, path);
                     let _ = compactor::summarize_compact(&mut self.messages, path);
                     // Reinject system identity as first message
                     self.messages.insert(0, Message {

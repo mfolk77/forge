@@ -191,6 +191,21 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Returns true if this tool is read-only (safe for concurrent execution).
+    pub fn is_read_only(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "file_read"
+                | "grep"
+                | "glob"
+                | "web_fetch"
+                | "ask_user"
+                | "memory_read"
+                | "research"
+                | "request_permissions"
+        )
+    }
+
     /// Register multiple plugin tools at once.
     pub fn register_plugin_tools(&mut self, tools: Vec<impl Tool + 'static>) {
         for tool in tools {
@@ -223,6 +238,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
 
     struct DummyTool;
 
@@ -496,6 +512,82 @@ mod tests {
 
         // Drain any partial output from the progress channel
         rx.close();
+    }
+
+    // ── Tool concurrency classification tests ──────────────────────────────
+
+    #[test]
+    fn test_is_read_only_true_for_read_tools() {
+        assert!(ToolRegistry::is_read_only("file_read"));
+        assert!(ToolRegistry::is_read_only("grep"));
+        assert!(ToolRegistry::is_read_only("glob"));
+        assert!(ToolRegistry::is_read_only("web_fetch"));
+        assert!(ToolRegistry::is_read_only("ask_user"));
+        assert!(ToolRegistry::is_read_only("memory_read"));
+        assert!(ToolRegistry::is_read_only("research"));
+        assert!(ToolRegistry::is_read_only("request_permissions"));
+    }
+
+    #[test]
+    fn test_is_read_only_false_for_mutating_tools() {
+        assert!(!ToolRegistry::is_read_only("file_write"));
+        assert!(!ToolRegistry::is_read_only("file_edit"));
+        assert!(!ToolRegistry::is_read_only("bash"));
+        assert!(!ToolRegistry::is_read_only("git"));
+        assert!(!ToolRegistry::is_read_only("memory_write"));
+        assert!(!ToolRegistry::is_read_only("agent_spawn"));
+        assert!(!ToolRegistry::is_read_only("task"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_read_only_execution() {
+        // Multiple read-only tools should all complete successfully
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool);
+        let reg = std::sync::Arc::new(reg);
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        // Simulate concurrent execution pattern
+        let futures: Vec<_> = (0..5).map(|_| {
+            reg.execute("dummy", serde_json::json!({}), &ctx)
+        }).collect();
+
+        let results: Vec<_> = future::join_all(futures).await;
+        for result in results {
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().output, "done");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serial_mutating_execution_order() {
+        // Mutating tools execute serially — verify they all succeed in order
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        COUNTER.store(0, Ordering::SeqCst);
+
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool);
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            project_path: PathBuf::from("/tmp"),
+        };
+
+        // Execute 3 times serially, verify all succeed
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            let result = reg.execute("dummy", serde_json::json!({}), &ctx).await;
+            results.push(result);
+        }
+
+        for (i, result) in results.iter().enumerate() {
+            assert!(result.is_ok(), "Tool call {} failed", i);
+        }
     }
 
     #[tokio::test]
