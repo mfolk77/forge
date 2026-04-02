@@ -292,16 +292,19 @@ impl CodeValidator {
     // ── JavaScript / TypeScript ───────────────────────────────────────────────
 
     pub async fn validate_javascript(&self, code: &str) -> ValidationResult {
-        // Try `node --check` via bash reading from /dev/stdin.
-        // Piping code to stdin avoids writing temp files and prevents
-        // path-traversal attacks from any filename derived from code content.
+        // Pipe code to `node --check` via stdin to avoid writing temp files
+        // and prevent path-traversal attacks from filename injection.
         let code_bytes = code.as_bytes().to_vec();
 
         let run = async move {
             use tokio::io::AsyncWriteExt;
-            let mut child = Command::new("bash")
-                .arg("-c")
-                .arg("node --check /dev/stdin")
+            let (shell, args): (&str, &[&str]) = if cfg!(windows) {
+                ("cmd.exe", &["/C", "node --check -"])
+            } else {
+                ("bash", &["-c", "node --check /dev/stdin"])
+            };
+            let mut child = Command::new(shell)
+                .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -340,9 +343,20 @@ impl CodeValidator {
     // ── Shell ─────────────────────────────────────────────────────────────────
 
     pub async fn validate_shell(&self, code: &str) -> ValidationResult {
-        // `bash -n` is syntax-only — it never executes the script.
+        // Syntax-only check — never executes the script.
         // Code is piped via stdin so no shell metacharacters in the code string
         // can escape into the process invocation arguments.
+        // On Windows, shell syntax validation falls back to brace-balance check
+        // since bash -n is not available.
+        if cfg!(windows) {
+            let errors = check_brace_balance(code);
+            return if errors.is_empty() {
+                ValidationResult::valid("shell")
+            } else {
+                ValidationResult::invalid("shell", errors)
+            };
+        }
+
         let code_bytes = code.as_bytes().to_vec();
 
         let run = async move {

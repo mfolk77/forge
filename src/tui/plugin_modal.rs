@@ -11,6 +11,7 @@ use super::render::Theme;
 pub enum PluginTab {
     Discover,
     Installed,
+    Marketplaces,
 }
 
 /// An entry in the "Installed" tab.
@@ -21,6 +22,17 @@ pub struct InstalledPluginEntry {
     pub plugin_type: String,
     pub enabled: bool,
     pub description: String,
+}
+
+/// A marketplace entry displayed in the Marketplaces tab.
+#[derive(Debug, Clone)]
+pub struct MarketplaceEntry {
+    pub name: String,
+    pub repo: String,
+    pub available_count: usize,
+    pub installed_count: usize,
+    pub last_updated: String,
+    pub is_default: bool,
 }
 
 /// Detail view state when the user presses Enter on an item.
@@ -34,11 +46,12 @@ pub struct DetailView {
     pub is_enabled: bool,
 }
 
-/// Interactive plugin browser modal with Discover and Installed tabs.
+/// Interactive plugin browser modal with Discover, Installed, and Marketplaces tabs.
 pub struct PluginModal {
     pub active_tab: PluginTab,
     pub discover_list: Vec<CatalogEntry>,
     pub installed_list: Vec<InstalledPluginEntry>,
+    pub marketplace_list: Vec<MarketplaceEntry>,
     pub selected_index: usize,
     pub search_query: String,
     pub search_active: bool,
@@ -53,6 +66,22 @@ impl PluginModal {
             active_tab: PluginTab::Discover,
             discover_list: catalog::catalog(),
             installed_list: installed,
+            marketplace_list: Vec::new(),
+            selected_index: 0,
+            search_query: String::new(),
+            search_active: false,
+            detail_view: None,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Create a new plugin modal with marketplace data.
+    pub fn with_marketplaces(installed: Vec<InstalledPluginEntry>, marketplaces: Vec<MarketplaceEntry>) -> Self {
+        Self {
+            active_tab: PluginTab::Discover,
+            discover_list: catalog::catalog(),
+            installed_list: installed,
+            marketplace_list: marketplaces,
             selected_index: 0,
             search_query: String::new(),
             search_active: false,
@@ -98,6 +127,7 @@ impl PluginModal {
         match self.active_tab {
             PluginTab::Discover => self.filtered_discover().len(),
             PluginTab::Installed => self.filtered_installed().len(),
+            PluginTab::Marketplaces => self.marketplace_list.len() + 1, // +1 for "Add Marketplace" row
         }
     }
 
@@ -114,7 +144,8 @@ impl PluginModal {
     fn switch_tab(&mut self) {
         self.active_tab = match self.active_tab {
             PluginTab::Discover => PluginTab::Installed,
-            PluginTab::Installed => PluginTab::Discover,
+            PluginTab::Installed => PluginTab::Marketplaces,
+            PluginTab::Marketplaces => PluginTab::Discover,
         };
         self.selected_index = 0;
         self.scroll_offset = 0;
@@ -123,6 +154,9 @@ impl PluginModal {
     fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset = self.selected_index;
+            }
         }
     }
 
@@ -130,6 +164,13 @@ impl PluginModal {
         let count = self.visible_count();
         if count > 0 && self.selected_index < count - 1 {
             self.selected_index += 1;
+            // Scroll follows selection — assume ~20 visible rows as safe default.
+            // The actual content_height is computed in render(), but we keep
+            // scroll_offset roughly in sync here so the next render picks it up.
+            let visible_rows = 18_usize; // conservative; render will clamp
+            if self.selected_index >= self.scroll_offset + visible_rows {
+                self.scroll_offset = self.selected_index + 1 - visible_rows;
+            }
         }
     }
 
@@ -165,6 +206,9 @@ impl PluginModal {
                     });
                 }
             }
+            PluginTab::Marketplaces => {
+                // No detail view for marketplaces — handled via u/r keys
+            }
         }
     }
 }
@@ -191,21 +235,21 @@ impl Modal for PluginModal {
         let content_height = footer_y.saturating_sub(content_start) as usize;
 
         // ── Tab bar ────────────────────────────────────────────────────
-        let discover_style = if self.active_tab == PluginTab::Discover {
-            Style::default().fg(theme.accent).bold()
-        } else {
-            Style::default().fg(theme.dim)
+        let tab_style = |tab: PluginTab| -> Style {
+            if self.active_tab == tab {
+                Style::default().fg(theme.accent).bold()
+            } else {
+                Style::default().fg(theme.dim)
+            }
         };
-        let installed_style = if self.active_tab == PluginTab::Installed {
-            Style::default().fg(theme.accent).bold()
-        } else {
-            Style::default().fg(theme.dim)
-        };
+        let sep = Span::styled("  |  ", Style::default().fg(theme.dim));
 
         let tab_line = Line::from(vec![
-            Span::styled("  Discover", discover_style),
-            Span::styled("  |  ", Style::default().fg(theme.dim)),
-            Span::styled("Installed", installed_style),
+            Span::styled("  Discover", tab_style(PluginTab::Discover)),
+            sep.clone(),
+            Span::styled("Installed", tab_style(PluginTab::Installed)),
+            sep,
+            Span::styled("Marketplaces", tab_style(PluginTab::Marketplaces)),
         ]);
         buf.set_line(area.x, area.y, &tab_line, area.width);
 
@@ -331,11 +375,81 @@ impl Modal for PluginModal {
                     }
                 }
             }
+            PluginTab::Marketplaces => {
+                // Header
+                let header = Line::from(Span::styled(
+                    "  Manage marketplaces",
+                    Style::default().fg(theme.assistant_text).bold(),
+                ));
+                buf.set_line(area.x, content_start, &header, area.width);
+
+                let mut y = content_start + 1;
+
+                // "+ Add Marketplace" row (index 0)
+                let add_selected = self.selected_index == 0;
+                let add_style = if add_selected {
+                    Style::default().fg(Color::Black).bg(theme.accent)
+                } else {
+                    Style::default().fg(theme.accent)
+                };
+                let add_line = Line::from(Span::styled(
+                    "  \u{203A} + Add Marketplace",
+                    add_style,
+                ));
+                buf.set_line(area.x, y, &add_line, area.width);
+                y += 1;
+
+                // Marketplace entries
+                for (i, mp) in self.marketplace_list.iter().enumerate() {
+                    if y + 3 >= footer_y {
+                        break;
+                    }
+
+                    let entry_index = i + 1; // offset by 1 for "Add" row
+                    let is_selected = self.selected_index == entry_index;
+                    y += 1; // blank line separator
+
+                    // Bullet + name
+                    let bullet = if mp.is_default { "  \u{2731} " } else { "  \u{2022} " };
+                    let name_style = if is_selected {
+                        Style::default().fg(Color::Black).bg(theme.accent).bold()
+                    } else {
+                        Style::default().fg(theme.assistant_text).bold()
+                    };
+                    let suffix = if mp.is_default { " \u{2731}" } else { "" };
+                    let name_line = Line::from(Span::styled(
+                        format!("{}{}{}", bullet, mp.name, suffix),
+                        name_style,
+                    ));
+                    buf.set_line(area.x, y, &name_line, area.width);
+                    y += 1;
+
+                    // Repo + stats
+                    let info_style = if is_selected {
+                        Style::default().fg(Color::Black).bg(theme.accent)
+                    } else {
+                        Style::default().fg(theme.dim)
+                    };
+                    let info_text = format!(
+                        "    {} \u{00B7} {} available \u{00B7} {} installed \u{00B7} Updated {}",
+                        mp.repo, mp.available_count, mp.installed_count, mp.last_updated
+                    );
+                    let info_line = Line::from(Span::styled(info_text, info_style));
+                    buf.set_line(area.x, y, &info_line, area.width);
+                    y += 1;
+                }
+            }
         }
 
         // ── Footer ─────────────────────────────────────────────────────
+        let footer_text = match self.active_tab {
+            PluginTab::Marketplaces =>
+                "  Tab: switch \u{00B7} \u{2191}\u{2193}: navigate \u{00B7} Enter: select \u{00B7} u: update \u{00B7} r: remove \u{00B7} Esc: back",
+            _ =>
+                "  Tab: switch \u{00B7} \u{2191}\u{2193}: navigate \u{00B7} Enter: details \u{00B7} Space: toggle \u{00B7} /: search \u{00B7} Esc: back",
+        };
         let footer = Line::from(Span::styled(
-            "  Tab: switch \u{00B7} \u{2191}\u{2193}: navigate \u{00B7} Enter: details \u{00B7} Space: toggle \u{00B7} /: search \u{00B7} Esc: back",
+            footer_text,
             Style::default().fg(theme.dim),
         ));
         buf.set_line(area.x, footer_y, &footer, area.width);
@@ -419,7 +533,28 @@ impl Modal for PluginModal {
                 ModalAction::Continue
             }
             KeyCode::Enter => {
+                if self.active_tab == PluginTab::Marketplaces {
+                    if self.selected_index == 0 {
+                        return ModalAction::AddMarketplace;
+                    }
+                    // Enter on a marketplace entry does nothing (use u/r)
+                    return ModalAction::Continue;
+                }
                 self.open_detail();
+                ModalAction::Continue
+            }
+            KeyCode::Char('u') if self.active_tab == PluginTab::Marketplaces => {
+                let mp_idx = self.selected_index.saturating_sub(1);
+                if let Some(mp) = self.marketplace_list.get(mp_idx) {
+                    return ModalAction::UpdateMarketplace(mp.name.clone());
+                }
+                ModalAction::Continue
+            }
+            KeyCode::Char('r') if self.active_tab == PluginTab::Marketplaces => {
+                let mp_idx = self.selected_index.saturating_sub(1);
+                if let Some(mp) = self.marketplace_list.get(mp_idx) {
+                    return ModalAction::RemoveMarketplace(mp.name.clone());
+                }
                 ModalAction::Continue
             }
             KeyCode::Char(' ') => {
@@ -445,6 +580,8 @@ impl Modal for PluginModal {
             "Type to filter, Enter to confirm, Esc to cancel"
         } else if self.detail_view.is_some() {
             "Enter: install/uninstall, Space: toggle, Esc: back"
+        } else if self.active_tab == PluginTab::Marketplaces {
+            "Enter: select, u: update, r: remove, Tab: switch, Esc: close"
         } else {
             "Tab: switch, Up/Down: navigate, Enter: details, /: search, Esc: close"
         }
@@ -565,11 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_switches_between_discover_and_installed() {
+    fn test_tab_cycles_through_all_tabs() {
         let mut modal = make_modal();
         assert_eq!(modal.active_tab, PluginTab::Discover);
         modal.handle_key(key(KeyCode::Tab));
         assert_eq!(modal.active_tab, PluginTab::Installed);
+        modal.handle_key(key(KeyCode::Tab));
+        assert_eq!(modal.active_tab, PluginTab::Marketplaces);
         modal.handle_key(key(KeyCode::Tab));
         assert_eq!(modal.active_tab, PluginTab::Discover);
     }

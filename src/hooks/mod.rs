@@ -7,6 +7,71 @@ use tokio::time::{timeout, Duration};
 
 use crate::config::Config;
 
+/// When a built-in hook fires relative to tool execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookEvent {
+    BeforeTool,
+    AfterTool,
+}
+
+/// A prompt-based hook that is evaluated by the model, not executed as a shell command.
+#[derive(Debug, Clone)]
+pub struct BuiltinHookPrompt {
+    pub name: String,
+    pub event: HookEvent,
+    pub tool_filter: Option<String>,
+    pub prompt: String,
+    pub enabled_by_default: bool,
+}
+
+/// Returns the default built-in hook configurations.
+/// These are prompt-based hooks that run before/after tool use.
+pub fn builtin_hook_prompts() -> Vec<BuiltinHookPrompt> {
+    vec![
+        BuiltinHookPrompt {
+            name: "confidence-gate".into(),
+            event: HookEvent::BeforeTool,
+            tool_filter: Some("file_write|file_edit".into()),
+            prompt: "Before making this code change, verify: 1) CONTEXT: Can you summarize \
+                     what this file does? 2) SCOPE: Does this match what was requested? \
+                     3) ASSUMPTIONS: List any unconfirmed assumptions. 4) CONFIDENCE: Rate \
+                     0.0-1.0 (need 0.8+ for standard, 0.9+ for >50 lines). If below \
+                     threshold, explain what would increase it."
+                .into(),
+            enabled_by_default: true,
+        },
+        BuiltinHookPrompt {
+            name: "tdd-reminder".into(),
+            event: HookEvent::BeforeTool,
+            tool_filter: Some("file_write|file_edit".into()),
+            prompt: "If writing implementation code (not tests), check if corresponding \
+                     test file exists. If not, output: 'TDD Reminder: Consider writing \
+                     tests first.'"
+                .into(),
+            enabled_by_default: false,
+        },
+        BuiltinHookPrompt {
+            name: "perf-check".into(),
+            event: HookEvent::BeforeTool,
+            tool_filter: Some("file_write|file_edit".into()),
+            prompt: "Check for: O(n^2) patterns (nested loops, .contains() in loops), \
+                     memory leaks (closures without weak refs), main thread blocking \
+                     (sync I/O), N+1 queries. If found, output brief warning."
+                .into(),
+            enabled_by_default: true,
+        },
+        BuiltinHookPrompt {
+            name: "mental-model-checkpoint".into(),
+            event: HookEvent::AfterTool,
+            tool_filter: Some("file_write|file_edit".into()),
+            prompt: "After this code change: 1) WHAT CHANGED (1-2 sentences), 2) WHY \
+                     (purpose), 3) KEY LINES to review. Then ask one comprehension check."
+                .into(),
+            enabled_by_default: false,
+        },
+    ]
+}
+
 fn default_timeout() -> u64 {
     10000
 }
@@ -76,10 +141,15 @@ impl HookRunner {
                 }
             }
 
+            let (shell, shell_flag) = if cfg!(windows) {
+                ("cmd.exe", "/C")
+            } else {
+                ("sh", "-c")
+            };
             let result = timeout(
                 Duration::from_millis(hook.timeout_ms),
-                Command::new("sh")
-                    .arg("-c")
+                Command::new(shell)
+                    .arg(shell_flag)
                     .arg(&hook.command)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -382,5 +452,28 @@ tool = "bash"
         assert_eq!(parsed.hooks[1].tool.as_deref(), Some("bash"));
         // Second hook should get default timeout
         assert_eq!(parsed.hooks[1].timeout_ms, 10000);
+    }
+
+    // ── Built-in hook prompt tests ────────────────────────────────────────
+
+    #[test]
+    fn test_builtin_hook_prompts_returns_four() {
+        let hooks = builtin_hook_prompts();
+        assert_eq!(hooks.len(), 4);
+    }
+
+    #[test]
+    fn test_confidence_gate_enabled_by_default() {
+        let hooks = builtin_hook_prompts();
+        let gate = hooks.iter().find(|h| h.name == "confidence-gate").unwrap();
+        assert!(gate.enabled_by_default);
+        assert_eq!(gate.event, HookEvent::BeforeTool);
+    }
+
+    #[test]
+    fn test_tdd_reminder_disabled_by_default() {
+        let hooks = builtin_hook_prompts();
+        let tdd = hooks.iter().find(|h| h.name == "tdd-reminder").unwrap();
+        assert!(!tdd.enabled_by_default);
     }
 }

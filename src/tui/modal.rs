@@ -22,6 +22,12 @@ pub enum ModalAction {
     ActivateSkill { name: String, content: String },
     /// Switch the color theme.
     SelectTheme(String),
+    /// Add a new marketplace source (prompts user for repo).
+    AddMarketplace,
+    /// Update a marketplace by name (git pull).
+    UpdateMarketplace(String),
+    /// Remove a marketplace by name.
+    RemoveMarketplace(String),
 }
 
 /// Trait implemented by all modal overlays (plugin browser, skill browser, etc.).

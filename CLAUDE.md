@@ -2,14 +2,13 @@
 
 ## Build & Test
 - `cargo build` — build debug binary
-- `cargo test` — 212 tests (182 lib + 30 integration)
+- `cargo test` — 1,206 tests (1,095 lib + 111 integration)
 - `cargo install --path . --root ~/.local --force` — install globally as `forge`
 - Binary location: `~/.local/bin/forge`
 
 ## Architecture
 - Rust monolithic binary, TUI via ratatui + crossterm
-- Existing modules: backend, config, conversation, formatting, permissions, plugins, rules, tools, tui
-- New modules (planned): inference, search, evolution, session, skills, hooks
+- All modules: backend, config, conversation, dream, evolution, formatting, hooks, inference, permissions, plugins, rules, search, session, skills, tools, tui
 - Config precedence: defaults → ~/.ftai/config.toml → ~/.ftai/projects/<encoded>/config.toml → <project>/.ftai/config.toml
 - System prompt order: identity → FTAI.md → tools → rules → memory → formatting → project rules → plugin skills → active skills (on-demand)
 

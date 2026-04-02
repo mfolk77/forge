@@ -33,12 +33,20 @@ impl SkillModal {
     fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset = self.selected_index;
+            }
         }
     }
 
     fn move_down(&mut self) {
         if !self.skills.is_empty() && self.selected_index < self.skills.len() - 1 {
             self.selected_index += 1;
+            // Keep selection visible — conservative row estimate
+            let visible_rows = 16_usize;
+            if self.selected_index >= self.scroll_offset + visible_rows {
+                self.scroll_offset = self.selected_index + 1 - visible_rows;
+            }
         }
     }
 }

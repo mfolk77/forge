@@ -45,8 +45,41 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Initialize a new Forge project in the current directory
+    Init,
     /// Check system health: backends, config, hardware
     Doctor,
+    /// Manage plugins
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// List installed plugins
+    List,
+    /// Search the built-in plugin catalog
+    Search {
+        /// Search query (matches name, description, or category)
+        query: String,
+    },
+    /// Install a plugin by catalog name or git URL
+    Install {
+        /// Plugin name from catalog, or a git URL
+        name_or_url: String,
+    },
+    /// Uninstall an installed plugin
+    Uninstall {
+        /// Plugin name
+        name: String,
+    },
+    /// Show details about an installed plugin
+    Info {
+        /// Plugin name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +269,149 @@ async fn main() -> Result<()> {
                     .status()?;
             }
         },
+        Some(Commands::Plugin { action }) => {
+            let plugins_dir = config::global_config_dir()?.join("plugins");
+            std::fs::create_dir_all(&plugins_dir)?;
+            plugins::builtins::ensure_builtin_plugins(&plugins_dir)?;
+
+            match action {
+                PluginAction::List => {
+                    let mut mgr = plugins::PluginManager::new(plugins_dir);
+                    mgr.load_all()?;
+                    let installed = mgr.list();
+                    if installed.is_empty() {
+                        println!("No plugins installed.");
+                        println!("Browse available plugins with: forge plugin search <query>");
+                    } else {
+                        println!("Installed plugins:\n");
+                        for p in installed {
+                            let m = &p.manifest.plugin;
+                            println!("  {} v{}", m.name, m.version);
+                            if !m.description.is_empty() {
+                                println!("    {}", m.description);
+                            }
+                        }
+                        println!("\n{} plugin(s) installed.", installed.len());
+                    }
+                }
+                PluginAction::Search { query } => {
+                    let q = query.to_lowercase();
+                    let matches: Vec<_> = plugins::catalog::catalog()
+                        .into_iter()
+                        .filter(|e| {
+                            e.name.to_lowercase().contains(&q)
+                                || e.description.to_lowercase().contains(&q)
+                                || e.category.to_lowercase().contains(&q)
+                        })
+                        .collect();
+
+                    if matches.is_empty() {
+                        println!("No plugins found matching \"{query}\".");
+                    } else {
+                        println!("Catalog results for \"{query}\":\n");
+                        for entry in &matches {
+                            println!("  {} [{}]", entry.name, entry.category);
+                            println!("    {}", entry.description);
+                            println!("    by {} — {}", entry.author, entry.repo);
+                            println!();
+                        }
+                        println!("{} result(s).", matches.len());
+                    }
+                }
+                PluginAction::Install { name_or_url } => {
+                    let url = if let Some(entry) = plugins::catalog::find_in_catalog(&name_or_url) {
+                        println!("Found \"{}\" in catalog.", entry.name);
+                        entry.repo
+                    } else if name_or_url.starts_with("https://") || name_or_url.contains("github.com") {
+                        name_or_url.clone()
+                    } else {
+                        eprintln!("Plugin \"{name_or_url}\" not found in catalog.");
+                        eprintln!("Use a git URL to install directly, e.g.:");
+                        eprintln!("  forge plugin install https://github.com/user/repo");
+                        std::process::exit(1);
+                    };
+
+                    let mgr = plugins::PluginManager::new(plugins_dir);
+                    match mgr.install_from_git(&url) {
+                        Ok(name) => println!("Plugin \"{name}\" installed successfully."),
+                        Err(e) => {
+                            eprintln!("Failed to install plugin: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                PluginAction::Uninstall { name } => {
+                    let mut mgr = plugins::PluginManager::new(plugins_dir);
+                    mgr.load_all()?;
+                    match mgr.uninstall(&name) {
+                        Ok(()) => println!("Plugin \"{name}\" uninstalled."),
+                        Err(e) => {
+                            eprintln!("Failed to uninstall plugin: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                PluginAction::Info { name } => {
+                    let mut mgr = plugins::PluginManager::new(plugins_dir);
+                    mgr.load_all()?;
+                    let found = mgr.list().iter().find(|p| p.manifest.plugin.name == name);
+                    match found {
+                        Some(plugin) => {
+                            let m = &plugin.manifest.plugin;
+                            println!("Plugin: {}", m.name);
+                            println!("Version: {}", m.version);
+                            if !m.description.is_empty() {
+                                println!("Description: {}", m.description);
+                            }
+                            if !m.author.is_empty() {
+                                println!("Author: {}", m.author);
+                            }
+                            println!("Path: {}", plugin.dir.display());
+                            println!("Tools: {}", plugin.manifest.tools.len());
+                            println!("Skills: {}", plugin.manifest.skills.len());
+                            println!("Hooks: {}", plugin.manifest.hooks.len());
+                        }
+                        None => {
+                            eprintln!("Plugin \"{name}\" is not installed.");
+                            if let Some(entry) = plugins::catalog::find_in_catalog(&name) {
+                                eprintln!("It is available in the catalog:");
+                                eprintln!("  {} — {}", entry.name, entry.description);
+                                eprintln!("Install with: forge plugin install {}", entry.name);
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+        Some(Commands::Init) => {
+            let ftai_dir = project_path.join(".ftai");
+            let config_file = ftai_dir.join("config.toml");
+            let ftai_md = project_path.join("FTAI.md");
+
+            // Create .ftai/ directory
+            std::fs::create_dir_all(&ftai_dir)?;
+            println!("Created {}", ftai_dir.display());
+
+            // Create .ftai/config.toml
+            let dir_name = project_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            let config_content = format!("[project]\nname = \"{dir_name}\"\n");
+            std::fs::write(&config_file, &config_content)?;
+            println!("Created {}", config_file.display());
+
+            // Create FTAI.md only if it doesn't exist
+            if ftai_md.exists() {
+                println!("FTAI.md already exists, skipping");
+            } else {
+                std::fs::write(&ftai_md, config::templates::default_ftai_md())?;
+                println!("Created {}", ftai_md.display());
+            }
+
+            println!("\nForge project initialized in {}", project_path.display());
+        }
         Some(Commands::Doctor) => {
             println!("Forge Doctor");
             println!("============\n");

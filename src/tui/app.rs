@@ -113,6 +113,9 @@ impl TuiApp {
             .map(|d| d.join("plugins"))
             .unwrap_or_else(|_| PathBuf::from("~/.ftai/plugins"));
 
+        // Ensure built-in plugins are scaffolded on first run
+        let _ = crate::plugins::builtins::ensure_builtin_plugins(&plugins_dir);
+
         let mut plugin_manager = PluginManager::new(plugins_dir);
         let mut plugin_loaded_skills = Vec::new();
 
@@ -765,6 +768,52 @@ impl TuiApp {
                 self.active_modal = None;
                 self.apply_theme(&name);
             }
+            ModalAction::AddMarketplace => {
+                self.active_modal = None;
+                self.messages.push(DisplayMessage::System(
+                    "To add a marketplace, use: /plugin marketplace add <owner/repo>".to_string(),
+                ));
+            }
+            ModalAction::UpdateMarketplace(name) => {
+                self.messages.push(DisplayMessage::System(
+                    format!("Updating marketplace: {name}..."),
+                ));
+                let config_dir = crate::config::global_config_dir().unwrap_or_default();
+                match crate::plugins::MarketplaceRegistry::new(&config_dir) {
+                    Ok(registry) => {
+                        match registry.update_all() {
+                            Ok(_) => self.messages.push(DisplayMessage::System(
+                                format!("Marketplace '{name}' updated."),
+                            )),
+                            Err(e) => self.messages.push(DisplayMessage::System(
+                                format!("Update failed: {e}"),
+                            )),
+                        }
+                    }
+                    Err(e) => self.messages.push(DisplayMessage::System(
+                        format!("Failed to load marketplaces: {e}"),
+                    )),
+                }
+            }
+            ModalAction::RemoveMarketplace(name) => {
+                self.active_modal = None;
+                let config_dir = crate::config::global_config_dir().unwrap_or_default();
+                match crate::plugins::MarketplaceRegistry::new(&config_dir) {
+                    Ok(mut registry) => {
+                        match registry.remove_source(&name) {
+                            Ok(_) => self.messages.push(DisplayMessage::System(
+                                format!("Removed marketplace: {name}"),
+                            )),
+                            Err(e) => self.messages.push(DisplayMessage::System(
+                                format!("Remove failed: {e}"),
+                            )),
+                        }
+                    }
+                    Err(e) => self.messages.push(DisplayMessage::System(
+                        format!("Failed to load marketplaces: {e}"),
+                    )),
+                }
+            }
         }
         Ok(())
     }
@@ -878,6 +927,33 @@ author = ""
                 description: p.manifest.plugin.description.clone(),
             })
             .collect()
+    }
+
+    /// Build marketplace entries for the plugin modal.
+    fn build_marketplace_entries(&self) -> Vec<super::plugin_modal::MarketplaceEntry> {
+        let config_dir = crate::config::global_config_dir().unwrap_or_default();
+        let registry = match crate::plugins::MarketplaceRegistry::new(&config_dir) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let installed_names: std::collections::HashSet<String> = self.plugin_manager
+            .list()
+            .iter()
+            .map(|p| p.manifest.plugin.name.clone())
+            .collect();
+
+        registry.list_sources().iter().map(|source| {
+            let available = registry.search("").len(); // empty query = all
+            let installed_from_source = installed_names.len(); // approximate
+            super::plugin_modal::MarketplaceEntry {
+                name: source.name.clone(),
+                repo: source.repo.clone(),
+                available_count: available,
+                installed_count: installed_from_source,
+                last_updated: "recently".to_string(),
+                is_default: source.name == "claude-plugins-official",
+            }
+        }).collect()
     }
 
     /// Build skill entries for the skill modal.
@@ -1986,10 +2062,67 @@ author = ""
                             ));
                         }
                     }
+                    Some("marketplace") => {
+                        match parts.get(2).copied() {
+                            Some("add") => {
+                                if let Some(repo) = parts.get(3) {
+                                    let config_dir = crate::config::global_config_dir().unwrap_or_default();
+                                    match crate::plugins::MarketplaceRegistry::new(&config_dir) {
+                                        Ok(mut registry) => {
+                                            let name = repo.split('/').last().unwrap_or(repo);
+                                            match registry.add_source(name, repo) {
+                                                Ok(_) => self.messages.push(DisplayMessage::System(
+                                                    format!("Added marketplace: {repo}"),
+                                                )),
+                                                Err(e) => self.messages.push(DisplayMessage::System(
+                                                    format!("Failed to add marketplace: {e}"),
+                                                )),
+                                            }
+                                        }
+                                        Err(e) => self.messages.push(DisplayMessage::System(
+                                            format!("Failed to load marketplaces: {e}"),
+                                        )),
+                                    }
+                                } else {
+                                    self.messages.push(DisplayMessage::System(
+                                        "Usage: /plugin marketplace add <owner/repo>".to_string(),
+                                    ));
+                                }
+                            }
+                            Some("list") => {
+                                let config_dir = crate::config::global_config_dir().unwrap_or_default();
+                                match crate::plugins::MarketplaceRegistry::new(&config_dir) {
+                                    Ok(registry) => {
+                                        let sources = registry.list_sources();
+                                        if sources.is_empty() {
+                                            self.messages.push(DisplayMessage::System(
+                                                "No marketplaces registered.".to_string(),
+                                            ));
+                                        } else {
+                                            let mut info = String::from("Registered marketplaces:\n");
+                                            for s in sources {
+                                                info.push_str(&format!("  {} ({})\n", s.name, s.repo));
+                                            }
+                                            self.messages.push(DisplayMessage::System(info));
+                                        }
+                                    }
+                                    Err(e) => self.messages.push(DisplayMessage::System(
+                                        format!("Failed to load marketplaces: {e}"),
+                                    )),
+                                }
+                            }
+                            _ => {
+                                self.messages.push(DisplayMessage::System(
+                                    "Usage: /plugin marketplace [add <owner/repo> | list]".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     _ => {
-                        // Open the interactive plugin browser modal
+                        // Open the interactive plugin browser modal with marketplace data
                         let installed = self.build_installed_entries();
-                        let modal = PluginModal::new(installed);
+                        let marketplaces = self.build_marketplace_entries();
+                        let modal = PluginModal::with_marketplaces(installed, marketplaces);
                         self.active_modal = Some(Box::new(modal));
                     }
                 }

@@ -62,7 +62,7 @@ impl Tool for FileEditTool {
                 return Ok(ToolResult::error("old_string and new_string are identical"));
             }
 
-            let path = if path_str.starts_with('/') {
+            let path = if std::path::Path::new(&path_str).is_absolute() {
                 PathBuf::from(&path_str)
             } else {
                 cwd.join(&path_str)

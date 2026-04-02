@@ -294,6 +294,9 @@ pub fn ensure_ftai_dirs() -> Result<()> {
     std::fs::create_dir_all(global.join("projects"))?;
     std::fs::create_dir_all(global.join("plugins"))?;
 
+    // Scaffold built-in plugins on first run
+    crate::plugins::builtins::ensure_builtin_plugins(&global.join("plugins"))?;
+
     // Create default config if it doesn't exist
     let config_path = global.join("config.toml");
     if !config_path.exists() {

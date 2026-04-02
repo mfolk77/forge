@@ -30,7 +30,12 @@ impl MlxServer {
 
     /// Find the mlx_lm.server executable.
     /// Tries: standalone binary (Homebrew) first, then python3 module fallback.
+    /// MLX is macOS-only; on other platforms this returns an error.
     fn find_server() -> Result<(String, Vec<String>)> {
+        if !is_available() {
+            anyhow::bail!("MLX requires Apple Silicon Mac");
+        }
+
         // 1. Standalone binary (Homebrew: brew install mlx-lm)
         let brew_path = "/opt/homebrew/bin/mlx_lm.server";
         if std::path::Path::new(brew_path).exists() {
@@ -48,7 +53,8 @@ impl MlxServer {
         }
 
         // 3. Python module fallback
-        let output = Command::new("python3")
+        let python_cmd = if cfg!(windows) { "python" } else { "python3" };
+        let output = Command::new(python_cmd)
             .args(["-c", "import mlx_lm"])
             .output();
 

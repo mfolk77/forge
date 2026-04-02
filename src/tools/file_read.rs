@@ -51,7 +51,7 @@ impl Tool for FileReadTool {
                 return Ok(ToolResult::error("No path provided"));
             }
 
-            let path = if path_str.starts_with('/') {
+            let path = if std::path::Path::new(&path_str).is_absolute() {
                 PathBuf::from(&path_str)
             } else {
                 cwd.join(&path_str)
