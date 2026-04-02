@@ -1,0 +1,175 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Context window expansion (10→25 exchanges, 1024→2048 output tokens)
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/ChatManager.swift (maxContextExchanges)
+/// - Sources/SerenaCore/Services/MLXEngine.swift (maxTokens)
+/// - Sources/SerenaCore/Protocols/AIEngine.swift (AIEngineConfiguration defaults)
+/// - Sources/SerenaCore/Services/MixtralEngine.swift (maxContextLength)
+///
+/// Security categories covered:
+/// - Cat 9: Memory & Persistence — DoS via oversized context
+/// - Cat 1: Input Injection — prompt injection surviving context trimming
+@MainActor
+final class ContextWindowRedTests: XCTestCase {
+
+    // MARK: - Helper
+
+    private func makeMessage(_ content: String, role: MessageRole, minutesAgo: Double = 0) -> Message {
+        Message(
+            id: UUID(),
+            content: content,
+            role: role,
+            timestamp: Date().addingTimeInterval(-minutesAgo * 60)
+        )
+    }
+
+    private func makeConversation(exchangeCount: Int, messageContent: String = "Hello") -> Conversation {
+        var conv = Conversation(title: "Test")
+        for i in 0..<exchangeCount {
+            let userMsg = makeMessage("User message \(i): \(messageContent)", role: .user, minutesAgo: Double(exchangeCount - i) * 2)
+            let assistantMsg = makeMessage("Assistant response \(i)", role: .assistant, minutesAgo: Double(exchangeCount - i) * 2 - 1)
+            conv.messages.append(userMsg)
+            conv.messages.append(assistantMsg)
+        }
+        return conv
+    }
+
+    // Lightweight ChatManager — avoid MLXEngine Metal initialization hanging in xctest
+    private func makeLightChatManager() -> ChatManager {
+        ChatManager()
+    }
+
+    // MARK: - Configuration Consistency (no ChatManager needed)
+
+    /// AIEngineConfiguration default maxTokens must be 2048
+    func test_config_defaultMaxTokens_is2048() {
+        let config = AIEngineConfiguration.default
+        XCTAssertEqual(config.maxTokens, 2048, "Default maxTokens must be 2048")
+    }
+
+    /// AIEngineConfiguration default contextWindow must be 25
+    func test_config_defaultContextWindow_is25() {
+        let config = AIEngineConfiguration.default
+        XCTAssertEqual(config.contextWindow, 25, "Default contextWindow must be 25 exchanges")
+    }
+
+    /// Conversation.getContextMessages default limit should return appropriate message count
+    func test_conversation_getContextMessages_defaultLimit() {
+        let conv = makeConversation(exchangeCount: 5)
+        let context = conv.getContextMessages(limit: 10)
+        XCTAssertEqual(context.count, 10, "5 exchanges = 10 messages, all within limit of 10")
+    }
+
+    /// Conversation.getContextMessages must cap at limit × 2
+    func test_conversation_getContextMessages_capsAtLimit() {
+        let conv = makeConversation(exchangeCount: 40) // 80 messages
+        let context = conv.getContextMessages(limit: 25) // cap at 50
+        XCTAssertEqual(context.count, 50, "Must return at most limit×2 messages")
+    }
+
+    /// Conversation.getContextMessages returns most recent messages (not oldest)
+    func test_conversation_getContextMessages_returnsMostRecent() {
+        let conv = makeConversation(exchangeCount: 40)
+        let context = conv.getContextMessages(limit: 25)
+        let lastConvMsg = conv.messages.last!
+        XCTAssertEqual(context.last?.id, lastConvMsg.id, "Context must include the most recent message")
+    }
+
+    // MARK: - Trim Enforcement via ChatManager (DoS Prevention — Cat 9)
+
+    /// Trim must activate when messages exceed 4× context limit (now 100 messages)
+    func test_trimConversation_activatesAboveThreshold() async {
+        let chatManager = makeLightChatManager()
+        var conv = makeConversation(exchangeCount: 55) // 110 messages > 100 threshold
+        XCTAssertEqual(conv.messages.count, 110)
+        chatManager.trimConversationContext(&conv)
+        XCTAssertLessThanOrEqual(conv.messages.count, 100, "Trim must enforce cap at maxContextExchanges * 4")
+    }
+
+    /// Below threshold, trim should be a no-op
+    func test_trimConversation_belowThreshold_noOp() async {
+        let chatManager = makeLightChatManager()
+        var conv = makeConversation(exchangeCount: 40) // 80 messages < 100 threshold
+        let originalCount = conv.messages.count
+        chatManager.trimConversationContext(&conv)
+        XCTAssertEqual(conv.messages.count, originalCount, "Trim must not remove messages below threshold")
+    }
+
+    /// Massive conversation (500 exchanges) trim must complete quickly
+    func test_trimConversation_massiveConversation_performant() async {
+        let chatManager = makeLightChatManager()
+        var conv = makeConversation(exchangeCount: 500) // 1000 messages
+        let start = Date()
+        chatManager.trimConversationContext(&conv)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThanOrEqual(conv.messages.count, 100, "Trim must enforce cap")
+        XCTAssertLessThan(elapsed, 2.0, "Trim of 1000 messages must complete in <2s")
+    }
+
+    // MARK: - Message Ordering Integrity
+
+    /// After trimming, messages must maintain chronological order
+    func test_contextWindow_afterTrim_chronologicalOrder() async {
+        let chatManager = makeLightChatManager()
+        var conv = makeConversation(exchangeCount: 55)
+        chatManager.trimConversationContext(&conv)
+
+        for i in 1..<conv.messages.count {
+            XCTAssertLessThanOrEqual(
+                conv.messages[i - 1].timestamp,
+                conv.messages[i].timestamp,
+                "Messages must remain in chronological order after trimming"
+            )
+        }
+    }
+
+    /// Most recent messages must always be preserved after trimming
+    func test_contextWindow_afterTrim_recentMessagesPreserved() async {
+        let chatManager = makeLightChatManager()
+        var conv = makeConversation(exchangeCount: 55)
+        let lastMessageId = conv.messages.last!.id
+        let secondLastId = conv.messages[conv.messages.count - 2].id
+        chatManager.trimConversationContext(&conv)
+
+        let ids = Set(conv.messages.map { $0.id })
+        XCTAssertTrue(ids.contains(lastMessageId), "Most recent message must survive trimming")
+        XCTAssertTrue(ids.contains(secondLastId), "Second-most-recent message must survive trimming")
+    }
+
+    // MARK: - Null Byte in Context (Cat 1)
+
+    /// Null bytes in messages must not corrupt conversation data
+    func test_conversation_nullByteInMessage_handledSafely() {
+        var conv = Conversation(title: "Test")
+        conv.messages.append(makeMessage("Hello\0world", role: .user))
+        conv.messages.append(makeMessage("Response", role: .assistant))
+        let context = conv.getContextMessages(limit: 25)
+        XCTAssertEqual(context.count, 2, "Null bytes in messages must not break context extraction")
+    }
+
+    // MARK: - Oversized Message (Cat 9: DoS)
+
+    /// 100K char single message must not crash context retrieval
+    func test_conversation_oversizedMessage_handledGracefully() {
+        let hugeContent = String(repeating: "A", count: 100_000)
+        var conv = Conversation(title: "Test")
+        conv.messages.append(makeMessage(hugeContent, role: .user))
+        conv.messages.append(makeMessage("OK", role: .assistant))
+        let context = conv.getContextMessages(limit: 25)
+        XCTAssertEqual(context.count, 2, "Oversized message must not break context extraction")
+    }
+
+    /// Trim with oversized messages must still enforce cap
+    func test_trimConversation_oversizedMessages_stillCaps() async {
+        let chatManager = makeLightChatManager()
+        let hugeContent = String(repeating: "B", count: 50_000)
+        var conv = makeConversation(exchangeCount: 55)
+        // Replace first message with oversized content
+        conv.messages[0] = makeMessage(hugeContent, role: .user, minutesAgo: 200)
+        chatManager.trimConversationContext(&conv)
+        XCTAssertLessThanOrEqual(conv.messages.count, 100, "Trim must enforce cap even with oversized messages")
+    }
+}

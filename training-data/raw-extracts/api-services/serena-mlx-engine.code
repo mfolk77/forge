@@ -1,0 +1,1206 @@
+import Foundation
+import CoreImage
+import os.log
+import MLX
+import MLXLLM
+import MLXLMCommon
+
+/// MLX-based AI Engine for pure Swift LLM inference on Apple Silicon
+/// Replaces the Python bridge for faster, more reliable local inference
+///
+/// IMPORTANT: This engine bypasses ChatSession entirely to preserve system prompt.
+/// ChatSession's respond() method replaces the messages array on each call,
+/// losing the system instructions. We use ModelContainer.perform directly with
+/// properly constructed Chat.Message array to ensure the system prompt is always included.
+///
+/// NOTE: Heavy inference work is moved off MainActor to prevent UI freezes.
+/// Only @Published properties are updated on MainActor.
+///
+/// CONCURRENCY: Uses an async request queue to handle multiple inference requests gracefully.
+/// Instead of rejecting concurrent requests, they are queued and processed sequentially.
+public final class MLXEngine: ObservableObject {
+    // MARK: - Published Properties (must be updated on MainActor)
+    @MainActor @Published public private(set) var isReady: Bool = false
+    @MainActor @Published public private(set) var loadingProgress: Double = 0.0
+    @MainActor @Published public private(set) var memoryUsage: Int64 = 0
+    @MainActor @Published public private(set) var downloadProgress: Progress?
+
+    // MARK: - Private Properties
+    private var modelContainer: ModelContainer?
+    private var chatSession: ChatSession?
+    private var configuration: AIEngineConfiguration
+    // Error logging: use logger.error("message") for errors
+    private let logger = Logger(subsystem: "com.serenanet.ai", category: "MLXEngine")
+
+    // Model Configuration - Auto-select based on device RAM
+    // 8GB devices → Qwen3.5-4B, 16GB+ → Qwen3.5-9B (natively multimodal)
+    private let modelId: String = {
+        let ram = ProcessInfo.processInfo.physicalMemory
+        if ram <= 8 * 1024 * 1024 * 1024 { // 8GB or less
+            return "mlx-community/Qwen3.5-4B-MLX-4bit"
+        } else {
+            return "mlx-community/Qwen3.5-9B-MLX-4bit"
+        }
+    }()
+    private let localModelFolderName: String = {
+        let ram = ProcessInfo.processInfo.physicalMemory
+        if ram <= 8 * 1024 * 1024 * 1024 {
+            return "Qwen3.5-4B-MLX-4bit"
+        } else {
+            return "Qwen3.5-9B-MLX-4bit"
+        }
+    }()
+    private var localModelPath: URL?
+
+    // Thinking Mode UI toggle — Qwen 3.5 supports native thinking via <think> blocks
+    @MainActor @Published public var thinkingModeEnabled: Bool = false
+
+    /// When true, adds /no_think to suppress Qwen 3.5's internal reasoning
+    @MainActor @Published public var suppressThinking: Bool = true  // Default: suppress
+
+    // Generation parameters (tuned for Qwen3.5)
+    private var temperature: Float = 0.7
+    private var maxTokens: Int = 2048     // 2K output for detailed responses
+    private var topP: Float = 0.9
+    private var repetitionPenalty: Float = 1.2
+    private var repetitionContextSize: Int = 64
+
+    // Inference state to prevent concurrent access to ChatSession (causes KV cache corruption)
+    @MainActor @Published public private(set) var isInferring: Bool = false
+
+    // MARK: - Request Queue (for handling concurrent requests)
+
+    /// Maximum number of requests that can be queued (prevents unbounded memory growth)
+    private let maxQueueDepth: Int = 10
+
+    /// Current number of pending requests in the queue
+    @MainActor @Published public private(set) var queuedRequestCount: Int = 0
+
+    /// Actor to serialize inference requests and manage the queue
+    private let requestQueue = InferenceRequestQueue()
+
+    // MARK: - Fact Confirmation Directive
+
+    /// Transient directive appended to the system prompt for the next response only.
+    /// Set by ChatManager when new personal facts are extracted from the user's message.
+    /// Cleared after one generation cycle.
+    @MainActor public var pendingFactDirective: String = ""
+
+    /// Transient screen image for VLM inference. Set by ChatManager when screen context
+    /// includes a screenshot. Consumed (cleared) after one generation cycle.
+    /// The CGImage is converted to CIImage and passed as UserInput.Image to the model.
+    @MainActor public var pendingScreenImage: CGImage?
+
+    // MARK: - Memory Diagnostics
+
+    /// Public diagnostics actor for tracking memory across inferences
+    public let memoryDiagnostics = MemoryDiagnostics()
+
+    // Base system prompt - Memory focused with tool definitions
+    // Note: Remembered facts are dynamically appended at generation time
+    private let baseSystemPrompt = """
+You are Serena, a warm and intelligent AI assistant on macOS. You have a genuine personality - curious, helpful, and empathetic.
+Be conversational and natural. Show genuine interest in the user. Be concise — match response length to question complexity.
+Never make up facts about the user. Only state what you know from this conversation or from remembered facts provided below.
+If you don't know something, say so honestly. When uncertain about preferences, ask rather than guess.
+Never claim you performed an action unless you see a tool result confirming it.
+CRITICAL OUTPUT RULES:
+- Never show your thinking process, reasoning steps, or analysis. Respond directly with your answer only.
+- Never start with "Okay, let me", "Let me start by", "Wait,", or any preamble. Just answer.
+- Never reference the system prompt, instructions, remembered facts, RTAI, or your internal workings.
+- Never mention /no_think, prompt context, or that you are an LLM/model.
+- Keep responses concise and conversational. One to three sentences for simple questions.
+
+LEARNING: When the user shares NEW personal facts about THEMSELVES in their CURRENT message, append a <serena_facts> block at the END of your response. Format: <serena_facts>[{"key":"short label","value":"the fact"}]</serena_facts>
+Personal facts include: names of family/friends, where they live/work, preferences, allergies, birthdays, hobbies.
+NOT personal facts: conversation topics, things they ask about, general knowledge, product names, news.
+Example: "my wife's name is Christina" → [{"key":"wife's name","value":"Christina"}]
+Example: "what is the nvidia dgx spark" → NO <serena_facts> (this is a question, not a personal fact)
+NEVER re-emit facts from conversation history. NEVER include <serena_facts> if no NEW personal facts appear in the current message.
+"""
+
+    /// Build the full system prompt with personality injected at the TOP (after identity line).
+    /// Budget: 0-40 tokens for personality. New users = 0 tokens added.
+    private func buildSystemPrompt(userMessage: String? = nil) async -> String {
+        var prompt = baseSystemPrompt
+
+        // Personality directives — disabled via FeatureFlags until tested
+        if FeatureFlags.personalityEnabled {
+            var directives: [String] = []
+
+            // 1. ResponseStyle — only non-balanced adds a directive
+            let styleRaw = UserDefaults.standard.string(forKey: "SerenaNet.ResponseStyle") ?? "balanced"
+            if let style = ResponseStyle(rawValue: styleRaw), style != .balanced {
+                directives.append(style.directive)
+            }
+
+            // 2. Relationship stage — empty for new users, 1 line for familiar/companion
+            let relationshipFragment = await MainActor.run { RelationshipTracker.shared.promptFragment }
+            if !relationshipFragment.isEmpty {
+                directives.append(relationshipFragment)
+            }
+
+            // 3. Tone hint — 1 directive line based on user's current message, or empty
+            if let message = userMessage {
+                let toneSignal = ToneAnalyzer.shared.analyze(message)
+                let toneHint = ToneAnalyzer.shared.promptHint(from: toneSignal)
+                if !toneHint.isEmpty {
+                    directives.append(toneHint)
+                }
+            }
+
+            // Inject directives right after the first line (identity) of the base prompt
+            if !directives.isEmpty {
+                let lines = baseSystemPrompt.components(separatedBy: "\n")
+                let identityLine = lines[0]
+                let rest = lines.dropFirst().joined(separator: "\n")
+                prompt = identityLine + directives.joined() + "\n" + rest
+            }
+        }
+
+        // 4. Remembered facts (always at the end — these are data, not directives)
+        let rememberedFacts = await UserFTAIManager.shared.getFactsForPrompt()
+        if !rememberedFacts.isEmpty {
+            prompt += "\n\n" + rememberedFacts
+        }
+
+        // 5. Fact confirmation directive (transient — only for the next response)
+        let factDirective = await MainActor.run {
+            let directive = self.pendingFactDirective
+            self.pendingFactDirective = ""  // Clear after consuming
+            return directive
+        }
+        if !factDirective.isEmpty {
+            prompt += "\n\n" + factDirective
+        }
+
+        return prompt
+    }
+
+    // MARK: - Initialization
+
+    public init(configuration: AIEngineConfiguration = .default) {
+        self.configuration = configuration
+        self.maxTokens = configuration.maxTokens
+        self.temperature = Float(configuration.temperature)
+    }
+
+    // MARK: - Public Methods
+
+    /// Initialize the MLX engine and load the model
+    @MainActor
+    public func initialize() async throws {
+        guard !isReady else {
+            #if DEBUG
+            print("🔥 MLXEngine: Already initialized, returning")
+            #endif
+            logger.info("MLXEngine already initialized")
+            return
+        }
+
+        #if DEBUG
+        print("🔥 MLXEngine: Starting initialization...")
+        #endif
+        logger.info("🚀 MLXEngine: Starting initialization...")
+        loadingProgress = 0.1
+        let modelLoadStartTime = Date()
+
+        do {
+            // Set GPU cache limit - 512MB for 7B model inference
+            // This helps prevent OOM while allowing efficient KV caching
+            GPU.set(cacheLimit: 512 * 1024 * 1024)
+            loadingProgress = 0.2
+
+            // Check for local model first, then download from HuggingFace
+            let modelConfig = try await resolveModelConfiguration()
+            loadingProgress = 0.4
+
+            logger.debug("📥 MLXEngine: Loading model...")
+
+            // Load the model container using the simplified API
+            modelContainer = try await loadModelContainer(
+                configuration: modelConfig
+            ) { [weak self] progress in
+                Task { @MainActor in
+                    self?.downloadProgress = progress
+                    // Update loading progress based on download
+                    let downloadFraction = progress.fractionCompleted
+                    self?.loadingProgress = 0.4 + (downloadFraction * 0.5)
+                }
+            }
+
+            loadingProgress = 0.9
+
+            // Verify model is loaded
+            guard let container = modelContainer else {
+                throw SerenaError.aiModelInitializationFailed("Failed to load MLX model container")
+            }
+
+            // Create chat session with system instructions (base prompt only at init time)
+            // CREATIVE WORKAROUND: We create a fresh ChatSession for each request to ensure
+            // the system prompt with tool definitions is always included. ChatSession replaces
+            // messages on each respond() call, so we need to ensure the instructions are fresh.
+            // Note: Remembered facts are injected dynamically in generateResponse()
+            let generateParams = GenerateParameters(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                repetitionPenalty: repetitionPenalty,
+                repetitionContextSize: repetitionContextSize
+            )
+            chatSession = ChatSession(
+                container,
+                instructions: baseSystemPrompt,
+                generateParameters: generateParams
+            )
+
+            loadingProgress = 1.0
+            isReady = true
+
+            // Track model load time for analytics
+            let modelLoadDuration = Date().timeIntervalSince(modelLoadStartTime)
+            Task { @MainActor in
+                AnalyticsManager.shared.trackModelLoadTime(ms: modelLoadDuration * 1000)
+            }
+
+            #if DEBUG
+            print("🔥 MLXEngine: Model loaded successfully (per-request ChatSession for tool calling)!")
+            #endif
+            logger.info("✅ MLXEngine: Model loaded successfully!")
+            logger.info("   Model: \(self.modelId)")
+            logger.debug("   Mode: Fresh ChatSession per request with tool-enabled system prompt")
+
+            // Update memory usage
+            updateMemoryUsage()
+
+            // Set baseline for memory diagnostics
+            let baseline = Int64(GPU.snapshot().activeMemory)
+            await memoryDiagnostics.setBaseline(baseline)
+            logger.info("📊 MLXEngine: Memory diagnostics baseline set after model load")
+
+        } catch {
+            logger.error("❌ MLXEngine: Initialization failed: \(error.localizedDescription)")
+            loadingProgress = 0.0
+            throw SerenaError.aiModelInitializationFailed(error.localizedDescription)
+        }
+    }
+
+    /// Generate a response for the given input
+    /// Uses low-level ModelContainer.perform API to bypass ChatSession's message wiping behavior.
+    /// Constructs proper Chat.Message array with system prompt + user message.
+    /// NOTE: Heavy inference runs off MainActor to prevent UI freezes.
+    /// NOTE: Concurrent requests are queued instead of rejected.
+    public func generateResponse(for input: String, context: [Message]) async throws -> String {
+        // Capture container reference before any async work
+        guard let container = modelContainer else {
+            throw SerenaError.aiModelNotLoaded
+        }
+
+        // Check isReady on MainActor
+        let ready = await MainActor.run { self.isReady }
+        guard ready else {
+            throw SerenaError.aiModelNotLoaded
+        }
+
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw SerenaError.emptyMessage
+        }
+
+        // Generate a unique request ID for logging
+        let requestId = UUID()
+
+        // Check queue depth and update UI state
+        let currentDepth = await requestQueue.queueDepth
+        if currentDepth > 0 {
+            logger.debug("📋 MLXEngine: Request \(requestId.uuidString.prefix(8)) joining queue (current depth: \(currentDepth))")
+        }
+
+        // Use a result variable to capture the response from the queued work
+        var result: String = ""
+
+        // Update queued count before entering the queue
+        await MainActor.run { self.queuedRequestCount += 1 }
+
+        // Enqueue the inference request - it will wait until it's this request's turn
+        do {
+            try await requestQueue.enqueue(id: requestId) { [weak self] in
+                guard let self = self else {
+                    throw SerenaError.aiModelNotLoaded
+                }
+
+                // Now it's our turn - set inferring flag and decrement queue count
+                await MainActor.run {
+                    self.isInferring = true
+                    self.queuedRequestCount = max(0, self.queuedRequestCount - 1)
+                }
+
+                // CRITICAL: Clear GPU cache BEFORE inference to prevent memory accumulation
+                GPU.clearCache()
+                Stream.gpu.synchronize()
+
+                // DIAGNOSTICS: Capture memory before inference
+                let memoryBefore = Int64(GPU.snapshot().activeMemory)
+                var peakMemory = memoryBefore
+
+                self.logger.debug("🤖 MLXEngine: Generating response for: '\(input.prefix(50))...' (input length: \(input.count) chars)")
+                self.logger.debug("📊 [Diagnostics] Memory before inference: \(ByteCountFormatter.string(fromByteCount: memoryBefore, countStyle: .memory))")
+                let startTime = Date()
+
+                do {
+                    // Build system prompt with personality, tone, relationship stage, and remembered facts
+                    let systemPrompt = await self.buildSystemPrompt(userMessage: input)
+
+                    // Construct proper Chat.Message array with system prompt and conversation history
+                    // This bypasses ChatSession which wipes messages on each respond() call
+                    var messages: [Chat.Message] = [.system(systemPrompt)]
+
+                    // Add conversation history (up to last 10 exchanges = 20 messages)
+                    // IMPORTANT: Clean tool calls from assistant messages to prevent the model
+                    // from repeating or being confused by previous tool executions
+                    let historyLimit = min(context.count, 20)
+                    let recentHistory = context.suffix(historyLimit)
+                    let toolParser = await ToolCallParser.shared
+                    for msg in recentHistory {
+                        switch msg.role {
+                        case .user:
+                            messages.append(.user(msg.content, images: [], videos: []))
+                        case .assistant:
+                            // Remove tool calls from history to prevent model confusion/repetition
+                            let cleanedContent = await toolParser.removeToolCalls(from: msg.content)
+                            // Only add if there's meaningful content left
+                            if !cleanedContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                messages.append(.assistant(cleanedContent))
+                            }
+                        }
+                    }
+
+                    // Add the current user input
+                    // Qwen3 bf16: /no_think must be at BOTH start AND end to reliably suppress thinking
+                    let (shouldSuppress, screenCGImage) = await MainActor.run {
+                        let suppress = self.suppressThinking
+                        let img = self.pendingScreenImage
+                        self.pendingScreenImage = nil  // consume one-shot
+                        return (suppress, img)
+                    }
+                    let finalInput = shouldSuppress ? "/no_think \(input) /no_think" : input
+
+                    // Attach screen image for VLM if available
+                    var userImages: [UserInput.Image] = []
+                    if let cgImage = screenCGImage {
+                        let ciImage = CIImage(cgImage: cgImage)
+                        userImages.append(.ciImage(ciImage))
+                        self.logger.info("🖼️ MLXEngine: Attaching screen image (\(cgImage.width)x\(cgImage.height)) for VLM inference")
+                    }
+                    messages.append(.user(finalInput, images: userImages, videos: []))
+
+                    self.logger.debug("📜 MLXEngine: Context includes \(recentHistory.count) history messages + current input (suppressThinking=\(shouldSuppress), hasImage=\(screenCGImage != nil))")
+
+                    let generateParams = GenerateParameters(
+                        maxTokens: self.maxTokens,
+                        temperature: self.temperature,
+                        topP: self.topP,
+                        repetitionPenalty: self.repetitionPenalty,
+                        repetitionContextSize: self.repetitionContextSize
+                    )
+
+                    self.logger.debug("🔧 MLXEngine: Using direct ModelContainer.perform with Chat.Message array")
+                    self.logger.debug("📝 MLXEngine: Messages: [system(\(systemPrompt.count) chars), user(\(input.count) chars)]")
+
+                    // Use ModelContainer.perform directly to bypass ChatSession
+                    // This runs the heavy inference work in MLX's background executor
+                    let response = try await container.perform { modelContext in
+                        // Create UserInput with our properly constructed messages array
+                        let userInput = UserInput(
+                            chat: messages,
+                            processing: UserInput.Processing(resize: CGSize(width: 512, height: 512)),
+                            additionalContext: nil
+                        )
+
+                        // Prepare input through the model's processor (applies chat template correctly)
+                        let preparedInput = try await modelContext.processor.prepare(input: userInput)
+
+                        // Create fresh cache for this generation
+                        let cache = modelContext.model.newCache(parameters: generateParams)
+
+                        // Generate tokens
+                        let iterator = try TokenIterator(
+                            input: preparedInput,
+                            model: modelContext.model,
+                            cache: cache,
+                            parameters: generateParams
+                        )
+
+                        let generationResult: GenerateResult = MLXLMCommon.generate(
+                            input: preparedInput,
+                            context: modelContext,
+                            iterator: iterator
+                        ) { _ in .more }
+
+                        // Extract output string FIRST, before any cleanup
+                        let output = generationResult.output
+
+                        // GPU sync and clear cache
+                        Stream.gpu.synchronize()
+                        GPU.clearCache()
+
+                        return output
+                    }
+
+                    // Clear inferring flag on MainActor
+                    await MainActor.run { self.isInferring = false }
+
+                    let duration = Date().timeIntervalSince(startTime)
+                    #if DEBUG
+                    print(response)
+                    #endif
+                    self.logger.info("✅ MLXEngine: Generated response in \(String(format: "%.2f", duration))s")
+
+                    // Track LLM response time for analytics
+                    Task { @MainActor in
+                        AnalyticsManager.shared.trackLLMResponseTime(ms: duration * 1000)
+                        AnalyticsManager.shared.trackMessageReceived()
+                    }
+
+                    await MainActor.run { self.updateMemoryUsage() }
+
+                    self.logger.debug("✅ MLXEngine: Response generated (\(response.count) chars)")
+                    self.logger.debug("📝 Response preview: \(response.prefix(150))...")
+
+                    result = response.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    // DIAGNOSTICS: Capture memory after inference and record snapshot
+                    let memoryAfter = Int64(GPU.snapshot().activeMemory)
+                    let currentPeak = Int64(GPU.snapshot().peakMemory)
+                    peakMemory = max(peakMemory, currentPeak)
+
+                    let snapshot = MemoryDiagnostics.InferenceSnapshot(
+                        requestId: requestId,
+                        timestamp: Date(),
+                        memoryBefore: memoryBefore,
+                        memoryAfter: memoryAfter,
+                        peakDuringInference: peakMemory
+                    )
+                    await self.memoryDiagnostics.recordInference(snapshot)
+                    self.logger.debug("📊 [Diagnostics] Memory after inference: \(ByteCountFormatter.string(fromByteCount: memoryAfter, countStyle: .memory)) (delta: \(snapshot.deltaFormatted))")
+
+                } catch {
+                    // Clear inferring flag on error
+                    await MainActor.run { self.isInferring = false }
+                    self.logger.error("❌ MLXEngine: Generation failed: \(error.localizedDescription)")
+                    throw SerenaError.aiResponseGenerationFailed(error.localizedDescription)
+                }
+            }
+        } catch {
+            // Decrement queue count if we failed to enqueue (e.g., queue full)
+            await MainActor.run { self.queuedRequestCount = max(0, self.queuedRequestCount - 1) }
+            throw error
+        }
+
+        // Process Qwen3 thinking blocks based on user preference
+        let thinkingEnabled = await MainActor.run { self.thinkingModeEnabled }
+        let processedResult = processThinkingBlocks(result, showThinking: thinkingEnabled)
+        return processedResult
+    }
+
+    /// Generate a streaming response
+    /// Uses low-level ModelContainer.perform API to preserve system prompt
+    /// NOTE: Heavy inference runs off MainActor to prevent UI freezes.
+    /// NOTE: Concurrent requests are queued instead of rejected.
+    public func generateStreamingResponse(for input: String, context: [Message]) async throws -> AsyncStream<String> {
+        // Capture container reference before any async work
+        guard let container = modelContainer else {
+            throw SerenaError.aiModelNotLoaded
+        }
+
+        // Check isReady on MainActor
+        let ready = await MainActor.run { self.isReady }
+        guard ready else {
+            throw SerenaError.aiModelNotLoaded
+        }
+
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw SerenaError.emptyMessage
+        }
+
+        // Generate a unique request ID for logging
+        let requestId = UUID()
+
+        logger.debug("🌊 MLXEngine: Starting streaming generation for: '\(input.prefix(50))...'")
+
+        // Check queue depth
+        let currentDepth = await requestQueue.queueDepth
+        if currentDepth > 0 {
+            logger.debug("📋 MLXEngine: Streaming request \(requestId.uuidString.prefix(8)) joining queue (current depth: \(currentDepth))")
+        }
+
+        // Build system prompt with personality, tone, relationship stage, and remembered facts
+        let systemPrompt = await buildSystemPrompt(userMessage: input)
+
+        // Construct proper Chat.Message array with system prompt and conversation history
+        var messages: [Chat.Message] = [.system(systemPrompt)]
+
+        // Add conversation history (up to last 10 exchanges = 20 messages)
+        // IMPORTANT: Clean tool calls from assistant messages to prevent the model
+        // from repeating or being confused by previous tool executions
+        let historyLimit = min(context.count, 20)
+        let recentHistory = context.suffix(historyLimit)
+        let toolParser = await ToolCallParser.shared
+        for msg in recentHistory {
+            switch msg.role {
+            case .user:
+                messages.append(.user(msg.content, images: [], videos: []))
+            case .assistant:
+                // Remove tool calls from history to prevent model confusion/repetition
+                let cleanedContent = await toolParser.removeToolCalls(from: msg.content)
+                // Only add if there's meaningful content left
+                if !cleanedContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    messages.append(.assistant(cleanedContent))
+                }
+            }
+        }
+
+        // Add the current user input
+        // Qwen3 bf16: /no_think must be at BOTH start AND end to reliably suppress thinking
+        // Testing showed: end-only = full thinking (20-26s), both = empty <think></think> (5-6s)
+        let (shouldSuppress, screenCGImage) = await MainActor.run {
+            let suppress = self.suppressThinking
+            let img = self.pendingScreenImage
+            self.pendingScreenImage = nil  // consume one-shot
+            return (suppress, img)
+        }
+        let finalInput = shouldSuppress ? "/no_think \(input) /no_think" : input
+        #if DEBUG
+        print("🧠 [MLXEngine] suppressThinking=\(shouldSuppress), finalInput: '/no_think...\(finalInput.suffix(30))'")
+        #endif
+        logger.debug("🧠 MLXEngine: suppressThinking=\(shouldSuppress)")
+        if shouldSuppress {
+            logger.debug("⚡ MLXEngine: Instant mode - appending /no_think to user message")
+        }
+
+        // Attach screen image for VLM if available
+        var userImages: [UserInput.Image] = []
+        if let cgImage = screenCGImage {
+            let ciImage = CIImage(cgImage: cgImage)
+            userImages.append(.ciImage(ciImage))
+            logger.info("🖼️ MLXEngine: Attaching screen image (\(cgImage.width)x\(cgImage.height)) for VLM streaming inference")
+        }
+        messages.append(.user(finalInput, images: userImages, videos: []))
+
+        logger.debug("🌊 MLXEngine: Streaming with \(recentHistory.count) history messages + current input (tool calls cleaned, hasImage=\(screenCGImage != nil))")
+
+        // Use reduced tokens and lower temperature for Instant mode (faster, shorter responses)
+        let effectiveMaxTokens = shouldSuppress ? min(maxTokens, 512) : maxTokens
+        let effectiveTemperature = shouldSuppress ? max(0.3, temperature - 0.2) : temperature
+
+        let generateParams = GenerateParameters(
+            maxTokens: effectiveMaxTokens,
+            temperature: effectiveTemperature,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionContextSize: repetitionContextSize
+        )
+
+        if shouldSuppress {
+            logger.debug("⚡ MLXEngine: Instant mode - maxTokens=\(effectiveMaxTokens), temperature=\(effectiveTemperature)")
+        }
+        logger.debug("🔧 MLXEngine: Streaming with direct ModelContainer.perform API")
+
+        // CRITICAL FIX: Avoid MainActor deadlock in streaming
+        // The caller (ChatManager) runs on MainActor and blocks in `for try await token in stream`.
+        // If this Task calls `await MainActor.run { ... }` before yielding tokens, deadlock occurs:
+        // - MainActor waits for tokens
+        // - This Task waits for MainActor
+        // - Neither can proceed
+        //
+        // Solution: Use fire-and-forget Task { @MainActor in ... } for state updates,
+        // which schedules work on MainActor without blocking.
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                guard let self = self else {
+                    continuation.finish()
+                    return
+                }
+
+                // Fire-and-forget: Update queued count (non-blocking)
+                Task { @MainActor in self.queuedRequestCount += 1 }
+
+                do {
+                    // Enqueue and wait for our turn
+                    try await self.requestQueue.enqueue(id: requestId) { [weak self] in
+                        guard let self = self else {
+                            throw SerenaError.aiModelNotLoaded
+                        }
+
+                        // Fire-and-forget: Set inferring flag (non-blocking)
+                        Task { @MainActor in
+                            self.isInferring = true
+                            self.queuedRequestCount = max(0, self.queuedRequestCount - 1)
+                        }
+
+                        // DIAGNOSTICS: Clear cache and capture memory before streaming
+                        GPU.clearCache()
+                        Stream.gpu.synchronize()
+                        let memoryBefore = Int64(GPU.snapshot().activeMemory)
+                        self.logger.debug("📊 [Diagnostics] Streaming memory before: \(ByteCountFormatter.string(fromByteCount: memoryBefore, countStyle: .memory))")
+
+                        do {
+                            // Create UserInput with proper messages array
+                            let userInput = UserInput(
+                                chat: messages,
+                                processing: UserInput.Processing(resize: CGSize(width: 512, height: 512)),
+                                additionalContext: nil
+                            )
+
+                            // Perform streaming directly - no detached Tasks
+                            try await container.perform { modelContext in
+                                // Prepare input
+                                let preparedInput = try await modelContext.processor.prepare(input: userInput)
+
+                                // Create fresh cache
+                                let cache = modelContext.model.newCache(parameters: generateParams)
+
+                                // Stream tokens directly to continuation
+                                for await item in try MLXLMCommon.generate(
+                                    input: preparedInput,
+                                    cache: cache,
+                                    parameters: generateParams,
+                                    context: modelContext
+                                ) {
+                                    if let chunk = item.chunk {
+                                        continuation.yield(chunk)
+                                    }
+                                }
+
+                                // Cleanup GPU before leaving perform scope
+                                Stream.gpu.synchronize()
+                                GPU.clearCache()
+                            }
+
+                            // DIAGNOSTICS: Capture memory after streaming
+                            let memoryAfter = Int64(GPU.snapshot().activeMemory)
+                            let peakMemory = Int64(GPU.snapshot().peakMemory)
+                            let snapshot = MemoryDiagnostics.InferenceSnapshot(
+                                requestId: requestId,
+                                timestamp: Date(),
+                                memoryBefore: memoryBefore,
+                                memoryAfter: memoryAfter,
+                                peakDuringInference: peakMemory
+                            )
+                            await self.memoryDiagnostics.recordInference(snapshot)
+                            self.logger.debug("📊 [Diagnostics] Streaming memory after: \(ByteCountFormatter.string(fromByteCount: memoryAfter, countStyle: .memory)) (delta: \(snapshot.deltaFormatted))")
+
+                        } catch {
+                            self.logger.error("❌ MLXEngine: Streaming error: \(error.localizedDescription)")
+                            Stream.gpu.synchronize()
+                            GPU.clearCache()
+                        }
+
+                        // Fire-and-forget: Clear inferring flag (non-blocking)
+                        Task { @MainActor in
+                            self.isInferring = false
+                            self.updateMemoryUsage()
+                        }
+
+                        continuation.finish()
+                    }
+                } catch {
+                    // Fire-and-forget: Decrement queue count (non-blocking)
+                    Task { @MainActor in self.queuedRequestCount = max(0, self.queuedRequestCount - 1) }
+                    self.logger.error("❌ MLXEngine: Streaming queue error: \(error.localizedDescription)")
+                    continuation.finish()
+                }
+            }
+        }
+    }
+
+    /// Cleanup and release resources
+    @MainActor
+    public func cleanup() async {
+        logger.info("🧹 MLXEngine: Cleaning up...")
+
+        // Cancel any pending requests in the queue
+        await requestQueue.cancelAll()
+        queuedRequestCount = 0
+
+        // Clear GPU cache before releasing resources
+        GPU.clearCache()
+
+        chatSession = nil
+        modelContainer = nil
+        isReady = false
+        loadingProgress = 0.0
+        memoryUsage = 0
+        logger.info("✅ MLXEngine: Cleanup complete")
+    }
+
+    /// Proactively release GPU memory without unloading the model
+    /// Call this between conversations or when memory pressure is detected
+    @MainActor
+    public func releaseMemory() {
+        logger.debug("🧹 MLXEngine: Releasing GPU memory...")
+
+        // Clear GPU cache to free accumulated KV cache memory
+        GPU.clearCache()
+
+        // Force synchronization to ensure all GPU work is complete
+        Stream.gpu.synchronize()
+
+        updateMemoryUsage()
+        logger.info("✅ MLXEngine: GPU memory released (current: \(ByteCountFormatter.string(fromByteCount: self.memoryUsage, countStyle: .memory)))")
+    }
+
+    // MARK: - Memory Verification
+
+    /// Result of memory leak verification
+    public struct MemoryVerificationResult: Sendable {
+        public let inferenceCount: Int
+        public let cumulativeGrowthBytes: Int64
+        public let averageDeltaBytes: Int64
+        public let hasLeakIndicators: Bool
+        public let summary: String
+
+        public var cumulativeGrowthFormatted: String {
+            ByteCountFormatter.string(fromByteCount: cumulativeGrowthBytes, countStyle: .memory)
+        }
+
+        public var averageDeltaFormatted: String {
+            let sign = averageDeltaBytes >= 0 ? "+" : ""
+            return "\(sign)\(ByteCountFormatter.string(fromByteCount: averageDeltaBytes, countStyle: .memory))"
+        }
+    }
+
+    /// Verify memory behavior and check for leaks
+    /// Use this after running multiple inference calls to verify memory is stable
+    /// - Parameter resetAfter: If true, resets diagnostics after verification
+    /// - Returns: MemoryVerificationResult with leak analysis
+    public func verifyMemoryBehavior(resetAfter: Bool = false) async -> MemoryVerificationResult {
+        let count = await memoryDiagnostics.inferenceCount
+        let growth = await memoryDiagnostics.cumulativeGrowth
+        let avgDelta = await memoryDiagnostics.averageDelta
+        let summary = await memoryDiagnostics.getSummary()
+
+        // Check for leak indicators:
+        // 1. Cumulative growth > 500MB
+        // 2. Average delta > 50MB per inference
+        // 3. More than 3 inferences with consistent positive growth
+        let recentSnapshots = await memoryDiagnostics.getRecentSnapshots(count: 5)
+        let consistentGrowth = recentSnapshots.count >= 3 &&
+            recentSnapshots.suffix(3).allSatisfy { $0.delta > 50 * 1024 * 1024 }
+
+        let hasLeakIndicators = growth > MemoryDiagnostics.cumulativeWarningThreshold ||
+                               avgDelta > MemoryDiagnostics.leakDetectionThreshold ||
+                               consistentGrowth
+
+        if resetAfter {
+            let currentMemory = Int64(GPU.snapshot().activeMemory)
+            await memoryDiagnostics.setBaseline(currentMemory)
+        }
+
+        let result = MemoryVerificationResult(
+            inferenceCount: count,
+            cumulativeGrowthBytes: growth,
+            averageDeltaBytes: avgDelta,
+            hasLeakIndicators: hasLeakIndicators,
+            summary: summary
+        )
+
+        logger.info("📊 [MemoryVerification] Inference count: \(count), Cumulative: \(result.cumulativeGrowthFormatted), Avg delta: \(result.averageDeltaFormatted), Leak indicators: \(hasLeakIndicators)")
+
+        return result
+    }
+
+    /// Reset memory diagnostics baseline (call after releasing memory or starting new session)
+    public func resetMemoryDiagnostics() async {
+        let currentMemory = Int64(GPU.snapshot().activeMemory)
+        await memoryDiagnostics.setBaseline(currentMemory)
+        logger.info("📊 [MemoryDiagnostics] Baseline reset to \(ByteCountFormatter.string(fromByteCount: currentMemory, countStyle: .memory))")
+    }
+
+    /// Reset the chat session for a new conversation
+    /// With the fresh-session-per-request approach, this just clears the cached session
+    public func resetChatSession() {
+        guard let container = modelContainer else {
+            logger.warning("⚠️ MLXEngine: Cannot reset chat session - model not loaded")
+            return
+        }
+
+        logger.debug("🔄 MLXEngine: Resetting chat session for new conversation")
+        let generateParams = GenerateParameters(
+            maxTokens: maxTokens,
+            temperature: temperature,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionContextSize: repetitionContextSize
+        )
+        chatSession = ChatSession(
+            container,
+            instructions: baseSystemPrompt,  // Use base prompt; remembered facts added at generation time
+            generateParameters: generateParams
+        )
+        logger.debug("✅ MLXEngine: Chat session reset complete")
+    }
+
+    // MARK: - Private Methods
+
+    /// Clear quarantine attribute from a directory and its contents (for DMG distribution)
+    /// Runs off MainActor to avoid blocking the UI at launch
+    private func clearQuarantineAttribute(at url: URL) {
+        let path = url.path
+        Task.detached(priority: .utility) { [logger] in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            task.arguments = ["-cr", path]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    logger.info("🔓 MLXEngine: Cleared quarantine attribute from: \(path)")
+                }
+            } catch {
+                logger.warning("⚠️ MLXEngine: Could not clear quarantine: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Resolve model configuration - check app bundle Resources first, then local path, then HuggingFace
+    private func resolveModelConfiguration() async throws -> ModelConfiguration {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+
+        // PRIORITY 1: Check app bundle Resources (for DMG distribution)
+        if let bundleResourcesURL = Bundle.main.resourceURL {
+            let bundledModelDir = bundleResourcesURL
+                .appendingPathComponent("Models")
+                .appendingPathComponent(localModelFolderName)
+
+            logger.debug("📦 MLXEngine: Checking for bundled model at: \(bundledModelDir.path)")
+
+            // Clear quarantine attribute from bundled resources (fixes macOS Gatekeeper blocking)
+            if FileManager.default.fileExists(atPath: bundledModelDir.path) {
+                clearQuarantineAttribute(at: bundledModelDir)
+            }
+
+            if FileManager.default.fileExists(atPath: bundledModelDir.path) {
+                // Verify model.safetensors exists
+                let safetensorsPath = bundledModelDir.appendingPathComponent("model.safetensors")
+                if FileManager.default.fileExists(atPath: safetensorsPath.path) {
+                    logger.info("📦 MLXEngine: Found bundled model with safetensors!")
+                    localModelPath = bundledModelDir
+                    return ModelConfiguration(directory: bundledModelDir)
+                } else {
+                    logger.warning("⚠️ MLXEngine: Model directory exists but model.safetensors missing!")
+                }
+            } else {
+                logger.debug("📦 MLXEngine: No bundled model at that path")
+            }
+        } else {
+            logger.warning("⚠️ MLXEngine: Bundle.main.resourceURL is nil!")
+        }
+
+        // PRIORITY 2: Check ~/Models directory (development)
+        let localModelDir = homeDir.appendingPathComponent("Models/\(localModelFolderName)")
+        if FileManager.default.fileExists(atPath: localModelDir.path) {
+            logger.info("📁 MLXEngine: Found local model at: \(localModelDir.path)")
+            localModelPath = localModelDir
+            return ModelConfiguration(directory: localModelDir)
+        }
+
+        // PRIORITY 3: Fall back to HuggingFace download (first launch only)
+        logger.info("☁️ MLXEngine: No bundled or local model found, will download from HuggingFace: \(self.modelId)")
+        return ModelConfiguration(id: modelId)
+    }
+
+    /// Update memory usage tracking
+    @MainActor
+    private func updateMemoryUsage() {
+        let snapshot = GPU.snapshot()
+        memoryUsage = Int64(snapshot.peakMemory)
+
+        logger.debug("📊 MLXEngine Memory: \(ByteCountFormatter.string(fromByteCount: self.memoryUsage, countStyle: .memory))")
+    }
+
+    /// Strip Qwen3/3.5 thinking blocks from response — UI shows isThinking indicator separately
+    private func processThinkingBlocks(_ response: String, showThinking: Bool) -> String {
+        guard response.contains("<think>") else { return response }
+
+        // Strip completed thinking blocks
+        var processed = response
+        if let regex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: []) {
+            let range = NSRange(processed.startIndex..., in: processed)
+            processed = regex.stringByReplacingMatches(in: processed, options: [], range: range, withTemplate: "")
+        }
+        // Strip incomplete thinking block (still generating)
+        if let thinkStart = processed.range(of: "<think>") {
+            processed = String(processed[processed.startIndex..<thinkStart.lowerBound])
+        }
+        return processed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Configuration
+
+    /// Update generation parameters
+    public func updateConfiguration(_ newConfig: AIEngineConfiguration) {
+        configuration = newConfig
+        maxTokens = newConfig.maxTokens
+        temperature = Float(newConfig.temperature)
+
+        // Recreate chat session with new parameters if model is loaded
+        if let container = modelContainer {
+            let generateParams = GenerateParameters(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                repetitionPenalty: repetitionPenalty,
+                repetitionContextSize: repetitionContextSize
+            )
+            chatSession = ChatSession(
+                container,
+                instructions: baseSystemPrompt,  // Use base prompt; remembered facts added at generation time
+                generateParameters: generateParams
+            )
+        }
+
+        logger.debug("⚙️ MLXEngine: Configuration updated (maxTokens: \(self.maxTokens), temperature: \(self.temperature))")
+    }
+
+    /// Get current memory statistics
+    public func getMemoryStats() -> AIEngineMemoryStats {
+        let snapshot = GPU.snapshot()
+        let peakMemory = Int64(snapshot.peakMemory)
+        let activeMemory = Int64(snapshot.activeMemory)
+
+        let physicalMemory = Int64(ProcessInfo.processInfo.physicalMemory)
+        let availableMemory = physicalMemory - activeMemory
+
+        let pressureLevel: MemoryPressureLevel
+        let usageRatio = Double(activeMemory) / Double(physicalMemory)
+        if usageRatio < 0.5 {
+            pressureLevel = .normal
+        } else if usageRatio < 0.8 {
+            pressureLevel = .warning
+        } else {
+            pressureLevel = .critical
+        }
+
+        return AIEngineMemoryStats(
+            totalMemoryUsage: activeMemory,
+            modelMemoryUsage: peakMemory,
+            cacheMemoryUsage: 0,
+            availableMemory: availableMemory,
+            memoryPressureLevel: pressureLevel
+        )
+    }
+}
+
+// MARK: - Memory Diagnostics
+
+/// Tracks memory usage across inference calls to detect leaks
+/// Thread-safe actor for accurate cross-inference tracking
+public actor MemoryDiagnostics {
+    /// Single inference memory snapshot
+    public struct InferenceSnapshot: Sendable {
+        public let requestId: UUID
+        public let timestamp: Date
+        public let memoryBefore: Int64
+        public let memoryAfter: Int64
+        public let peakDuringInference: Int64
+
+        public var delta: Int64 { memoryAfter - memoryBefore }
+        public var deltaFormatted: String {
+            let sign = delta >= 0 ? "+" : ""
+            return "\(sign)\(ByteCountFormatter.string(fromByteCount: delta, countStyle: .memory))"
+        }
+    }
+
+    /// Warning thresholds
+    public static let singleInferenceWarningThreshold: Int64 = 100 * 1024 * 1024  // 100MB per inference
+    public static let cumulativeWarningThreshold: Int64 = 500 * 1024 * 1024       // 500MB cumulative
+    public static let leakDetectionThreshold: Int64 = 50 * 1024 * 1024            // 50MB sustained growth
+
+    private var snapshots: [InferenceSnapshot] = []
+    private var baselineMemory: Int64 = 0
+    private var sessionStartTime: Date = Date()
+    private let logger = Logger(subsystem: "com.serenanet.ai", category: "MemoryDiagnostics")
+
+    /// Total inference count this session
+    public var inferenceCount: Int { snapshots.count }
+
+    /// Cumulative memory growth since session start
+    public var cumulativeGrowth: Int64 {
+        guard let last = snapshots.last else { return 0 }
+        return last.memoryAfter - baselineMemory
+    }
+
+    /// Average memory delta per inference
+    public var averageDelta: Int64 {
+        guard !snapshots.isEmpty else { return 0 }
+        let totalDelta = snapshots.reduce(0) { $0 + $1.delta }
+        return totalDelta / Int64(snapshots.count)
+    }
+
+    /// Initialize with current GPU memory as baseline
+    public func setBaseline(_ memory: Int64) {
+        baselineMemory = memory
+        sessionStartTime = Date()
+        snapshots.removeAll()
+        logger.info("📊 [MemoryDiagnostics] Baseline set: \(ByteCountFormatter.string(fromByteCount: memory, countStyle: .memory))")
+    }
+
+    /// Record a completed inference
+    public func recordInference(_ snapshot: InferenceSnapshot) {
+        snapshots.append(snapshot)
+        if snapshots.count > 200 {
+            snapshots.removeFirst(snapshots.count - 200)
+        }
+
+        // Log the snapshot
+        logger.debug("📊 [MemoryDiagnostics] Inference #\(self.snapshots.count): \(snapshot.deltaFormatted) (before: \(ByteCountFormatter.string(fromByteCount: snapshot.memoryBefore, countStyle: .memory)), after: \(ByteCountFormatter.string(fromByteCount: snapshot.memoryAfter, countStyle: .memory)))")
+
+        // Check for warnings
+        if snapshot.delta > Self.singleInferenceWarningThreshold {
+            logger.warning("⚠️ [MemoryDiagnostics] HIGH GROWTH: Single inference grew \(snapshot.deltaFormatted)")
+        }
+
+        if cumulativeGrowth > Self.cumulativeWarningThreshold {
+            logger.warning("⚠️ [MemoryDiagnostics] CUMULATIVE WARNING: Total growth \(ByteCountFormatter.string(fromByteCount: self.cumulativeGrowth, countStyle: .memory)) exceeds threshold")
+        }
+
+        // Leak detection: check if last 3 inferences all show positive growth
+        if snapshots.count >= 3 {
+            let lastThree = snapshots.suffix(3)
+            let allPositive = lastThree.allSatisfy { $0.delta > Self.leakDetectionThreshold }
+            if allPositive {
+                let avgGrowth = lastThree.reduce(0) { $0 + $1.delta } / 3
+                logger.error("🚨 [MemoryDiagnostics] POTENTIAL LEAK DETECTED: Last 3 inferences all grew >\(Self.leakDetectionThreshold / 1024 / 1024)MB (avg: \(ByteCountFormatter.string(fromByteCount: avgGrowth, countStyle: .memory)))")
+            }
+        }
+    }
+
+    /// Get summary for diagnostics
+    public func getSummary() -> String {
+        let duration = Date().timeIntervalSince(sessionStartTime)
+        return """
+        === Memory Diagnostics Summary ===
+        Session duration: \(String(format: "%.1f", duration))s
+        Inference count: \(inferenceCount)
+        Baseline memory: \(ByteCountFormatter.string(fromByteCount: baselineMemory, countStyle: .memory))
+        Cumulative growth: \(ByteCountFormatter.string(fromByteCount: cumulativeGrowth, countStyle: .memory))
+        Average delta/inference: \(ByteCountFormatter.string(fromByteCount: averageDelta, countStyle: .memory))
+        ================================
+        """
+    }
+
+    /// Reset diagnostics for new session
+    public func reset() {
+        snapshots.removeAll()
+        baselineMemory = 0
+        sessionStartTime = Date()
+        logger.info("🔄 [MemoryDiagnostics] Reset complete")
+    }
+
+    /// Get recent snapshots for debugging
+    public func getRecentSnapshots(count: Int = 5) -> [InferenceSnapshot] {
+        Array(snapshots.suffix(count))
+    }
+}
+
+// MARK: - Inference Request Queue Actor
+
+/// Actor that serializes inference requests to prevent KV cache corruption from concurrent access.
+/// Requests are queued and processed sequentially, with support for queue depth limits.
+private actor InferenceRequestQueue {
+    /// Represents a queued inference request
+    private struct QueuedRequest {
+        let id: UUID
+        let work: @Sendable () async throws -> Void
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    /// The queue of pending requests
+    private var pendingRequests: [QueuedRequest] = []
+
+    /// Whether a request is currently being processed
+    private var isProcessing: Bool = false
+
+    /// Maximum queue depth (0 = unlimited)
+    private var maxDepth: Int = 10
+
+    private let logger = Logger(subsystem: "com.serenanet.ai", category: "InferenceQueue")
+
+    /// Configure the maximum queue depth
+    func setMaxDepth(_ depth: Int) {
+        maxDepth = depth
+    }
+
+    /// Get current queue depth
+    var queueDepth: Int {
+        pendingRequests.count
+    }
+
+    /// Check if queue is full
+    var isFull: Bool {
+        maxDepth > 0 && pendingRequests.count >= maxDepth
+    }
+
+    /// Enqueue a request and wait for it to complete
+    /// - Parameters:
+    ///   - id: Unique identifier for logging
+    ///   - work: The async work to perform
+    /// - Throws: SerenaError.aiProcessingError if queue is full
+    func enqueue(id: UUID = UUID(), work: @escaping @Sendable () async throws -> Void) async throws {
+        // Check queue depth limit
+        if isFull {
+            logger.warning("⚠️ InferenceQueue: Queue full (\(self.maxDepth) requests), rejecting new request")
+            throw SerenaError.aiProcessingError("Request queue full - please wait for pending requests to complete")
+        }
+
+        logger.debug("📥 InferenceQueue: Enqueueing request \(id.uuidString.prefix(8)) (queue depth: \(self.pendingRequests.count + 1))")
+
+        // Use a continuation to wait for completion
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let request = QueuedRequest(id: id, work: work, continuation: continuation)
+            pendingRequests.append(request)
+
+            // Start processing if not already running
+            if !isProcessing {
+                Task {
+                    await processQueue()
+                }
+            }
+        }
+    }
+
+    /// Process queued requests sequentially
+    private func processQueue() async {
+        guard !isProcessing else { return }
+        isProcessing = true
+
+        while !pendingRequests.isEmpty {
+            let request = pendingRequests.removeFirst()
+            logger.debug("🔄 InferenceQueue: Processing request \(request.id.uuidString.prefix(8)) (remaining: \(self.pendingRequests.count))")
+
+            do {
+                try await request.work()
+                request.continuation.resume()
+                logger.debug("✅ InferenceQueue: Request \(request.id.uuidString.prefix(8)) completed successfully")
+            } catch {
+                request.continuation.resume(throwing: error)
+                logger.error("❌ InferenceQueue: Request \(request.id.uuidString.prefix(8)) failed: \(error.localizedDescription)")
+            }
+        }
+
+        isProcessing = false
+        logger.debug("📭 InferenceQueue: Queue empty, stopping processor")
+    }
+
+    /// Cancel all pending requests (for cleanup)
+    func cancelAll() {
+        logger.info("🛑 InferenceQueue: Cancelling \(self.pendingRequests.count) pending requests")
+        for request in pendingRequests {
+            request.continuation.resume(throwing: CancellationError())
+        }
+        pendingRequests.removeAll()
+    }
+}

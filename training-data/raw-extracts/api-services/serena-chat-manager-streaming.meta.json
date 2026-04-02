@@ -1,0 +1,14 @@
+{
+  "name": "serena-chat-manager-streaming",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/ChatManager.swift",
+  "line_count": 3587,
+  "why": "Streaming response generation, concurrent fact extraction, tool call parsing",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

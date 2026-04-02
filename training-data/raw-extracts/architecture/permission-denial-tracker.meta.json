@@ -1,0 +1,12 @@
+{
+  "name": "permission-denial-tracker",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/permissions/denial_tracker.rs",
+  "line_count": 234,
+  "why": "Rate limiting, denial tracking, policy enforcement",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

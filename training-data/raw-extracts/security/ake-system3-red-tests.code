@@ -1,0 +1,308 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: AKE System 3 (Style Adaptation) — model types, training config,
+/// LoRA adapter metadata, training status, scheduler status, error types.
+///
+/// Note: Actual LoRA training requires MLX/Python and is not tested here.
+/// These tests verify data models, configuration, and testable state logic.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/ConversationDatasetBuilder.swift
+/// - Sources/SerenaCore/Services/LoRATrainer.swift
+/// - Sources/SerenaCore/Services/LoRALoader.swift
+/// - Sources/SerenaCore/Services/StyleTrainingScheduler.swift
+/// - Sources/SerenaCore/Models/KnowledgeModels.swift
+final class AKESystem3RedTests: XCTestCase {
+
+    // MARK: - Group 1: TrainingExample Model
+
+    /// TrainingExample should store text and optional context
+    func test_trainingExample_creation() {
+        let example = TrainingExample(text: "Hello, how are you?", context: "greeting")
+        XCTAssertEqual(example.text, "Hello, how are you?")
+        XCTAssertEqual(example.context, "greeting")
+    }
+
+    /// TrainingExample context defaults to nil
+    func test_trainingExample_contextDefaultsNil() {
+        let example = TrainingExample(text: "Test message")
+        XCTAssertNil(example.context)
+    }
+
+    /// TrainingExample should be Codable
+    func test_trainingExample_codable() throws {
+        let example = TrainingExample(text: "Test", context: "ctx", timestamp: Date())
+        let data = try JSONEncoder().encode(example)
+        let decoded = try JSONDecoder().decode(TrainingExample.self, from: data)
+        XCTAssertEqual(decoded.text, "Test")
+        XCTAssertEqual(decoded.context, "ctx")
+    }
+
+    // MARK: - Group 2: LoRAConfig Model
+
+    /// LoRAConfig should store all hyperparameters
+    func test_loraConfig_creation() {
+        let config = LoRAConfig(
+            rank: 8,
+            alpha: 16,
+            targetModules: ["q_proj", "v_proj"],
+            epochs: 3,
+            batchSize: 4,
+            learningRate: 1e-4
+        )
+
+        XCTAssertEqual(config.rank, 8)
+        XCTAssertEqual(config.alpha, 16)
+        XCTAssertEqual(config.targetModules.count, 2)
+        XCTAssertEqual(config.epochs, 3)
+        XCTAssertEqual(config.batchSize, 4)
+        XCTAssertEqual(config.learningRate, 1e-4, accuracy: 1e-10)
+    }
+
+    /// LoRAConfig default should have sensible values
+    func test_loraConfig_default() {
+        let config = LoRAConfig.default
+        XCTAssertGreaterThan(config.rank, 0)
+        XCTAssertGreaterThan(config.alpha, 0)
+        XCTAssertFalse(config.targetModules.isEmpty)
+        XCTAssertGreaterThan(config.epochs, 0)
+        XCTAssertGreaterThan(config.batchSize, 0)
+        XCTAssertGreaterThan(config.learningRate, 0)
+    }
+
+    /// LoRAConfig should be Codable
+    func test_loraConfig_codable() throws {
+        let config = LoRAConfig.default
+        let data = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(LoRAConfig.self, from: data)
+        XCTAssertEqual(decoded.rank, config.rank)
+        XCTAssertEqual(decoded.alpha, config.alpha)
+    }
+
+    // MARK: - Group 3: LoRAAdapter Model
+
+    /// LoRAAdapter should store version, path, and stats
+    func test_loraAdapter_creation() {
+        let stats = TrainingStats(
+            messagesUsed: 5000,
+            trainingTime: 3600,
+            finalLoss: 0.5,
+            validationAccuracy: 0.85
+        )
+
+        let adapter = LoRAAdapter(
+            version: 1,
+            filePath: URL(fileURLWithPath: "/tmp/adapter.safetensors"),
+            trainingStats: stats
+        )
+
+        XCTAssertEqual(adapter.version, 1)
+        XCTAssertEqual(adapter.trainingStats.finalLoss, 0.5)
+        XCTAssertEqual(adapter.trainingStats.messagesUsed, 5000)
+    }
+
+    /// LoRAAdapter should be Codable
+    func test_loraAdapter_codable() throws {
+        let stats = TrainingStats(
+            messagesUsed: 10000,
+            trainingTime: 7200,
+            finalLoss: 0.3,
+            validationAccuracy: 0.9
+        )
+
+        let adapter = LoRAAdapter(
+            version: 2,
+            filePath: URL(fileURLWithPath: "/tmp/v2.safetensors"),
+            trainingStats: stats
+        )
+
+        let data = try JSONEncoder().encode(adapter)
+        let decoded = try JSONDecoder().decode(LoRAAdapter.self, from: data)
+
+        XCTAssertEqual(decoded.version, 2)
+        let decodedLoss = decoded.trainingStats.finalLoss
+        XCTAssertEqual(decodedLoss, 0.3, accuracy: 0.001)
+        XCTAssertEqual(decoded.trainingStats.messagesUsed, 10000)
+    }
+
+    // MARK: - Group 4: TrainingStatus Enum
+
+    /// TrainingStatus should have all expected cases
+    func test_trainingStatus_cases() {
+        let statuses: [TrainingStatus] = [
+            .needMoreData(have: 100, need: 3000),
+            .ready,
+            .training(progress: 0.5),
+            .complete(adapter: LoRAAdapter(
+                version: 1,
+                filePath: URL(fileURLWithPath: "/tmp/test"),
+                trainingStats: TrainingStats(messagesUsed: 1, trainingTime: 1, finalLoss: 0.1, validationAccuracy: 0.9)
+            )),
+            .failed(error: "test error")
+        ]
+
+        XCTAssertEqual(statuses.count, 5)
+    }
+
+    /// TrainingStatus should be Codable
+    func test_trainingStatus_codable() throws {
+        let statuses: [TrainingStatus] = [
+            .needMoreData(have: 50, need: 3000),
+            .ready,
+            .training(progress: 0.75),
+            .failed(error: "MLX not found")
+        ]
+
+        for status in statuses {
+            let data = try JSONEncoder().encode(status)
+            let _ = try JSONDecoder().decode(TrainingStatus.self, from: data)
+            // Just verify no crash on roundtrip
+        }
+    }
+
+    // MARK: - Group 5: TrainingError Enum
+
+    /// TrainingError should have all expected cases
+    func test_trainingError_allCases() {
+        let errors: [TrainingError] = [
+            .insufficientData(have: 100, need: 3000),
+            .trainingFailed(reason: "GPU OOM"),
+            .adapterNotFound(version: 1),
+            .invalidDataset,
+            .pythonBridgeError("import failed"),
+            .fileSystemError("permission denied")
+        ]
+
+        XCTAssertEqual(errors.count, 6)
+    }
+
+    /// TrainingError should conform to Error protocol
+    func test_trainingError_conformsToError() {
+        let error: Error = TrainingError.insufficientData(have: 10, need: 3000)
+        XCTAssertFalse(error.localizedDescription.isEmpty)
+    }
+
+    // MARK: - Group 6: StyleAdaptationConfig
+
+    /// Config should have training window (2 AM Sunday)
+    func test_styleAdaptationConfig_trainingWindow() {
+        XCTAssertEqual(StyleAdaptationConfig.trainingDayOfWeek, 1, "Sunday = 1")
+        XCTAssertEqual(StyleAdaptationConfig.trainingStartHour, 2, "2 AM")
+    }
+
+    /// Config should limit adapter versions
+    func test_styleAdaptationConfig_maxVersions() {
+        XCTAssertEqual(StyleAdaptationConfig.maxAdapterVersions, 3)
+    }
+
+    /// Config minimumMessages should be positive
+    func test_styleAdaptationConfig_minimumMessages() {
+        XCTAssertGreaterThan(StyleAdaptationConfig.minimumMessages, 0)
+    }
+
+    // MARK: - Group 7: LoRATrainer State
+
+    /// LoRATrainer should start in ready state
+    func test_loraTrainer_initialState() async {
+        let trainer = LoRATrainer()
+        let status = await trainer.getTrainingStatus()
+
+        switch status {
+        case .ready:
+            break // Expected
+        default:
+            XCTFail("Trainer should start in .ready state, got: \(status)")
+        }
+    }
+
+    /// LoRATrainer progress should start at 0
+    func test_loraTrainer_initialProgress() async {
+        let trainer = LoRATrainer()
+        let progress = await trainer.trainingProgress
+        XCTAssertEqual(progress, 0)
+    }
+
+    /// LoRATrainer should not be training initially
+    func test_loraTrainer_notTrainingInitially() async {
+        let trainer = LoRATrainer()
+        let training = await trainer.isTraining
+        XCTAssertFalse(training)
+    }
+
+    // MARK: - Group 8: LoRALoader Singleton
+
+    /// LoRALoader.shared should exist
+    func test_loraLoader_singletonExists() async {
+        let loader = LoRALoader.shared
+        let adapter = await loader.getActiveAdapter()
+        XCTAssertNil(adapter, "No adapter should be active initially")
+    }
+
+    // MARK: - Group 9: StyleTrainingScheduler
+
+    /// Scheduler should start as not scheduled (DISABLED)
+    func test_scheduler_startsNotScheduled() async {
+        let scheduler = StyleTrainingScheduler.shared
+        let status = await scheduler.getStatus()
+        XCTAssertFalse(status.isRunning, "Scheduler is disabled, should not be running")
+    }
+
+    /// Scheduler status should have a nextWindowStart in the future
+    func test_scheduler_nextWindowInFuture() async {
+        let scheduler = StyleTrainingScheduler.shared
+        let status = await scheduler.getStatus()
+        XCTAssertGreaterThan(status.nextWindowStart, Date().addingTimeInterval(-86400),
+                            "Next training window should be reasonable")
+    }
+
+    /// Scheduler start should return early (disabled)
+    func test_scheduler_startReturnsEarly() async {
+        let scheduler = StyleTrainingScheduler.shared
+        await scheduler.start()
+        // Should return immediately due to DISABLED guard
+        let status = await scheduler.getStatus()
+        XCTAssertFalse(status.isRunning, "Scheduler should remain not running when DISABLED")
+    }
+
+    // MARK: - Group 10: SchedulerStatus Model
+
+    /// SchedulerStatus should store all fields
+    func test_schedulerStatus_creation() {
+        let status = SchedulerStatus(
+            isRunning: true,
+            lastCheck: Date(),
+            nextWindowStart: Date().addingTimeInterval(3600),
+            isInWindow: false
+        )
+
+        XCTAssertTrue(status.isRunning)
+        XCTAssertNotNil(status.lastCheck)
+        XCTAssertFalse(status.isInWindow)
+    }
+
+    // MARK: - Group 11: TrainingDataset Model
+
+    /// TrainingDataset should be Codable
+    func test_trainingDataset_codable() throws {
+        let examples = [
+            TrainingExample(text: "Hello world"),
+            TrainingExample(text: "How are you today")
+        ]
+
+        let metadata = DatasetMetadata(
+            totalMessages: 2,
+            dateRangeStart: Date().addingTimeInterval(-86400),
+            dateRangeEnd: Date(),
+            avgMessageLength: 15,
+            vocabularySize: 100
+        )
+
+        let dataset = TrainingDataset(messages: examples, metadata: metadata)
+        let data = try JSONEncoder().encode(dataset)
+        let decoded = try JSONDecoder().decode(TrainingDataset.self, from: data)
+
+        XCTAssertEqual(decoded.messages.count, 2)
+        XCTAssertEqual(decoded.metadata.totalMessages, 2)
+    }
+}

@@ -1,0 +1,454 @@
+import XCTest
+@testable import SerenaCore
+
+final class ScreenAgentRedTests: XCTestCase {
+
+    // MARK: - Task 1: ScreenAction Model Tests
+
+    func test_screenAction_clickHasCorrectType() {
+        let action = ScreenAction.click(target: .label("Submit"))
+        XCTAssertEqual(action.type, .click)
+    }
+
+    func test_screenAction_typeHasText() {
+        let action = ScreenAction.typeText("hello", target: .label("Name"))
+        XCTAssertEqual(action.type, .typeText)
+        XCTAssertEqual(action.text, "hello")
+    }
+
+    func test_screenAction_scrollHasDirection() {
+        let action = ScreenAction.scroll(direction: .down, amount: 3)
+        XCTAssertEqual(action.type, .scroll)
+    }
+
+    func test_screenAction_keyboardShortcut() {
+        let action = ScreenAction.keyboardShortcut(key: .c, modifiers: [.command])
+        XCTAssertEqual(action.type, .keyboardShortcut)
+    }
+
+    func test_actionTarget_labelNormalization() {
+        let target = ActionTarget.label("  Submit Button  ")
+        XCTAssertEqual(target.normalizedLabel, "submit button")
+    }
+
+    func test_screenResult_successDescription() {
+        let result = ScreenResult(success: true, action: .click(target: .label("OK")), description: "Clicked OK button", screenshotAfter: nil)
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.description, "Clicked OK button")
+    }
+
+    func test_screenResult_failureDescription() {
+        let result = ScreenResult(success: false, action: .click(target: .label("OK")), description: "Element not found", screenshotAfter: nil)
+        XCTAssertFalse(result.success)
+    }
+
+    func test_safetyDecision_confirmHasReason() {
+        let decision = SafetyDecision.confirm(reason: "Clicking in Safari")
+        if case .confirm(let reason) = decision {
+            XCTAssertEqual(reason, "Clicking in Safari")
+        } else {
+            XCTFail("Expected confirm decision")
+        }
+    }
+
+    func test_safetyDecision_denyHasReason() {
+        let decision = SafetyDecision.deny(reason: "Password field detected")
+        if case .deny(let reason) = decision {
+            XCTAssertEqual(reason, "Password field detected")
+        } else {
+            XCTFail("Expected deny decision")
+        }
+    }
+
+    func test_screenStep_planDescription() {
+        let step = ScreenStep(index: 0, action: .click(target: .label("Submit")), description: "Click the Submit button")
+        XCTAssertEqual(step.index, 0)
+        XCTAssertEqual(step.description, "Click the Submit button")
+    }
+
+    // MARK: - Task 2: ScreenCapture Tests
+
+    func test_screenCapture_exists() {
+        let capture = ScreenCapture()
+        XCTAssertNotNil(capture)
+    }
+
+    func test_screenCapture_hasPermissionCheck() async {
+        let capture = ScreenCapture()
+        let _ = await capture.hasPermission()
+    }
+
+    func test_screenCapture_configScaleDefault() {
+        let config = ScreenAgentConfig()
+        XCTAssertEqual(config.captureScale, 1.0)
+    }
+
+    // MARK: - Task 3: ScreenVision Tests
+
+    func test_textObservation_hasRequiredFields() {
+        let obs = TextObservation(text: "Submit", boundingBox: CGRect(x: 100, y: 200, width: 80, height: 30), confidence: 0.95)
+        XCTAssertEqual(obs.text, "Submit")
+        XCTAssertEqual(obs.confidence, 0.95)
+        XCTAssertEqual(obs.boundingBox.origin.x, 100)
+    }
+
+    func test_textObservation_centerPoint() {
+        let obs = TextObservation(text: "OK", boundingBox: CGRect(x: 100, y: 200, width: 80, height: 30), confidence: 0.9)
+        XCTAssertEqual(obs.center.x, 140) // 100 + 80/2
+        XCTAssertEqual(obs.center.y, 215) // 200 + 30/2
+    }
+
+    func test_screenVision_exists() async {
+        let vision = ScreenVision()
+        XCTAssertNotNil(vision)
+    }
+
+    func test_changeRegion_hasDescription() {
+        let region = ChangeRegion(rect: CGRect(x: 0, y: 0, width: 100, height: 100), description: "Button text changed")
+        XCTAssertEqual(region.description, "Button text changed")
+    }
+
+    func test_screenLayout_emptyByDefault() {
+        let layout = ScreenLayout(textObservations: [], interactiveRegions: [])
+        XCTAssertTrue(layout.textObservations.isEmpty)
+        XCTAssertTrue(layout.interactiveRegions.isEmpty)
+    }
+
+    // MARK: - Task 4: ScreenSafety Tests
+
+    func test_safety_strictAlwaysConfirms() {
+        let safety = ScreenSafety(level: .strict)
+        let action = ScreenAction.click(target: .label("Submit"))
+        let context = ScreenSafetyContext(appName: "Safari", appBundleID: "com.apple.Safari")
+        let decision = safety.shouldAllow(action: action, context: context)
+        if case .confirm = decision {
+            // expected
+        } else {
+            XCTFail("Strict mode should always confirm, got: \(decision)")
+        }
+    }
+
+    func test_safety_passwordFieldDenied() {
+        let safety = ScreenSafety(level: .strict)
+        let action = ScreenAction.typeText("secret", target: .role("AXSecureTextField", label: "Password"))
+        let context = ScreenSafetyContext(appName: "Safari", appBundleID: "com.apple.Safari")
+        let decision = safety.shouldAllow(action: action, context: context)
+        if case .deny(let reason) = decision {
+            XCTAssertTrue(reason.contains("password") || reason.contains("secure"))
+        } else {
+            XCTFail("Should deny typing into password field, got: \(decision)")
+        }
+    }
+
+    func test_safety_auditLogRecords() {
+        var safety = ScreenSafety(level: .strict)
+        let action = ScreenAction.click(target: .label("OK"))
+        safety.recordAction(action, decision: .allow, success: true)
+        XCTAssertEqual(safety.auditLog.count, 1)
+        XCTAssertTrue(safety.auditLog[0].success)
+    }
+
+    func test_safety_auditLogPrunes() {
+        var safety = ScreenSafety(level: .strict, maxAuditEntries: 3)
+        for i in 0..<5 {
+            let action = ScreenAction.click(target: .label("Button \(i)"))
+            safety.recordAction(action, decision: .allow, success: true)
+        }
+        XCTAssertEqual(safety.auditLog.count, 3)
+    }
+
+    func test_safety_paymentFormDetected() {
+        let safety = ScreenSafety(level: .strict)
+        let screenText = ["Card Number", "CVV", "Expiration Date", "Submit Payment"]
+        XCTAssertTrue(safety.containsSensitiveContent(screenText: screenText))
+    }
+
+    func test_safety_normalFormNotSensitive() {
+        let safety = ScreenSafety(level: .strict)
+        let screenText = ["First Name", "Last Name", "Email", "Submit"]
+        XCTAssertFalse(safety.containsSensitiveContent(screenText: screenText))
+    }
+
+    // MARK: - Task 5: ScreenInteractor Tests
+
+    func test_screenInteractor_exists() async {
+        let interactor = ScreenInteractor()
+        XCTAssertNotNil(interactor)
+    }
+
+    func test_screenInteractor_cgKeyCodeMapping() {
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .c), 8)    // 'c' key
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .v), 9)    // 'v' key
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .enter), 36)
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .tab), 48)
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .escape), 53)
+        XCTAssertEqual(ScreenInteractor.cgKeyCode(for: .space), 49)
+    }
+
+    func test_screenInteractor_modifierFlagMapping() {
+        XCTAssertEqual(ScreenInteractor.cgEventFlags(for: [.command]), CGEventFlags.maskCommand)
+        XCTAssertEqual(ScreenInteractor.cgEventFlags(for: [.shift]), CGEventFlags.maskShift)
+        XCTAssertEqual(
+            ScreenInteractor.cgEventFlags(for: [.command, .shift]),
+            CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue)
+        )
+    }
+
+    // MARK: - Task 6: FieldMapper Tests
+
+    func test_fieldMapper_firstNameMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "First Name"), "first_name")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Given Name"), "first_name")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "FIRST NAME"), "first_name")
+    }
+
+    func test_fieldMapper_lastNameMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Last Name"), "last_name")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Surname"), "last_name")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Family Name"), "last_name")
+    }
+
+    func test_fieldMapper_emailMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Email"), "email")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "E-mail Address"), "email")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Email:"), "email")
+    }
+
+    func test_fieldMapper_phoneMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Phone"), "phone")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Mobile Number"), "phone")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Cell Phone"), "phone")
+    }
+
+    func test_fieldMapper_addressMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Address"), "address")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Street Address"), "address")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "City"), "city")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Zip Code"), "zip_code")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Postal Code"), "zip_code")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "State"), "state")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Country"), "country")
+    }
+
+    func test_fieldMapper_unknownField() {
+        let mapper = FieldMapper()
+        XCTAssertNil(mapper.mapFieldToFact(label: "Favorite Color"))
+        XCTAssertNil(mapper.mapFieldToFact(label: "Comments"))
+    }
+
+    func test_fieldMapper_birthdayMapping() {
+        let mapper = FieldMapper()
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Birthday"), "birthday")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "Date of Birth"), "birthday")
+        XCTAssertEqual(mapper.mapFieldToFact(label: "DOB"), "birthday")
+    }
+
+    // MARK: - Task 7: ScreenAgent Orchestrator Tests
+
+    func test_screenAgent_exists() async {
+        let agent = ScreenAgent()
+        XCTAssertNotNil(agent)
+    }
+
+    func test_screenAgent_statusReportsCapabilities() async {
+        let agent = ScreenAgent()
+        let status = await agent.getStatus()
+        // In test environment, no permissions granted
+        XCTAssertFalse(status.hasScreenCapture)
+        XCTAssertNotNil(status.safetyLevel)
+        XCTAssertEqual(status.safetyLevel, .strict)
+    }
+
+    func test_screenAgent_planReturnsSteps() async {
+        let agent = ScreenAgent()
+        let request = ScreenRequest(intent: "click the submit button", targetApp: nil, actions: [
+            .click(target: .label("Submit"))
+        ])
+        let steps = await agent.plan(request: request)
+        XCTAssertEqual(steps.count, 1)
+        XCTAssertEqual(steps[0].index, 0)
+        XCTAssertTrue(steps[0].description.lowercased().contains("submit"))
+    }
+
+    func test_screenAgent_planMultipleActions() async {
+        let agent = ScreenAgent()
+        let request = ScreenRequest(intent: "fill name and click submit", targetApp: nil, actions: [
+            .typeText("Michael", target: .label("Name")),
+            .click(target: .label("Submit"))
+        ])
+        let steps = await agent.plan(request: request)
+        XCTAssertEqual(steps.count, 2)
+        XCTAssertEqual(steps[0].index, 0)
+        XCTAssertEqual(steps[1].index, 1)
+    }
+
+    func test_screenAgent_configDefaults() async {
+        let agent = ScreenAgent()
+        let config = await agent.getConfig()
+        XCTAssertEqual(config.actionTimeout, 5.0)
+        XCTAssertEqual(config.verifySettleTime, 2.0)
+        XCTAssertEqual(config.sequenceTimeout, 60.0)
+        XCTAssertEqual(config.safetyLevel, .strict)
+        XCTAssertEqual(config.maxRetries, 1)
+    }
+
+    // MARK: - Task 8: Integration Tests
+
+    @MainActor
+    func test_intentDetector_clickOnDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "click on the submit button")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    @MainActor
+    func test_intentDetector_typeIntoDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "type my name into the form")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    @MainActor
+    func test_intentDetector_scrollDownDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "scroll down in safari")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    @MainActor
+    func test_intentDetector_fillOutFormDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "fill out the form")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    // Test polite phrasing: "can you click on the button"
+    @MainActor
+    func test_intentDetector_politeClickDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "can you click on the button")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    // Test polite phrasing: "can you type my name in the textbox"
+    @MainActor
+    func test_intentDetector_politeTypeDetected() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "can you type my name in the textbox")
+        XCTAssertTrue(intent?.description.hasPrefix("screenInteraction") == true)
+    }
+
+    // Test action parsing: click → ScreenAction
+    @MainActor
+    func test_parseScreenActions_click() {
+        let actions = IntentDetector.shared.parseScreenActions(from: "click on the submit button")
+        XCTAssertEqual(actions.count, 1)
+        if case .click(let target) = actions.first {
+            XCTAssertNotNil(target.normalizedLabel)
+        } else {
+            XCTFail("Expected click action")
+        }
+    }
+
+    // Test action parsing: scroll
+    @MainActor
+    func test_parseScreenActions_scroll() {
+        let actions = IntentDetector.shared.parseScreenActions(from: "scroll down")
+        XCTAssertEqual(actions.count, 1)
+        if case .scroll(let dir, _) = actions.first {
+            XCTAssertEqual(dir, .down)
+        } else {
+            XCTFail("Expected scroll action")
+        }
+    }
+
+    @MainActor
+    func test_intentDetector_screenContextStillWorks() {
+        let detector = IntentDetector.shared
+        let intent = detector.detectIntent(from: "what's on my screen")
+        XCTAssertEqual(intent?.description, "screenContext")
+    }
+
+    // MARK: - Security Red Tests
+
+    // Category 1: Input injection — ActionTarget label normalization prevents case manipulation
+    func test_security_actionTarget_nullByteStripped() {
+        let target = ActionTarget.label("Submit\0malicious")
+        // normalizedLabel lowercases and trims but null bytes survive — verify they don't affect matching
+        XCTAssertNotNil(target.normalizedLabel)
+        // The label should not silently truncate at null byte
+        XCTAssertTrue(target.normalizedLabel!.contains("malicious"))
+    }
+
+    // Category 3: Sensitive data — ScreenSafety must deny password fields
+    func test_security_safety_secureTextFieldAlwaysDenied() {
+        let safety = ScreenSafety(level: .autonomous) // Even in autonomous mode
+        let action = ScreenAction.typeText("hunter2", target: .role("AXSecureTextField", label: "Password"))
+        let context = ScreenSafetyContext(appName: "Safari", appBundleID: "com.apple.Safari")
+        let decision = safety.shouldAllow(action: action, context: context)
+        if case .deny = decision {
+            // expected — password fields are ALWAYS denied regardless of safety level
+        } else {
+            XCTFail("Password fields must be denied even in autonomous mode")
+        }
+    }
+
+    // Category 3: Sensitive data — payment detection catches variants
+    func test_security_safety_creditCardDetected() {
+        let safety = ScreenSafety(level: .strict)
+        XCTAssertTrue(safety.containsSensitiveContent(screenText: ["Credit Card"]))
+        XCTAssertTrue(safety.containsSensitiveContent(screenText: ["SSN"]))
+        XCTAssertTrue(safety.containsSensitiveContent(screenText: ["Routing Number"]))
+        XCTAssertTrue(safety.containsSensitiveContent(screenText: ["Social Security"]))
+    }
+
+    // Category 5: System command safety — verify confirm required even for seemingly harmless actions
+    func test_security_safety_strictConfirmsAllActions() {
+        let safety = ScreenSafety(level: .strict)
+        let context = ScreenSafetyContext(appName: "Terminal", appBundleID: "com.apple.Terminal")
+
+        // Every action type should require confirmation in strict mode
+        let actions: [ScreenAction] = [
+            .click(target: .label("OK")),
+            .typeText("hello", target: .label("Input")),
+            .scroll(direction: .down, amount: 1),
+            .keyboardShortcut(key: .c, modifiers: [.command]),
+            .drag(from: .zero, to: CGPoint(x: 100, y: 100)),
+            .selectMenuItem(path: ["File", "Quit"]),
+        ]
+
+        for action in actions {
+            let decision = safety.shouldAllow(action: action, context: context)
+            if case .confirm = decision {
+                // expected
+            } else {
+                XCTFail("Strict mode must confirm all actions, failed for: \(action.type)")
+            }
+        }
+    }
+
+    // Category 1: FieldMapper shouldn't match injection payloads
+    func test_security_fieldMapper_injectionPayloadsReturnNil() {
+        let mapper = FieldMapper()
+        XCTAssertNil(mapper.mapFieldToFact(label: "'; DROP TABLE users; --"))
+        XCTAssertNil(mapper.mapFieldToFact(label: "<script>alert('xss')</script>"))
+        XCTAssertNil(mapper.mapFieldToFact(label: "../../../etc/passwd"))
+    }
+
+    // Category 5: ScreenAgent denies actions without confirmation handler in strict mode
+    func test_security_screenAgent_deniesWithoutConfirmationHandler() async {
+        let agent = ScreenAgent()
+        let request = ScreenRequest(intent: "click button", targetApp: nil, actions: [
+            .click(target: .label("Delete Everything"))
+        ])
+        let result = await agent.execute(request: request)
+        // Without a confirmation handler, strict mode should deny
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.description.contains("confirmation") || result.description.contains("denied") || result.description.lowercased().contains("no confirmation"))
+    }
+}

@@ -1,0 +1,146 @@
+import XCTest
+import CryptoKit
+@testable import SerenaCore
+
+/// Integration tests verifying security boundaries across the full pipeline.
+/// Ensures malicious inputs are blocked at the appropriate layer.
+@MainActor
+final class SecurityIntegrationTests: XCTestCase {
+
+    // MARK: - Feature Flag Snapshot
+
+    private var savedBiometricAuthEnabled = true
+
+    override func setUp() async throws {
+        savedBiometricAuthEnabled = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = false
+    }
+
+    override func tearDown() async throws {
+        FeatureFlags.biometricAuthEnabled = savedBiometricAuthEnabled
+    }
+
+    // MARK: - Group 8: Security Boundaries E2E
+
+    func test_fileSchemeURL_blockedThroughPipeline() async throws {
+        let maliciousURL = "file:///etc/passwd"
+        let result = try await RealToolExecutor.shared.execute("task: browser.open_url\nurl: \(maliciousURL)")
+
+        // Should be blocked — either by handler URL validation or by returning an error
+        if result.success {
+            // If it claims success, the output should NOT contain file contents
+            XCTAssertFalse(result.output.contains("root:"),
+                          "file:// URL should never return actual file contents")
+        } else {
+            // Expected: blocked with error
+            XCTAssertNotNil(result.error, "Blocked file:// URL should have an error message")
+        }
+    }
+
+    func test_javascriptScheme_blockedThroughPipeline() async throws {
+        let xssURL = "javascript:alert('xss')"
+        let result = try await RealToolExecutor.shared.execute("task: browser.open_url\nurl: \(xssURL)")
+
+        XCTAssertFalse(result.success, "javascript: scheme should be blocked")
+        if let error = result.error {
+            XCTAssertFalse(error.isEmpty, "Should provide error message for blocked javascript: URL")
+        }
+    }
+
+    func test_vaToolWithBiometricEnabled_blocked() async throws {
+        FeatureFlags.biometricAuthEnabled = true
+
+        let handler = VAToolHandler()
+        let result = await handler.execute(action: "claims", params: [:])
+
+        // With biometric enabled and no session, should be blocked by either:
+        // 1. Biometric gate ("Authentication required to access health data"), or
+        // 2. OAuth check ("Not authenticated with VA")
+        // Both are valid security blocks — the key is that it doesn't succeed
+        XCTAssertFalse(result.success, "VA health data should be blocked when biometric auth is enabled")
+        XCTAssertNotNil(result.error, "Should have an error message indicating auth failure")
+    }
+
+    func test_vaToolWithBiometricDisabled_accessible() async throws {
+        FeatureFlags.biometricAuthEnabled = false
+
+        let handler = VAToolHandler()
+        let result = await handler.execute(action: "status", params: [:])
+
+        // Should NOT be blocked by biometric gate — may fail for other reasons (no OAuth token)
+        if let error = result.error {
+            XCTAssertFalse(error.contains("Authentication required to access health data"),
+                          "Should not hit biometric gate when disabled — got: \(error)")
+        }
+    }
+
+    func test_encryptionManager_encryptDecryptRoundTrip() throws {
+        // Use session key init to avoid Keychain dependency in tests
+        let sessionKey = SymmetricKey(size: .bits256)
+        let encManager = try EncryptionManager(sessionKey: sessionKey)
+
+        let original = "Sensitive health data: blood pressure 120/80"
+        let encrypted = try encManager.encrypt(original)
+        let decrypted = try encManager.decryptString(encrypted)
+
+        XCTAssertEqual(decrypted, original, "Decrypt should reproduce original plaintext")
+        XCTAssertNotEqual(encrypted, original.data(using: .utf8),
+                         "Encrypted data should differ from plaintext")
+    }
+
+    func test_maliciousFTAITask_noCodeExecution() async throws {
+        // Attempt to inject shell commands via FTAI task string
+        let maliciousTask = "task: app.launch\napp: safari; rm -rf /\n"
+
+        let result = try await RealToolExecutor.shared.execute(maliciousTask)
+
+        // The app name should be treated as a literal string, not executed as shell
+        // This test verifies the parameter is passed safely through the pipeline
+        if result.success {
+            // If it "succeeds", it tried to launch an app named "safari; rm -rf /"
+            // which won't exist — that's fine, the key is no actual shell execution
+            XCTAssertTrue(true, "Malicious string treated as literal app name")
+        } else {
+            // Expected: app not found or similar error, NOT a shell error
+            if let error = result.error {
+                XCTAssertFalse(error.contains("No such file or directory"),
+                              "Should not attempt shell execution")
+            }
+        }
+    }
+
+    func test_toolNameInjection_blockedByRegistry() async throws {
+        let injectedName = "app; rm -rf /"
+
+        // Registry should reject this
+        let validation = ToolRegistry.validateOrError(injectedName)
+        XCTAssertFalse(validation.valid,
+                      "Injected tool name should fail registry validation")
+
+        // Executor should also reject
+        do {
+            let result = try await RealToolExecutor.shared.execute("task: \(injectedName).launch\n")
+            XCTAssertFalse(result.success, "Injected tool name should not succeed")
+        } catch {
+            // Throwing is acceptable for invalid tool names
+        }
+    }
+
+    func test_mixedCaseFileScheme_stillBlocked() async throws {
+        let mixedCaseURLs = [
+            "FILE:///etc/passwd",
+            "File:///etc/passwd",
+            "fIlE:///etc/shadow"
+        ]
+
+        for url in mixedCaseURLs {
+            let result = try await RealToolExecutor.shared.execute("task: browser.open_url\nurl: \(url)")
+
+            if result.success {
+                XCTAssertFalse(result.output.contains("root:"),
+                              "Mixed case '\(url)' should not return file contents")
+            }
+            // Whether it fails or returns empty success, it should NOT leak file data
+        }
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "search-indexer",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/search/indexer.rs",
+  "line_count": 670,
+  "why": "ChunkType enum, semantic embedding, boundary-based chunking",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,683 @@
+# Source Map — Maps source files to training data categories
+# Used by extract.py to pull code patterns into raw-extracts/
+
+# ============================================================
+# ARCHITECTURE PATTERNS
+# ============================================================
+
+[[architecture]]
+name = "tool-registry-and-trait"
+source = "~/Developer/forge/src/tools/registry.rs"
+lines = 609
+why = "Tool trait with Box<dyn Future>, CancelToken via watch::Sender, ToolProgress enum"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[architecture]]
+name = "context-compaction-three-tier"
+source = "~/Developer/forge/src/conversation/compactor.rs"
+lines = 1007
+why = "microcompact → snip → summarize, deterministic snipping, transcript saving"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[architecture]]
+name = "permission-classifier"
+source = "~/Developer/forge/src/permissions/classifier.rs"
+lines = 603
+why = "Hard-block vs advisory, context-aware verdicts, git subcommand rules"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[architecture]]
+name = "permission-denial-tracker"
+source = "~/Developer/forge/src/permissions/denial_tracker.rs"
+lines = 234
+why = "Rate limiting, denial tracking, policy enforcement"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "permission-grants"
+source = "~/Developer/forge/src/permissions/grants.rs"
+lines = 173
+why = "Grant caching with expiry, scope-based grants"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "permission-hard-blocks"
+source = "~/Developer/forge/src/permissions/patterns.rs"
+lines = 109
+why = "Hard-blocked commands, fork bomb detection"
+distill_as = ["instruction", "negative"]
+
+[[architecture]]
+name = "plugin-manager"
+source = "~/Developer/forge/src/plugins/manager.rs"
+lines = 447
+why = "Plugin lifecycle: load, install, uninstall, path validation"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "plugin-manifest"
+source = "~/Developer/forge/src/plugins/manifest.rs"
+lines = 409
+why = "TOML manifest parsing, name sanitization, path traversal prevention"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "plugin-namespace-isolation"
+source = "~/Developer/forge/src/plugins/catalog.rs"
+lines = 495
+why = "Plugin catalog with namespace isolation pattern"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "plugin-tool-bridge"
+source = "~/Developer/forge/src/plugins/tool_bridge.rs"
+lines = 205
+why = "IPC abstraction, timeout enforcement"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "plugin-hooks"
+source = "~/Developer/forge/src/plugins/hooks.rs"
+lines = 212
+why = "Event dispatch, hook execution with timeout"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "skill-loader"
+source = "~/Developer/forge/src/plugins/skill_loader.rs"
+lines = 206
+why = "Lazy loading from .md with YAML frontmatter"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "rules-engine-evaluator"
+source = "~/Developer/forge/src/rules/evaluator.rs"
+lines = 705
+why = "Scoped rules, context-aware evaluation, RuleAction enum"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[architecture]]
+name = "rules-parser-recursive-descent"
+source = "~/Developer/forge/src/rules/parser.rs"
+lines = 512
+why = "Recursive descent parser, tokenization, expression trees"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "rules-lexer"
+source = "~/Developer/forge/src/rules/lexer.rs"
+lines = 317
+why = "Lexical analysis for custom DSL"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "rules-glob-matcher"
+source = "~/Developer/forge/src/rules/glob_matcher.rs"
+lines = 440
+why = "Glob-to-regex compilation, wildcard support"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "config-precedence-loader"
+source = "~/Developer/forge/src/config/loader.rs"
+lines = 662
+why = "4-level config precedence merging, TOML parsing, directory init"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "conversation-engine"
+source = "~/Developer/forge/src/conversation/engine.rs"
+lines = 337
+why = "ConversationEngine struct, message history, ChatRequest builder"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "system-prompt-builder"
+source = "~/Developer/forge/src/conversation/prompt.rs"
+lines = 755
+why = "Modular system prompt: identity → tools → rules → memory → formatting"
+distill_as = ["instruction", "reasoning"]
+
+[[architecture]]
+name = "evolution-skill-builder"
+source = "~/Developer/forge/src/evolution/skill_builder.rs"
+lines = 884
+why = "Tool sequence pattern mining, significance scoring, skill template generation"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[architecture]]
+name = "evolution-analyzer"
+source = "~/Developer/forge/src/evolution/analyzer.rs"
+lines = 218
+why = "Session outcome classification, success metrics"
+distill_as = ["instruction"]
+
+[[architecture]]
+name = "dream-runner"
+source = "~/Developer/forge/src/dream/runner.rs"
+lines = 842
+why = "Background task execution, fire-and-forget spawn, state recovery"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "dream-scheduler"
+source = "~/Developer/forge/src/dream/scheduler.rs"
+lines = 338
+why = "Cron-like task scheduling"
+distill_as = ["instruction"]
+
+# Serena architecture patterns
+[[architecture]]
+name = "serena-orchestrator"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/SerenaOrchestrator.swift"
+lines = 601
+why = "Multi-path routing: IntentDetector → RTAI → LLM, graceful degradation"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[architecture]]
+name = "serena-jit-permissions"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/RealToolExecutor.swift"
+lines = 396
+why = "JIT permission model — conversational dialogs instead of hard walls"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[architecture]]
+name = "serena-feature-flags"
+source = "~/Developer/Serena/Sources/SerenaCore/Configuration/FeatureFlags.swift"
+lines = 231
+why = "Three-tier feature flags: DEBUG → FOLK_FAMILY → Release"
+distill_as = ["instruction", "reasoning"]
+
+[[architecture]]
+name = "serena-inference-manager"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/InferenceManager.swift"
+lines = 394
+why = "Runtime engine selection based on hardware, protocol-driven backends"
+distill_as = ["instruction", "conversation"]
+
+[[architecture]]
+name = "serena-subscription-gating"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/SubscriptionService.swift"
+lines = 1446
+why = "Sole source of truth for feature access, tier gating"
+distill_as = ["instruction", "reasoning"]
+
+# ============================================================
+# SECURITY PATTERNS
+# ============================================================
+
+# Forge inline security tests
+[[security]]
+name = "conversation-security-tests"
+source = "~/Developer/forge/src/conversation/security_tests.rs"
+lines = 1096
+why = "Prompt injection, output injection, memory escape attacks"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[security]]
+name = "inference-security-tests"
+source = "~/Developer/forge/src/inference/security_tests.rs"
+lines = 812
+why = "Prompt injection, knowledge boundary violations"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[security]]
+name = "session-security-tests"
+source = "~/Developer/forge/src/session/security_tests.rs"
+lines = 885
+why = "Session isolation, injection prevention"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[security]]
+name = "search-security-tests"
+source = "~/Developer/forge/src/search/security_tests.rs"
+lines = 542
+why = "Injection via search queries"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[security]]
+name = "tool-validator"
+source = "~/Developer/forge/src/tools/validator.rs"
+lines = 657
+why = "Dangerous pattern detection, language detection, code validation"
+distill_as = ["instruction", "conversation"]
+
+# Serena red tests — P0 security
+[[security]]
+name = "file-traversal-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/FileTraversalRedTests.swift"
+lines = 202
+why = "../, /etc/passwd, ~/.ssh, keychain blocking"
+distill_as = ["instruction", "conversation", "negative"]
+
+[[security]]
+name = "notes-injection-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/NotesInjectionRedTests.swift"
+lines = 192
+why = "SQL injection, DOM injection"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "browser-injection-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/BrowserInjectionRedTests.swift"
+lines = 107
+why = "XSS, script injection"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "media-injection-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/MediaInjectionRedTests.swift"
+lines = 118
+why = "EXIF injection"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "permission-manager-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/PermissionManagerRedTests.swift"
+lines = 376
+why = "JIT permission state machines"
+distill_as = ["instruction", "conversation"]
+
+[[security]]
+name = "biometric-auth-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/BiometricAuthRedTests.swift"
+lines = 168
+why = "Auth bypass attempts"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "encryption-manager-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/EncryptionManagerRedTests.swift"
+lines = 244
+why = "AES-GCM, nonce uniqueness, key rejection"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "debug-leakage-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/DebugLeakageRedTests.swift"
+lines = 143
+why = "Sensitive data in debug output"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "screen-exposure-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/ScreenExposureRedTests.swift"
+lines = 174
+why = "Screen capture of sensitive content"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "memory-exposure-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/MemoryExposureRedTests.swift"
+lines = 111
+why = "Memory-resident sensitive data"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "rate-limiter-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/MessageRateLimitRedTests.swift"
+lines = 330
+why = "Token bucket, sliding window rate limiting"
+distill_as = ["instruction", "conversation"]
+
+[[security]]
+name = "subscription-bypass-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/SubscriptionBypassRedTests.swift"
+lines = 0
+why = "Subscription bypass attempts"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "thinking-block-stripper-red-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/ThinkingBlockStripperRedTests.swift"
+lines = 0
+why = "LLM thinking block leak prevention"
+distill_as = ["instruction", "negative"]
+
+[[security]]
+name = "serena-encryption-manager"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/EncryptionManager.swift"
+lines = 237
+why = "CryptoKit AES-GCM, data encryption at rest"
+distill_as = ["instruction", "conversation"]
+
+[[security]]
+name = "serena-screen-safety"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/ScreenIntelligence/ScreenSafety.swift"
+lines = 108
+why = "Whitelist/blacklist for sensitive UI elements, audit logging"
+distill_as = ["instruction", "reasoning"]
+
+# ============================================================
+# API & SERVICES
+# ============================================================
+
+[[api-services]]
+name = "api-client-multi-provider"
+source = "~/Developer/forge/src/backend/api_client.rs"
+lines = 1206
+why = "Multi-provider abstraction (Anthropic/OpenAI/Custom), API key masking"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[api-services]]
+name = "http-client"
+source = "~/Developer/forge/src/backend/http_client.rs"
+lines = 445
+why = "Async HTTP streaming, error handling, health checks"
+distill_as = ["instruction"]
+
+[[api-services]]
+name = "backend-types"
+source = "~/Developer/forge/src/backend/types.rs"
+lines = 428
+why = "Rich type system: Token, Message, Role, ToolDefinition, HardwareInfo, ModelBackend trait"
+distill_as = ["instruction", "reasoning"]
+
+[[api-services]]
+name = "backend-manager"
+source = "~/Developer/forge/src/backend/manager.rs"
+lines = 250
+why = "Backend lifecycle, hardware probing, provider selection"
+distill_as = ["instruction"]
+
+[[api-services]]
+name = "streaming-responses"
+source = "~/Developer/forge/src/conversation/streaming.rs"
+lines = 383
+why = "Async streaming response handling, token-by-token parsing"
+distill_as = ["instruction", "conversation"]
+
+[[api-services]]
+name = "format-adapter"
+source = "~/Developer/forge/src/conversation/adapter.rs"
+lines = 664
+why = "Format conversion between LLM provider message formats"
+distill_as = ["instruction"]
+
+[[api-services]]
+name = "conversation-recovery"
+source = "~/Developer/forge/src/conversation/recovery.rs"
+lines = 570
+why = "Transcript recovery, message reconstruction, session state restoration"
+distill_as = ["instruction", "conversation"]
+
+[[api-services]]
+name = "bash-tool-execution"
+source = "~/Developer/forge/src/tools/bash.rs"
+lines = 615
+why = "Shell execution, working dir persistence, timeout, streaming output"
+distill_as = ["instruction", "conversation"]
+
+[[api-services]]
+name = "agent-spawn"
+source = "~/Developer/forge/src/tools/agent_spawn.rs"
+lines = 285
+why = "Subagent spawning with restricted tool sets, message filtering"
+distill_as = ["instruction", "conversation"]
+
+# Serena API patterns
+[[api-services]]
+name = "serena-mcp-client"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/MCP/MCPClient.swift"
+lines = 420
+why = "JSON-RPC client, request/response correlation, timeout handling"
+distill_as = ["instruction", "conversation"]
+
+[[api-services]]
+name = "serena-mcp-manager"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/MCP/MCPClientManager.swift"
+lines = 313
+why = "Connection pool, singleton pattern for MCP servers"
+distill_as = ["instruction"]
+
+[[api-services]]
+name = "serena-stdio-transport"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/MCP/StdioTransport.swift"
+lines = 337
+why = "Stdio-based subprocess communication with JSON-RPC framing"
+distill_as = ["instruction", "conversation"]
+
+[[api-services]]
+name = "serena-oauth"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/VA/VAAuthManager.swift"
+lines = 406
+why = "OAuth token rotation, Keychain credential storage"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[api-services]]
+name = "serena-rest-client"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/VA/VAAPIClient.swift"
+lines = 418
+why = "REST client with auth flow integration"
+distill_as = ["instruction"]
+
+[[api-services]]
+name = "serena-network-monitor"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/NetworkConnectivityManager.swift"
+lines = 300
+why = "Reachability monitoring, offline-first degradation"
+distill_as = ["instruction", "reasoning"]
+
+[[api-services]]
+name = "serena-chat-manager-streaming"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/ChatManager.swift"
+lines = 3587
+why = "Streaming response generation, concurrent fact extraction, tool call parsing"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[api-services]]
+name = "serena-mlx-engine"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/MLXEngine.swift"
+lines = 1206
+why = "Metal GPU inference, model loading, GPU memory management"
+distill_as = ["instruction", "conversation"]
+
+# ============================================================
+# DATA PERSISTENCE
+# ============================================================
+
+[[data-persistence]]
+name = "session-memory-dual-store"
+source = "~/Developer/forge/src/session/memory.rs"
+lines = 834
+why = "SQLite + vector embeddings, semantic search, confidence scoring"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[data-persistence]]
+name = "session-manager"
+source = "~/Developer/forge/src/session/manager.rs"
+lines = 354
+why = "Session lifecycle, transcript management"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "session-budget"
+source = "~/Developer/forge/src/session/budget.rs"
+lines = 348
+why = "Token budget tracking, overage detection"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "search-indexer"
+source = "~/Developer/forge/src/search/indexer.rs"
+lines = 670
+why = "ChunkType enum, semantic embedding, boundary-based chunking"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[data-persistence]]
+name = "search-store"
+source = "~/Developer/forge/src/search/store.rs"
+lines = 372
+why = "Vector store interface, cosine similarity"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "search-watcher"
+source = "~/Developer/forge/src/search/watcher.rs"
+lines = 183
+why = "File system watching with debounce for auto-reindexing"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "evolution-store"
+source = "~/Developer/forge/src/evolution/store.rs"
+lines = 442
+why = "Skill persistence, version management"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "tool-execution-log"
+source = "~/Developer/forge/src/tools/execution_log.rs"
+lines = 468
+why = "Structured execution history logging"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "tool-result-storage"
+source = "~/Developer/forge/src/tools/result_storage.rs"
+lines = 193
+why = "Tool result persistence for replay"
+distill_as = ["instruction"]
+
+[[data-persistence]]
+name = "conversation-facts"
+source = "~/Developer/forge/src/conversation/facts.rs"
+lines = 461
+why = "Fact storage & retrieval for memory system"
+distill_as = ["instruction", "conversation"]
+
+# Serena persistence
+[[data-persistence]]
+name = "serena-user-ftai-manager"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/UserFTAIManager.swift"
+lines = 587
+why = "Dual write paths, key normalization, deduplication, symmetric add/delete"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[data-persistence]]
+name = "serena-fact-extractor"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/PersonalFactExtractor.swift"
+lines = 923
+why = "Pre-LLM regex extraction, correction detection, delete → add flow"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[data-persistence]]
+name = "serena-conversation-memory"
+source = "~/Developer/Serena/Sources/SerenaCore/Services/ConversationMemoryService.swift"
+lines = 742
+why = "Context window management, conversation persistence"
+distill_as = ["instruction", "conversation"]
+
+# ============================================================
+# RUST IDIOMS
+# ============================================================
+
+# These are extracted AS patterns from the Forge codebase, not standalone files
+# The distillation script will pull specific patterns from multiple files
+
+[[rust-idioms]]
+name = "error-handling-anyhow"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: anyhow::Result, .with_context(), error propagation"
+distill_as = ["instruction", "conversation", "negative"]
+extract_strategy = "grep-pattern"
+pattern = "with_context|anyhow::Result|anyhow::bail|anyhow::ensure"
+
+[[rust-idioms]]
+name = "async-patterns-tokio"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: tokio spawn, JoinHandle, select!, timeout, watch channels"
+distill_as = ["instruction", "conversation", "negative"]
+extract_strategy = "grep-pattern"
+pattern = "tokio::spawn|JoinHandle|tokio::select|tokio::time::timeout|watch::channel"
+
+[[rust-idioms]]
+name = "trait-design"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: trait definitions, impl blocks, dyn dispatch, associated types"
+distill_as = ["instruction", "conversation", "reasoning"]
+extract_strategy = "grep-pattern"
+pattern = "^pub trait|impl.*for|Box<dyn|Arc<dyn"
+
+[[rust-idioms]]
+name = "cfg-conditional-compilation"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: #[cfg(target_os)], #[cfg(feature)], cfg_if"
+distill_as = ["instruction"]
+extract_strategy = "grep-pattern"
+pattern = "#\\[cfg\\(|cfg_if!"
+
+[[rust-idioms]]
+name = "builder-patterns"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: Builder structs, method chaining, Default impl"
+distill_as = ["instruction", "conversation"]
+extract_strategy = "grep-pattern"
+pattern = "Builder|fn build|impl Default"
+
+[[rust-idioms]]
+name = "enum-state-machines"
+source = "~/Developer/forge/src/"
+lines = 0
+why = "Pattern extraction: Rich enums used as state machines, match arms"
+distill_as = ["instruction", "conversation", "reasoning"]
+extract_strategy = "grep-pattern"
+pattern = "^pub enum|=> \\{|match self"
+
+# ============================================================
+# TESTING METHODOLOGY
+# ============================================================
+
+[[testing-methodology]]
+name = "forge-integration-tests"
+source = "~/Developer/forge/tests/integration.rs"
+lines = 2712
+why = "Rules + tool integration, destructive command blocking"
+distill_as = ["instruction", "conversation"]
+
+[[testing-methodology]]
+name = "serena-red-test-structure"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/AKEWiringRedTests.swift"
+lines = 605
+why = "Red test methodology: attack vector → assertion → fix → verify"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[testing-methodology]]
+name = "serena-learning-coordinator-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/LearningCoordinatorRedTests.swift"
+lines = 510
+why = "Threshold testing, debounce verification, pattern materialization"
+distill_as = ["instruction", "conversation"]
+
+[[testing-methodology]]
+name = "serena-memory-validation-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/MemoryValidationRedTests.swift"
+lines = 413
+why = "Fact correction, dedup, inline extraction testing"
+distill_as = ["instruction", "conversation"]
+
+[[testing-methodology]]
+name = "serena-two-stage-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/TwoStage/StyleCoordinatorTwoStageTests.swift"
+lines = 444
+why = "Two-stage methodology: negative control + positive validation"
+distill_as = ["instruction", "conversation", "reasoning"]
+
+[[testing-methodology]]
+name = "serena-security-integration"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/Integration/SecurityIntegrationTests.swift"
+lines = 0
+why = "End-to-end security integration testing"
+distill_as = ["instruction", "conversation"]
+
+[[testing-methodology]]
+name = "serena-va-integration-tests"
+source = "~/Developer/Serena/Tests/SerenaCoreTests/RedTests/VAIntegrationRedTests.swift"
+lines = 1479
+why = "Complex multi-component integration, state management testing"
+distill_as = ["instruction", "conversation"]

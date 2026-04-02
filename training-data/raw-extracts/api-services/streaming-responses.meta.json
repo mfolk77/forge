@@ -1,0 +1,13 @@
+{
+  "name": "streaming-responses",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/streaming.rs",
+  "line_count": 383,
+  "why": "Async streaming response handling, token-by-token parsing",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

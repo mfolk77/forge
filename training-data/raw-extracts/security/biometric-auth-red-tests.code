@@ -1,0 +1,168 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red tests for BiometricAuthManager state machine.
+/// Note: Actual LAContext.evaluatePolicy cannot be tested in unit tests (requires hardware).
+/// These tests verify the state management, session timeout logic, and feature flag gating.
+@MainActor
+final class BiometricAuthRedTests: XCTestCase {
+
+    private var manager: BiometricAuthManager!
+
+    override func setUp() async throws {
+        manager = BiometricAuthManager.shared
+        manager.resetForTesting()
+    }
+
+    override func tearDown() async throws {
+        manager.resetForTesting()
+        manager = nil
+    }
+
+    // MARK: - Initial State
+
+    func testInitialState_notAuthenticated() {
+        XCTAssertFalse(manager.isAuthenticated, "Manager should start unauthenticated")
+    }
+
+    func testInitialState_sessionInvalid() {
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid initially")
+    }
+
+    func testInitialState_biometricTypeNone() {
+        // After resetForTesting, biometricType is .none
+        XCTAssertEqual(manager.biometricType, .none, "Biometric type should be .none after reset")
+    }
+
+    // MARK: - Reset
+
+    func testResetForTesting_clearsAllState() {
+        // Simulate some state
+        manager.isAuthenticated = true
+        manager.setLastAuthTimeForTesting(Date())
+
+        // Reset
+        manager.resetForTesting()
+
+        XCTAssertFalse(manager.isAuthenticated)
+        XCTAssertFalse(manager.isSessionValid)
+        XCTAssertEqual(manager.biometricType, .none)
+    }
+
+    // MARK: - Session Validity
+
+    func testSessionValid_whenAuthenticatedAndRecent() {
+        manager.isAuthenticated = true
+        manager.setLastAuthTimeForTesting(Date()) // Just now
+
+        XCTAssertTrue(manager.isSessionValid, "Session should be valid when recently authenticated")
+    }
+
+    func testSessionInvalid_whenNotAuthenticated() {
+        manager.isAuthenticated = false
+        manager.setLastAuthTimeForTesting(Date())
+
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid when not authenticated")
+    }
+
+    func testSessionInvalid_whenNoLastAuthTime() {
+        manager.isAuthenticated = true
+        manager.setLastAuthTimeForTesting(nil)
+
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid without lastAuthTime")
+    }
+
+    func testSessionInvalid_whenExpired() {
+        manager.isAuthenticated = true
+        // Set last auth to 16 minutes ago (timeout is 15 min = 900s)
+        let expired = Date().addingTimeInterval(-960)
+        manager.setLastAuthTimeForTesting(expired)
+
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid after 15-minute timeout")
+    }
+
+    func testSessionValid_justBeforeTimeout() {
+        manager.isAuthenticated = true
+        // Set last auth to 14 minutes ago (just within 15-min window)
+        let recent = Date().addingTimeInterval(-840)
+        manager.setLastAuthTimeForTesting(recent)
+
+        XCTAssertTrue(manager.isSessionValid, "Session should still be valid just before timeout")
+    }
+
+    // MARK: - Invalidate Session
+
+    func testInvalidateSession_clearsAuthState() {
+        manager.isAuthenticated = true
+        manager.setLastAuthTimeForTesting(Date())
+
+        manager.invalidateSession()
+
+        XCTAssertFalse(manager.isAuthenticated, "Authentication should be cleared")
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid after invalidation")
+    }
+
+    // MARK: - authenticateForSensitiveData
+
+    func testAuthenticateForSensitiveData_returnsFalseWhenNotAuthenticated() async {
+        // Feature flag on, not authenticated, no valid session
+        let savedFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = true
+        defer { FeatureFlags.biometricAuthEnabled = savedFlag }
+
+        manager.resetForTesting()
+
+        // When not authenticated and session invalid, isSessionValid returns false
+        // We can't test the full authenticate() path without hardware interaction
+        // so we verify the state check: session is invalid when not authenticated
+        XCTAssertFalse(manager.isSessionValid, "Session should be invalid when not authenticated")
+        XCTAssertFalse(manager.isAuthenticated, "Should not be authenticated after reset")
+    }
+
+    func testAuthenticateForSensitiveData_returnsTrueWhenSessionValid() async {
+        // Set up a valid session
+        manager.isAuthenticated = true
+        manager.setLastAuthTimeForTesting(Date())
+
+        let savedFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = true
+        defer { FeatureFlags.biometricAuthEnabled = savedFlag }
+
+        let result = await manager.authenticateForSensitiveData()
+        XCTAssertTrue(result, "Should return true when session is still valid (no re-auth needed)")
+    }
+
+    func testAuthenticateForSensitiveData_bypassedWhenFlagDisabled() async {
+        let savedFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = false
+        defer { FeatureFlags.biometricAuthEnabled = savedFlag }
+
+        manager.resetForTesting()
+
+        let result = await manager.authenticateForSensitiveData()
+        XCTAssertTrue(result, "Should return true when biometric auth feature flag is disabled")
+    }
+
+    // MARK: - Feature Flag Gating
+
+    func testAuthenticate_bypassedWhenFlagDisabled() async {
+        let savedFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = false
+        defer { FeatureFlags.biometricAuthEnabled = savedFlag }
+
+        manager.resetForTesting()
+
+        let result = await manager.authenticate()
+        XCTAssertTrue(result, "authenticate() should auto-succeed when feature flag is disabled")
+        XCTAssertTrue(manager.isAuthenticated, "Should be marked authenticated when flag is off")
+    }
+
+    // MARK: - Feature Flag Exists
+
+    func testFeatureFlag_exists() {
+        // Verify the flag is accessible and defaults to true
+        let _ = FeatureFlags.biometricAuthEnabled
+        // If this compiles, the flag exists
+        XCTAssertTrue(true)
+    }
+}

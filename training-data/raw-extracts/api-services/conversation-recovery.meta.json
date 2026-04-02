@@ -1,0 +1,13 @@
+{
+  "name": "conversation-recovery",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/recovery.rs",
+  "line_count": 570,
+  "why": "Transcript recovery, message reconstruction, session state restoration",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

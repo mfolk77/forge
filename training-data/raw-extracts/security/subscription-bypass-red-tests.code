@@ -1,0 +1,220 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Subscription bypass, trial abuse, and key exposure.
+/// These tests verify that license keys are obfuscated, trial/count
+/// tracking resists UserDefaults tampering, and tool gating works correctly.
+///
+/// Target: Sources/SerenaCore/Services/SubscriptionService.swift
+///         Sources/SerenaCore/Configuration/FeatureFlags.swift
+@MainActor
+final class SubscriptionBypassRedTests: XCTestCase {
+
+    // MARK: - License Key Obfuscation Tests
+
+    /// Master keys must NOT appear as plaintext string literals in source.
+    /// A `strings` command on the binary would reveal them if they're plain literals.
+    /// The fix is to obfuscate them (e.g. XOR with compile-time constant).
+    func test_subscription_masterKeys_notInPlaintext() {
+        // Read the SubscriptionService source and check for plaintext keys.
+        // In a compiled binary this would use `strings`, but for source-level
+        // verification we check that the keys aren't stored as simple string literals.
+        //
+        // After the fix, SubscriptionService.deobfuscateMasterKeys() will produce
+        // the actual keys at runtime from obfuscated byte arrays.
+        let hasObfuscation = SubscriptionService.usesObfuscatedKeys
+        XCTAssertTrue(hasObfuscation,
+                      "Master keys must be obfuscated (not plaintext string literals)")
+    }
+
+    // MARK: - Trial Tamper Detection Tests
+
+    /// Deleting the trial flag from UserDefaults should NOT allow a second trial.
+    /// The trial-used state must have a secondary verification (e.g. Keychain).
+    func test_subscription_trialFlag_deletion_detected() {
+        let service = SubscriptionService.shared
+
+        // Simulate legitimate trial usage — write to both stores via the Keychain service
+        UserDefaults.standard.set(true, forKey: "SerenaTrialUsed")
+        // The KeychainService is internal, so we write the backup via startFreeTrial's path.
+        // Since we can't call startFreeTrial (it checks status), we write Keychain directly
+        // by making a KeychainService and using its method.
+        let ks = KeychainService()
+        ks.setTrialUsedFlag(true)
+
+        // Now simulate tampering: delete the UserDefaults flag
+        UserDefaults.standard.removeObject(forKey: "SerenaTrialUsed")
+
+        // The service should still detect that trial was used (via Keychain backup)
+        XCTAssertTrue(service.hasUsedTrial,
+                      "Trial-used flag must survive UserDefaults deletion (needs Keychain backup)")
+
+        // Clean up Keychain
+        ks.setTrialUsedFlag(false)
+    }
+
+    /// Resetting the trial flag to false should NOT allow a second trial.
+    func test_subscription_trialFlag_tampering_detected() {
+        let service = SubscriptionService.shared
+
+        // Simulate legitimate trial usage — write to both stores
+        UserDefaults.standard.set(true, forKey: "SerenaTrialUsed")
+        let ks = KeychainService()
+        ks.setTrialUsedFlag(true)
+
+        // Now simulate tampering: set UserDefaults flag to false
+        UserDefaults.standard.set(false, forKey: "SerenaTrialUsed")
+
+        // The service should still detect that trial was used
+        XCTAssertTrue(service.hasUsedTrial,
+                      "Trial-used flag must resist direct tampering (needs Keychain backup)")
+
+        // Clean up Keychain
+        ks.setTrialUsedFlag(false)
+    }
+
+    // MARK: - Daily Count Tamper Detection Tests
+
+    /// Resetting daily count via UserDefaults should NOT bypass the limit.
+    func test_subscription_dailyCount_tampering_detected() {
+        let service = SubscriptionService.shared
+        let ks = KeychainService()
+
+        let todayString = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: Date())
+        }()
+
+        // Write legitimate count to BOTH stores (simulating normal app usage)
+        UserDefaults.standard.set(todayString, forKey: "SerenaDailyToolCallDate")
+        UserDefaults.standard.set(3, forKey: "SerenaDailyToolCallCount")
+        ks.saveDailyCount(3, date: todayString)
+
+        // Verify limit is hit
+        XCTAssertEqual(service.dailyToolCallCount, 3, "Should show 3 calls")
+
+        // Now simulate tampering: reset UserDefaults count to 0
+        UserDefaults.standard.set(0, forKey: "SerenaDailyToolCallCount")
+
+        // The service should still enforce the limit (via Keychain HMAC backup)
+        let countAfterTamper = service.dailyToolCallCount
+        XCTAssertEqual(countAfterTamper, 3,
+                       "Daily count must survive UserDefaults tampering (needs integrity check)")
+    }
+
+    /// Changing the daily date should NOT reset count.
+    func test_subscription_dailyDate_tampering_detected() {
+        let service = SubscriptionService.shared
+        let ks = KeychainService()
+
+        let todayString = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: Date())
+        }()
+
+        // Write legitimate count to BOTH stores
+        UserDefaults.standard.set(todayString, forKey: "SerenaDailyToolCallDate")
+        UserDefaults.standard.set(3, forKey: "SerenaDailyToolCallCount")
+        ks.saveDailyCount(3, date: todayString)
+
+        // Tamper: change UserDefaults date to yesterday
+        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date())!
+        let yesterdayString = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: yesterday)
+        }()
+        UserDefaults.standard.set(yesterdayString, forKey: "SerenaDailyToolCallDate")
+
+        // With HMAC protection, Keychain still has today's count=3.
+        // The service should detect the UserDefaults date was tampered and use Keychain.
+        let countAfterTamper = service.dailyToolCallCount
+        XCTAssertEqual(countAfterTamper, 3,
+                       "Tampering with date must not reset daily count (needs HMAC verification)")
+    }
+
+    // MARK: - Tool Gating Tests
+
+    /// Free user should be blocked after exceeding daily limit.
+    func test_subscription_freeUser_gatedTool_blockedAfterLimit() {
+        let service = SubscriptionService.shared
+
+        // Force free-tier status for this test by setting count to limit
+        let todayString = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: Date())
+        }()
+        UserDefaults.standard.set(todayString, forKey: "SerenaDailyToolCallDate")
+        UserDefaults.standard.set(SubscriptionService.freeToolCallLimit, forKey: "SerenaDailyToolCallCount")
+
+        // canExecuteGatedTool checks isPro first — if Pro, always allowed.
+        // This test verifies the daily count path, which only applies to free users.
+        // If running on a dev machine with debugForcePro=true, the test can't
+        // validate the free path. We verify the count is at limit instead.
+        XCTAssertEqual(service.dailyToolCallCount, SubscriptionService.freeToolCallLimit,
+                       "Daily count should be at limit")
+        XCTAssertEqual(service.remainingFreeToolCalls, 0,
+                       "No remaining free calls after hitting limit")
+    }
+
+    /// Ungated tools should always be allowed regardless of count.
+    func test_subscription_ungatedTool_alwaysAllowed() {
+        let service = SubscriptionService.shared
+
+        // Even with count at limit, ungated tools should work
+        let todayString = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: Date())
+        }()
+        UserDefaults.standard.set(todayString, forKey: "SerenaDailyToolCallDate")
+        UserDefaults.standard.set(100, forKey: "SerenaDailyToolCallCount")
+
+        for tool in SubscriptionService.ungatedTools {
+            let (canExecute, _) = service.canExecuteGatedTool(tool)
+            XCTAssertTrue(canExecute, "Ungated tool '\(tool)' must always be allowed")
+        }
+    }
+
+    /// Gated tools list must include all tools that should be limited
+    func test_subscription_gatedTools_complete() {
+        let expectedGated: Set<String> = ["calendar", "notes", "media", "browser", "app", "briefing"]
+        XCTAssertEqual(SubscriptionService.gatedTools, expectedGated,
+                       "Gated tools set must match expected list")
+    }
+
+    /// Free tool call limit should be 3
+    func test_subscription_freeToolCallLimit_isThree() {
+        XCTAssertEqual(SubscriptionService.freeToolCallLimit, 3,
+                       "Free tier should allow 3 tool calls per day")
+    }
+
+    // MARK: - Debug Flag Tests
+
+    /// debugForcePro must be false in Release builds.
+    /// This verifies the #if DEBUG guard is correctly placed.
+    func test_subscription_debugForcePro_notInRelease() {
+        #if DEBUG
+        // In debug, we just verify the flag exists and can be toggled
+        // The REAL test is that this code doesn't even compile in Release
+        XCTAssertTrue(true, "debugForcePro is expected in DEBUG builds")
+        #else
+        // If we somehow get here in Release, FeatureFlags.debugForcePro shouldn't exist
+        // This test documents the expectation even if it can't run in Release
+        XCTFail("This test validates debugForcePro is DEBUG-only")
+        #endif
+    }
+
+    // MARK: - Teardown
+
+    override func tearDown() {
+        // Clean up any UserDefaults we set during tests
+        // (Don't remove SerenaTrialUsed — that's the real flag)
+        UserDefaults.standard.removeObject(forKey: "SerenaDailyToolCallCount")
+        UserDefaults.standard.removeObject(forKey: "SerenaDailyToolCallDate")
+        super.tearDown()
+    }
+}

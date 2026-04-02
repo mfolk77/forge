@@ -1,0 +1,12 @@
+{
+  "name": "search-watcher",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/search/watcher.rs",
+  "line_count": 183,
+  "why": "File system watching with debounce for auto-reindexing",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

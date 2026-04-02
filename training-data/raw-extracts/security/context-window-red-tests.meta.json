@@ -1,0 +1,1 @@
+{"name": "context-window-red-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/ContextWindowRedTests.swift", "line_count": 175, "why": "Serena red tests: ContextWindowRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

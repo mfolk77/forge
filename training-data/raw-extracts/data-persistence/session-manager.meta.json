@@ -1,0 +1,12 @@
+{
+  "name": "session-manager",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/session/manager.rs",
+  "line_count": 354,
+  "why": "Session lifecycle, transcript management",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

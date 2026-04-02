@@ -1,0 +1,923 @@
+import Foundation
+import os.log
+
+/// Extracts important personal facts from conversations for cross-conversation memory
+/// Prioritizes high-value information like relationships, names, and preferences
+/// Now writes directly to RTAI library (.ftai files) for unified knowledge storage
+public actor PersonalFactExtractor {
+    public static let shared = PersonalFactExtractor()
+
+    private let logger = Logger(subsystem: "com.serenanet.memory", category: "PersonalFactExtractor")
+
+    /// Unified RTAI storage for user facts
+    private let ftaiManager = UserFTAIManager.shared
+
+    /// Track mention counts across conversation for repeat detection
+    /// Key: normalized fact key, Value: mention count
+    private var mentionCounts: [String: Int] = [:]
+
+    /// Minimum mentions required before auto-storing (without explicit "remember")
+    private let repeatMentionThreshold = 5
+
+    private init() {}
+
+    /// Reset mention tracking (call when starting new conversation)
+    public func resetMentionTracking() {
+        mentionCounts = [:]
+        logger.info("🔄 Reset mention tracking for new conversation")
+    }
+
+    // MARK: - Fact Extraction Patterns
+
+    /// High-priority patterns - relationships, family, important people
+    private let relationshipPatterns: [(pattern: String, category: MemoryCategory, priority: Int)] = [
+        // Spouse/Partner
+        (#"(?:my (?:wife|husband|spouse|partner)(?:'s name)? is |(?:wife|husband|spouse|partner) (?:is |named ))(\w+)"#, .personal, 10),
+        (#"(\w+) is my (?:wife|husband|spouse|partner)"#, .personal, 10),
+        (#"(?:married to|engaged to) (\w+)"#, .personal, 10),
+
+        // Children
+        (#"(?:my (?:son|daughter|kid|child)(?:'s name)? is |(?:son|daughter|kid|child) (?:is |named ))(\w+)"#, .personal, 10),
+        (#"(\w+) is my (?:son|daughter|kid|child)"#, .personal, 10),
+        (#"(?:i have (?:a |)(?:son|daughter|kid|child) (?:named |called ))(\w+)"#, .personal, 10),
+        (#"my (?:kids|children) (?:are |)(?:named |called |)(\w+(?:,? \w+)*)"#, .personal, 10),
+
+        // Pets
+        (#"(?:my (?:dog|cat|pet)(?:'s name)? is |(?:dog|cat|pet) (?:is |named ))(\w+)"#, .personal, 9),
+        (#"(\w+) is my (?:dog|cat|pet)"#, .personal, 9),
+        (#"(?:i have (?:a |)(?:dog|cat|pet) (?:named |called ))(\w+)"#, .personal, 9),
+
+        // Parents/Siblings
+        (#"(?:my (?:mom|mother|dad|father|brother|sister)(?:'s name)? is )(\w+)"#, .personal, 8),
+
+        // Friends
+        (#"(?:my (?:best |)friend(?:'s name)? is )(\w+)"#, .personal, 7),
+    ]
+
+    /// Medium-priority patterns - preferences, favorites
+    private let preferencePatterns: [(pattern: String, category: MemoryCategory, priority: Int)] = [
+        // Favorites
+        (#"(?:my favorite (\w+) is )(.+?)(?:\.|$)"#, .preference, 6),
+        (#"(?:i (?:love|really like|prefer) )(.+?)(?:\.|,|$)"#, .preference, 5),
+        (#"(?:i (?:hate|dislike|don't like) )(.+?)(?:\.|,|$)"#, .preference, 5),
+
+        // Food preferences
+        (#"(?:i'm |i am )(?:a )?(vegetarian|vegan|pescatarian)"#, .preference, 6),
+        (#"(?:i'm |i am )allergic to (.+?)(?:\.|,|$)"#, .health, 8),
+
+        // Colors, hobbies
+        (#"(?:my favorite color is )(\w+)"#, .preference, 5),
+        (#"(?:i (?:enjoy|like) )(\w+ing)(?:\.|,|$)"#, .preference, 4),
+    ]
+
+    /// Work/Professional patterns
+    private let workPatterns: [(pattern: String, category: MemoryCategory, priority: Int)] = [
+        (#"(?:i (?:work (?:at|for)|am (?:a |an )?(?:working (?:at|for)|employed (?:at|by))) )(.+?)(?:\.|,|$)"#, .work, 7),
+        (#"(?:i'm |i am )(?:a |an )(\w+(?:\s\w+)?)(?:\.|,| at| for|$)"#, .work, 6),
+        (#"(?:my (?:job|profession|occupation|career) is )(.+?)(?:\.|,|$)"#, .work, 7),
+        (#"(?:i (?:manage|lead|run|own) )(.+?)(?:\.|,|$)"#, .work, 6),
+    ]
+
+    /// Personal info patterns
+    private let personalInfoPatterns: [(pattern: String, category: MemoryCategory, priority: Int)] = [
+        // Name
+        (#"(?:my name is |i'm |i am |call me )(\w+)"#, .personal, 9),
+
+        // Birthday
+        (#"(?:my birthday is |i was born on )(.+?)(?:\.|,|$)"#, .personal, 7),
+        (#"(?:i'm |i am )(\d+)(?: years old|yo)"#, .personal, 6),
+
+        // Location
+        (#"(?:i live in |i'm from |i am from )(.+?)(?:\.|,|$)"#, .personal, 6),
+    ]
+
+    /// Health patterns (high priority for safety)
+    private let healthPatterns: [(pattern: String, category: MemoryCategory, priority: Int)] = [
+        (#"(?:i have |i'm diagnosed with |i suffer from )(.+?)(?:\.|,|$)"#, .health, 8),
+        (#"(?:i take |i'm on )(.+?) (?:medication|medicine|pills)"#, .health, 8),
+    ]
+
+    // MARK: - Main Extraction Method
+
+    /// Extract personal facts from a user message
+    /// - Parameter message: The user's message text
+    /// - Returns: Array of extracted facts with their categories and priorities
+    public func extractFacts(from message: String) async -> [ExtractedFact] {
+        let normalizedMessage = normalizePossessives(message.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
+
+        // CRITICAL: Skip questions - they are asking about facts, not stating them
+        // This prevents "what is my wife's name" from being extracted as "wife's name is What"
+        if isQuestion(normalizedMessage) {
+            logger.debug("⏭️ Skipping question (not a fact statement): '\(message.prefix(50))'")
+            return []
+        }
+
+        var extractedFacts: [ExtractedFact] = []
+
+        // Process all pattern categories
+        let allPatterns = relationshipPatterns + preferencePatterns + workPatterns + personalInfoPatterns + healthPatterns
+
+        for (pattern, category, priority) in allPatterns {
+            if let fact = extractWithPattern(pattern, from: normalizedMessage, originalMessage: message, category: category, priority: priority) {
+                extractedFacts.append(fact)
+            }
+        }
+
+        // Also use simple keyword matching for common statements (normalize input for these too)
+        extractedFacts.append(contentsOf: extractSimpleFacts(from: normalizePossessives(message)))
+
+        // Deduplicate and sort by priority
+        let uniqueFacts = Array(Set(extractedFacts)).sorted { $0.priority > $1.priority }
+
+        if !uniqueFacts.isEmpty {
+            logger.info("📝 Extracted \(uniqueFacts.count) personal fact(s) from message")
+            for fact in uniqueFacts {
+                logger.debug("  - [\(fact.category.rawValue)] \(fact.fact) (priority: \(fact.priority))")
+            }
+        }
+
+        return uniqueFacts
+    }
+
+    /// Extract facts and save them to RTAI library (.ftai files)
+    /// - Parameter message: The user's message text
+    /// - Returns: Array of facts that were actually stored (not just tracked for repeat)
+    ///
+    /// Storage rules:
+    /// 1. Explicit "remember" commands: Store immediately (priority 12)
+    /// 2. High-priority relationship facts (priority >= 8): Store immediately (wife's name, etc.)
+    /// 3. Other facts: Track mentions, store after 5+ mentions
+    /// Maximum input length for fact extraction — prevents regex DoS on oversized messages
+    private let maxInputLength = 5000
+
+    @discardableResult
+    public func extractAndSave(from message: String) async -> [ExtractedFact] {
+        // Guard against oversized input — regex matching is expensive on large strings
+        let truncatedMessage: String
+        if message.count > maxInputLength {
+            truncatedMessage = String(message.prefix(maxInputLength))
+            logger.warning("⚠️ Input truncated from \(message.count) to \(self.maxInputLength) chars for fact extraction")
+        } else {
+            truncatedMessage = message
+        }
+
+        print("🔍 [PersonalFactExtractor] extractAndSave called with: '\(truncatedMessage.prefix(100))'")
+
+        // Check for explicit "remember" command - highest priority
+        let hasExplicitRemember = detectExplicitRememberCommand(truncatedMessage)
+        if hasExplicitRemember {
+            logger.info("💡 Explicit 'remember' command detected - will store immediately")
+        }
+
+        var facts = await extractFacts(from: truncatedMessage)
+        print("🔍 [PersonalFactExtractor] Extracted \(facts.count) fact(s)")
+
+        // Fallback: user explicitly asked to remember something but no structured pattern matched.
+        // Store as a general fact with the remember prefix stripped.
+        if hasExplicitRemember && facts.isEmpty {
+            let stripped = stripRememberPrefix(truncatedMessage)
+            if !stripped.isEmpty {
+                let genericFact = ExtractedFact(fact: stripped, category: .general, priority: 12)
+                facts = [genericFact]
+                print("🔍 [PersonalFactExtractor] No pattern match — using generic fallback: '\(stripped)'")
+            }
+        }
+
+        var storedFacts: [ExtractedFact] = []
+
+        for fact in facts {
+            // Boost priority if explicit "remember" was used
+            let effectivePriority = hasExplicitRemember ? max(fact.priority, 12) : fact.priority
+            print("🔍 [PersonalFactExtractor] Processing fact: '\(fact.fact)' (priority: \(effectivePriority))")
+
+            // Determine if we should store this fact
+            var shouldStore = false
+            var storeReason = ""
+
+            // Rule 1: Explicit "remember" command - always store
+            if hasExplicitRemember {
+                shouldStore = true
+                storeReason = "explicit remember command"
+            }
+            // Rule 2: High-priority relationship facts (priority >= 8) - store immediately
+            else if effectivePriority >= 8 {
+                shouldStore = true
+                storeReason = "high-priority fact (priority >= 8)"
+            }
+            // Rule 3: Medium priority (5-7) - track mentions, store after threshold
+            else if effectivePriority >= 5 {
+                let mentionKey = normalizeMentionKey(fact.fact)
+                let currentCount = (mentionCounts[mentionKey] ?? 0) + 1
+                mentionCounts[mentionKey] = currentCount
+
+                let threshold = self.repeatMentionThreshold
+                logger.info("📊 Mention tracking: '\(mentionKey)' mentioned \(currentCount)/\(threshold) times")
+
+                if currentCount >= threshold {
+                    shouldStore = true
+                    storeReason = "repeated \(currentCount) times (threshold: \(threshold))"
+                    // Reset counter after storing
+                    mentionCounts[mentionKey] = 0
+                } else {
+                    logger.info("⏸️ Fact flagged for tracking (mention \(currentCount)/\(threshold)): '\(fact.fact)'")
+                }
+            } else {
+                print("⏭️ [PersonalFactExtractor] Skipping low priority fact (\(effectivePriority) < 5)")
+            }
+
+            // Store the fact if conditions are met
+            if shouldStore {
+                print("💾 [PersonalFactExtractor] Saving to RTAI library (\(storeReason)): '\(fact.fact)'")
+                await ftaiManager.addExtractedFact(fact.fact, category: fact.category, priority: effectivePriority)
+                storedFacts.append(fact)
+                print("✅ [PersonalFactExtractor] Saved fact #\(storedFacts.count) to RTAI")
+            }
+        }
+
+        if !storedFacts.isEmpty {
+            logger.info("💾 Saved \(storedFacts.count) new personal fact(s) to RTAI library")
+            print("💾 [PersonalFactExtractor] Total saved: \(storedFacts.count) fact(s)")
+        } else {
+            print("⚠️ [PersonalFactExtractor] No facts saved from message (may be tracking for repeat)")
+        }
+
+        return storedFacts
+    }
+
+    /// Detect if the message contains an explicit "remember" command
+    private func detectExplicitRememberCommand(_ message: String) -> Bool {
+        let lower = message.lowercased()
+
+        let rememberPatterns = [
+            "remember that",
+            "remember this",
+            "please remember",
+            "don't forget",
+            "keep in mind",
+            "note that",
+            "make a note",
+            "save this",
+            "store this"
+        ]
+
+        for pattern in rememberPatterns {
+            if lower.contains(pattern) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Strip "remember that", "please remember", etc. prefix from a message
+    private func stripRememberPrefix(_ message: String) -> String {
+        let lower = message.lowercased()
+        let prefixes = [
+            "please remember that ", "please remember ", "remember that ",
+            "remember this: ", "remember this ", "don't forget that ",
+            "don't forget ", "keep in mind that ", "keep in mind ",
+            "note that ", "make a note that ", "make a note ",
+            "save this: ", "save this ", "store this: ", "store this "
+        ]
+        for prefix in prefixes {
+            if lower.hasPrefix(prefix) {
+                let stripped = String(message.dropFirst(prefix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return stripped
+            }
+        }
+        return message.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Normalize a fact to a consistent key for mention tracking
+    private func normalizeMentionKey(_ fact: String) -> String {
+        // Extract the core fact (e.g., "wife's name" from "User's wife's name is Christina")
+        let lower = fact.lowercased()
+
+        // Remove common prefixes
+        var normalized = lower
+            .replacingOccurrences(of: "user's ", with: "")
+            .replacingOccurrences(of: "user ", with: "")
+
+        // Remove "is X" suffix to get just the key
+        if let isRange = normalized.range(of: " is ") {
+            normalized = String(normalized[..<isRange.lowerBound])
+        }
+
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Process a full conversation exchange (user + assistant) for facts
+    /// - Parameters:
+    ///   - userMessage: The user's message
+    ///   - assistantResponse: Serena's response
+    /// - Returns: Number of new facts saved
+    @discardableResult
+    public func processExchange(userMessage: String, assistantResponse: String) async -> Int {
+        // Primary focus: extract from user message
+        let storedFacts = await extractAndSave(from: userMessage)
+        var totalCount = storedFacts.count
+
+        // Also check if Serena's acknowledgment reveals she understood a fact
+        // e.g., "Nice! I'll remember that your wife's name is Christina"
+        totalCount += await extractFromAcknowledgment(assistantResponse)
+
+        return totalCount
+    }
+
+    // MARK: - Private Helpers
+
+    /// Normalize possessive forms so patterns only need canonical versions.
+    /// "wifes name" → "wife's name", "husbands" → "husband's", "kids" → "kid's"
+    /// This runs ONCE before all pattern matching — no per-word hardcoding needed.
+    private func normalizePossessives(_ text: String) -> String {
+        var result = text
+        // "wifes" → "wife's", "husbands" → "husband's", etc. (missing apostrophe)
+        // Matches word + "s" followed by space (not end-of-word plural like "cats are")
+        // Only normalizes when followed by a noun-like word (name, birthday, job, etc.)
+        result = result.replacingOccurrences(
+            of: #"(\b\w+?)s\b(\s+(?:name|birthday|job|work|phone|email|address|number|age|favorite))"#,
+            with: "$1's$2",
+            options: .regularExpression
+        )
+        // Already has apostrophe-s — canonical form, leave as-is
+        // Curly quotes → straight apostrophe
+        result = result.replacingOccurrences(of: "\u{2019}", with: "'")
+        result = result.replacingOccurrences(of: "\u{2018}", with: "'")
+        return result
+    }
+
+    /// Check if text contains a whole word (not a substring).
+    /// Uses word-boundary regex to prevent "vacation" matching "cat", etc.
+    private func containsWord(_ text: String, _ word: String) -> Bool {
+        text.range(of: "\\b\(word)\\b", options: .regularExpression) != nil
+    }
+
+    private func extractWithPattern(_ pattern: String, from normalizedMessage: String, originalMessage: String, category: MemoryCategory, priority: Int) -> ExtractedFact? {
+        do {
+            let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            let range = NSRange(normalizedMessage.startIndex..., in: normalizedMessage)
+
+            if let match = regex.firstMatch(in: normalizedMessage, options: [], range: range) {
+                // Get the captured group (the value we want to extract)
+                var capturedValue = ""
+
+                // Try to get the last capture group (usually contains the value)
+                for i in (1..<match.numberOfRanges).reversed() {
+                    if let captureRange = Range(match.range(at: i), in: normalizedMessage) {
+                        let captured = String(normalizedMessage[captureRange])
+                        if !captured.isEmpty {
+                            capturedValue = captured
+                            break
+                        }
+                    }
+                }
+
+                if !capturedValue.isEmpty {
+                    // Format the fact nicely
+                    let fact = formatFact(value: capturedValue, category: category, originalMessage: originalMessage)
+                    return ExtractedFact(fact: fact, category: category, priority: priority)
+                }
+            }
+        } catch {
+            logger.error("Regex error for pattern '\(pattern)': \(error)")
+        }
+
+        return nil
+    }
+
+    private func extractSimpleFacts(from message: String) -> [ExtractedFact] {
+        var facts: [ExtractedFact] = []
+        let lower = message.lowercased()
+
+        // Wife's name pattern - handles "my wife's name is X", "my wifes name is X", "my wife is X"
+        if lower.contains("wife") {
+            // Try multiple patterns
+            if let name = extractNameFromPattern(lower, patterns: [
+                "wife's name is ",
+                "wifes name is ",
+                "wife name is ",
+                "wife is named ",
+                "wife is called ",
+                "wife is "  // "my wife is Christina"
+            ], original: message) {
+                facts.append(ExtractedFact(
+                    fact: "User's wife's name is \(name)",
+                    category: .personal,
+                    priority: 10
+                ))
+            }
+        }
+
+        // Husband's name pattern
+        if lower.contains("husband") {
+            if let name = extractNameFromPattern(lower, patterns: [
+                "husband's name is ",
+                "husbands name is ",
+                "husband name is ",
+                "husband is named ",
+                "husband is called ",
+                "husband is "
+            ], original: message) {
+                facts.append(ExtractedFact(
+                    fact: "User's husband's name is \(name)",
+                    category: .personal,
+                    priority: 10
+                ))
+            }
+        }
+
+        // Kid/child name patterns — use word boundaries to avoid "person"→"son", "reason"→"son"
+        if (containsWord(lower, "son") || containsWord(lower, "daughter") || containsWord(lower, "kid") || containsWord(lower, "child")) {
+            if containsWord(lower, "name") || containsWord(lower, "named") || containsWord(lower, "called") {
+                let keywords = ["son", "daughter", "kid", "child", "is", "named", "called"]
+                if let name = extractNameAfterKeyword(message, keywords: keywords) {
+                    let childType = containsWord(lower, "daughter") ? "daughter" : (containsWord(lower, "son") ? "son" : "child")
+                    facts.append(ExtractedFact(
+                        fact: "User's \(childType)'s name is \(name.capitalized)",
+                        category: .personal,
+                        priority: 10
+                    ))
+                }
+            }
+        }
+
+        // Pet name patterns — use word boundaries to avoid "vacation"→"cat", "catalog"→"cat"
+        if (containsWord(lower, "dog") || containsWord(lower, "cat") || containsWord(lower, "pet")) {
+            if containsWord(lower, "name") || containsWord(lower, "named") || containsWord(lower, "called") {
+                let keywords = ["dog", "cat", "pet", "is", "named", "called"]
+                if let name = extractNameAfterKeyword(message, keywords: keywords) {
+                    let petType = containsWord(lower, "cat") ? "cat" : (containsWord(lower, "dog") ? "dog" : "pet")
+                    facts.append(ExtractedFact(
+                        fact: "User's \(petType)'s name is \(name.capitalized)",
+                        category: .personal,
+                        priority: 9
+                    ))
+                }
+            }
+        }
+
+        // Favorite color (very common test)
+        if lower.contains("favorite color") {
+            let colors = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "black", "white", "gray", "grey", "brown", "gold", "silver"]
+            for color in colors {
+                if lower.contains(color) {
+                    facts.append(ExtractedFact(
+                        fact: "User's favorite color is \(color)",
+                        category: .preference,
+                        priority: 5
+                    ))
+                    break
+                }
+            }
+        }
+
+        // Birthday - handle both user's and family member's birthdays
+        if lower.contains("birthday") || lower.contains("born on") {
+            // Extract date pattern
+            if let dateMatch = extractDate(from: message) {
+                // Check if it's about wife/husband/family member
+                if containsWord(lower, "wife") {
+                    facts.append(ExtractedFact(
+                        fact: "User's wife's birthday is \(dateMatch)",
+                        category: .personal,
+                        priority: 8
+                    ))
+                } else if containsWord(lower, "husband") {
+                    facts.append(ExtractedFact(
+                        fact: "User's husband's birthday is \(dateMatch)",
+                        category: .personal,
+                        priority: 8
+                    ))
+                } else if containsWord(lower, "son") || containsWord(lower, "daughter") || containsWord(lower, "kid") || containsWord(lower, "child") {
+                    let childType = containsWord(lower, "daughter") ? "daughter" : (containsWord(lower, "son") ? "son" : "child")
+                    facts.append(ExtractedFact(
+                        fact: "User's \(childType)'s birthday is \(dateMatch)",
+                        category: .personal,
+                        priority: 8
+                    ))
+                } else {
+                    // User's own birthday
+                    facts.append(ExtractedFact(
+                        fact: "User's birthday is \(dateMatch)",
+                        category: .personal,
+                        priority: 7
+                    ))
+                }
+            }
+        }
+
+        return facts
+    }
+
+    /// Extract a name that appears after certain keywords
+    private func extractNameAfterKeyword(_ message: String, keywords: [String]) -> String? {
+        let words = message.components(separatedBy: .whitespacesAndNewlines)
+        let lowerWords = words.map { $0.lowercased() }
+
+        // Find the position of any keyword
+        var keywordIndex = -1
+        for keyword in keywords {
+            if let idx = lowerWords.firstIndex(of: keyword.lowercased()) {
+                if idx > keywordIndex {
+                    keywordIndex = idx
+                }
+            }
+        }
+
+        // Look for a capitalized word after the keywords
+        if keywordIndex >= 0 && keywordIndex < words.count - 1 {
+            for i in (keywordIndex + 1)..<words.count {
+                let word = words[i].trimmingCharacters(in: .punctuationCharacters)
+                // Check if it looks like a name (capitalized, not a common word)
+                if word.first?.isUppercase == true && word.count > 1 && !isCommonWord(word) {
+                    return word
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Check if a word is a common non-name word
+    private func isCommonWord(_ word: String) -> Bool {
+        let commonWords = Set(["I", "The", "A", "An", "My", "Your", "His", "Her", "Is", "Are", "Was", "Were", "Have", "Has", "And", "Or", "But", "So", "Because", "That", "This", "It"])
+        return commonWords.contains(word)
+    }
+
+    /// Extract a name by finding text after a pattern
+    /// Returns the properly capitalized name from the original message
+    private func extractNameFromPattern(_ lower: String, patterns: [String], original: String) -> String? {
+        for pattern in patterns {
+            if let range = lower.range(of: pattern) {
+                // Get everything after the pattern
+                let afterPattern = String(lower[range.upperBound...])
+                let originalAfter = String(original[original.index(original.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.upperBound))...])
+
+                // Get the first word (the name)
+                let words = afterPattern.components(separatedBy: .whitespacesAndNewlines)
+                let originalWords = originalAfter.components(separatedBy: .whitespacesAndNewlines)
+
+                if let firstWord = words.first, !firstWord.isEmpty {
+                    // Clean punctuation
+                    let cleaned = firstWord.trimmingCharacters(in: .punctuationCharacters)
+
+                    // Skip common non-name words
+                    let skipWords = Set(["a", "an", "the", "my", "very", "really", "also", "too", "and", "but"])
+                    if skipWords.contains(cleaned) {
+                        continue
+                    }
+
+                    // Get the original casing if possible
+                    if let originalFirst = originalWords.first {
+                        let originalCleaned = originalFirst.trimmingCharacters(in: .punctuationCharacters)
+                        // If original starts with uppercase, use it; otherwise capitalize
+                        if originalCleaned.first?.isUppercase == true {
+                            return originalCleaned
+                        }
+                    }
+
+                    // Capitalize the name
+                    return cleaned.capitalized
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Check if a message is a question (should not be extracted as a fact)
+    /// Questions are asking about information, not providing it
+    private func isQuestion(_ message: String) -> Bool {
+        let lower = message.lowercased()
+
+        // Check for question mark
+        if message.contains("?") {
+            return true
+        }
+
+        // Check for question starters
+        let questionStarters = [
+            "what ", "what's ", "whats ",
+            "who ", "who's ", "whos ",
+            "where ", "where's ", "wheres ",
+            "when ", "when's ", "whens ",
+            "why ", "why's ", "whys ",
+            "how ", "how's ", "hows ",
+            "do you ", "does ", "did ",
+            "can you ", "could you ", "would you ",
+            "is my ", "are my ", "was my ",
+            "tell me ", "remind me ",
+            "do i ", "have i "
+        ]
+
+        for starter in questionStarters {
+            if lower.hasPrefix(starter) {
+                return true
+            }
+        }
+
+        // Check for question patterns in the middle
+        let questionPatterns = [
+            "what is my",
+            "who is my",
+            "what's my",
+            "who's my",
+            "do you know my",
+            "do you remember my",
+            "can you tell me"
+        ]
+
+        for pattern in questionPatterns {
+            if lower.contains(pattern) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Extract date from message
+    private func extractDate(from message: String) -> String? {
+        // Try to match common date patterns
+        let patterns = [
+            #"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b"#,  // 12-25-77, 12/25/1977
+            #"\b(\d{1,2}[-/]\d{1,2})\b"#,              // 12-25, 12/25
+            #"\b(\w+ \d{1,2}(?:st|nd|rd|th)?(?:,? \d{4})?)\b"#,  // January 15th, 2024
+        ]
+
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+               let match = regex.firstMatch(in: message, options: [], range: NSRange(message.startIndex..., in: message)),
+               let range = Range(match.range(at: 1), in: message) {
+                let dateString = String(message[range])
+                // Try to format numeric dates nicely
+                return formatDateString(dateString)
+            }
+        }
+
+        return nil
+    }
+
+    /// Convert numeric date strings to readable format
+    private func formatDateString(_ dateString: String) -> String {
+        let months = ["", "January", "February", "March", "April", "May", "June",
+                     "July", "August", "September", "October", "November", "December"]
+
+        // Try to parse MM-DD-YY or MM/DD/YY format
+        let separators = CharacterSet(charactersIn: "-/")
+        let parts = dateString.components(separatedBy: separators)
+
+        if parts.count >= 2 {
+            if let month = Int(parts[0]), let day = Int(parts[1]), month >= 1 && month <= 12 {
+                var result = "\(months[month]) \(day)"
+                if parts.count >= 3, let year = Int(parts[2]) {
+                    // Convert 2-digit year to 4-digit
+                    let fullYear = year < 100 ? (year > 30 ? 1900 + year : 2000 + year) : year
+                    result += ", \(fullYear)"
+                }
+                return result
+            }
+        }
+
+        // Return original if can't parse
+        return dateString
+    }
+
+    /// Format extracted fact into a readable statement
+    private func formatFact(value: String, category: MemoryCategory, originalMessage: String) -> String {
+        let cleanValue = value.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+
+        switch category {
+        case .personal:
+            let lowerOriginal = normalizePossessives(originalMessage.lowercased())
+            if containsWord(lowerOriginal, "wife") {
+                return "User's wife's name is \(cleanValue.capitalized)"
+            } else if containsWord(lowerOriginal, "husband") {
+                return "User's husband's name is \(cleanValue.capitalized)"
+            } else if containsWord(lowerOriginal, "son") {
+                return "User's son's name is \(cleanValue.capitalized)"
+            } else if containsWord(lowerOriginal, "daughter") {
+                return "User's daughter's name is \(cleanValue.capitalized)"
+            } else if containsWord(lowerOriginal, "dog") {
+                return "User's dog's name is \(cleanValue.capitalized)"
+            } else if containsWord(lowerOriginal, "cat") {
+                return "User's cat's name is \(cleanValue.capitalized)"
+            } else if lowerOriginal.contains("name is") || lowerOriginal.contains("i'm ") {
+                return "User's name is \(cleanValue.capitalized)"
+            } else if lowerOriginal.contains("live in") || lowerOriginal.contains("from ") {
+                return "User lives in \(cleanValue.capitalized)"
+            }
+            return "Personal fact: \(cleanValue)"
+
+        case .preference:
+            if originalMessage.lowercased().contains("favorite") {
+                return "User's favorite: \(cleanValue)"
+            } else if originalMessage.lowercased().contains("love") || originalMessage.lowercased().contains("like") {
+                return "User likes \(cleanValue)"
+            } else if originalMessage.lowercased().contains("hate") || originalMessage.lowercased().contains("dislike") {
+                return "User dislikes \(cleanValue)"
+            }
+            return "Preference: \(cleanValue)"
+
+        case .work:
+            if originalMessage.lowercased().contains("work") {
+                return "User works at/as \(cleanValue)"
+            }
+            return "Work: \(cleanValue)"
+
+        case .health:
+            // Preserve allergy/condition context from the original message
+            let lowerOrig = originalMessage.lowercased()
+            if lowerOrig.contains("allergic to") {
+                return "User is allergic to \(cleanValue)"
+            } else if lowerOrig.contains("diagnosed with") || lowerOrig.contains("suffer from") || lowerOrig.contains("i have") {
+                return "User has \(cleanValue)"
+            } else if lowerOrig.contains("take") || lowerOrig.contains("medication") {
+                return "User takes \(cleanValue)"
+            }
+            return "Health info: \(cleanValue)"
+
+        case .schedule:
+            return "Schedule: \(cleanValue)"
+
+        case .general:
+            return cleanValue
+        }
+    }
+
+    /// Extract facts from Serena's acknowledgment response
+    private func extractFromAcknowledgment(_ response: String) async -> Int {
+        // Look for acknowledgment patterns that confirm understanding
+        let patterns = [
+            #"(?:I'll remember|I've noted|got it|understood).+?(?:wife|husband|spouse|partner)(?:'s name)? is (\w+)"#,
+            #"(?:I'll remember|I've noted|got it|understood).+?(?:son|daughter|child)(?:'s name)? is (\w+)"#,
+        ]
+
+        var savedCount = 0
+
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = regex.firstMatch(in: response, options: [], range: NSRange(response.startIndex..., in: response)),
+               let range = Range(match.range(at: 1), in: response) {
+                let name = String(response[range])
+                // The fact will be saved through the primary extraction, so just log
+                logger.debug("Serena acknowledged remembering: \(name)")
+            }
+        }
+
+        return savedCount
+    }
+
+    // MARK: - Correction Detection
+
+    /// Detect if the user is correcting recently stored facts
+    /// - Parameters:
+    ///   - message: The user's current message
+    ///   - recentFacts: Facts stored from the previous turn
+    /// - Returns: Array of corrections (empty if no correction detected).
+    ///   Broad negations ("that's all wrong") return corrections for ALL recent facts.
+    ///   Specific negations ("her name is Sarah") return only the matching fact.
+    public func detectCorrection(in message: String, recentFacts: [ExtractedFact]) -> [FactCorrection] {
+        let lower = message.lowercased()
+
+        // Must contain a negation/correction signal
+        let correctionSignals = [
+            "no that's wrong", "no, that's wrong", "that's not right", "that's incorrect",
+            "that's not correct", "no that's not", "no, that's not", "actually",
+            "wrong", "not right", "incorrect",
+            "that's all wrong", "none of that is right", "all wrong"
+        ]
+
+        let hasCorrection = correctionSignals.contains { lower.contains($0) }
+        guard hasCorrection else { return [] }
+
+        let subjectKeywords = ["wife", "husband", "spouse", "partner", "son", "daughter",
+                               "dog", "cat", "pet", "color", "birthday", "name", "favorite"]
+        let messageSubjects = subjectKeywords.filter { lower.contains($0) }
+
+        // Broad negation: no specific subject mentioned → correct ALL recent facts
+        let broadNegationSignals = ["all wrong", "none of that", "that's all wrong"]
+        let isBroadNegation = broadNegationSignals.contains(where: { lower.contains($0) }) || messageSubjects.isEmpty
+
+        if isBroadNegation && recentFacts.count > 1 {
+            let correctedValue = extractCorrectedValue(from: message)
+            return recentFacts.map { fact in
+                FactCorrection(
+                    originalFact: fact,
+                    correctedValue: correctedValue ?? "",
+                    originalMessage: message
+                )
+            }
+        }
+
+        // Specific negation: find matching facts by subject overlap
+        var corrections: [FactCorrection] = []
+        for fact in recentFacts {
+            let factLower = fact.fact.lowercased()
+            let factSubjects = subjectKeywords.filter { factLower.contains($0) }
+
+            let sharesSubject = !factSubjects.isEmpty && !messageSubjects.isEmpty &&
+                                !Set(factSubjects).isDisjoint(with: Set(messageSubjects))
+            let referencesName = (lower.contains("her name") || lower.contains("his name") ||
+                                  lower.contains("the name")) && factLower.contains("name")
+
+            if sharesSubject || referencesName {
+                let correctedValue = extractCorrectedValue(from: message)
+                corrections.append(FactCorrection(
+                    originalFact: fact,
+                    correctedValue: correctedValue ?? "",
+                    originalMessage: message
+                ))
+            }
+        }
+
+        return corrections
+    }
+
+    /// Extract the corrected value from a correction message
+    /// e.g., "no that's wrong, her name is Sarah" → "Sarah"
+    private func extractCorrectedValue(from message: String) -> String? {
+        let lower = message.lowercased()
+
+        // Pattern: "name is X" / "it's X" / "it is X"
+        let valuePatterns = [
+            "name is ", "it's ", "it is ", "she is ", "he is ",
+            "should be ", "is actually "
+        ]
+
+        for pattern in valuePatterns {
+            if let range = lower.range(of: pattern) {
+                let afterPattern = String(message[message.index(message.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.upperBound))...])
+                let words = afterPattern.components(separatedBy: .whitespacesAndNewlines)
+                if let firstWord = words.first?.trimmingCharacters(in: .punctuationCharacters), !firstWord.isEmpty {
+                    return firstWord.capitalized
+                }
+            }
+        }
+
+        return nil
+    }
+
+    // MARK: - Memory Integration
+
+    /// Get all remembered facts formatted for system prompt injection
+    /// Reads from RTAI library (.ftai files) for unified storage
+    public func getMemoryPrompt() async -> String {
+        return await ftaiManager.getFactsForPrompt()
+    }
+
+    /// Get count of remembered facts
+    public func factCount() async -> Int {
+        return await ftaiManager.factCount()
+    }
+}
+
+// MARK: - Supporting Types
+
+public struct ExtractedFact: Hashable {
+    public let fact: String
+    public let category: MemoryCategory
+    public let priority: Int
+
+    public init(fact: String, category: MemoryCategory, priority: Int) {
+        self.fact = fact
+        self.category = category
+        self.priority = priority
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(fact.lowercased())
+    }
+
+    public static func == (lhs: ExtractedFact, rhs: ExtractedFact) -> Bool {
+        return lhs.fact.lowercased() == rhs.fact.lowercased()
+    }
+}
+
+/// Represents a detected correction to a previously stored fact
+public struct FactCorrection {
+    public let originalFact: ExtractedFact
+    public let correctedValue: String
+    public let originalMessage: String
+}
+
+/// Generates LLM system prompt directives for confirming newly learned facts
+public enum FactConfirmationDirective {
+    /// Generate a prompt fragment instructing the LLM to confirm learned facts naturally
+    /// - Parameter facts: Facts that were just stored from the user's message
+    /// - Returns: A prompt fragment to append to the system prompt, or empty string if no facts
+    public static func generate(for facts: [ExtractedFact]) -> String {
+        guard !facts.isEmpty else { return "" }
+
+        let factDescriptions = facts.map { "- \($0.fact)" }.joined(separator: "\n")
+
+        return """
+
+        IMPORTANT: You just learned new personal facts from the user's message. \
+        Confirm these naturally in your response (don't make it the entire response):
+        \(factDescriptions)
+        Weave acknowledgment in naturally, like "Got it — I'll remember that!" or reference the fact conversationally. \
+        Do NOT list them robotically. Be warm and conversational.
+        """
+    }
+}

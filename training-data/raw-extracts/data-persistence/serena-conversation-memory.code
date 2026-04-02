@@ -1,0 +1,742 @@
+import Foundation
+
+/// Service for storing and retrieving conversation history with semantic search
+@available(macOS 13.0, *)
+public actor ConversationMemoryService {
+    public static let shared = ConversationMemoryService()
+
+    private let storageDirectory: URL
+    private let conversationHistoryPath: URL
+    private let embeddingsIndexPath: URL
+    private let tierConfigPath: URL
+
+    // In-memory cache
+    private var conversationHistory: [StoredMessage] = []
+    private var embeddingsIndex: [UUID: TextEmbedding] = [:]
+    private var userContext: UserContext?
+    private var tierConfig: UserTierConfig
+
+    // Configuration
+    private let semanticSearchThreshold: Float = 0.7
+
+    private init() {
+        // Setup storage paths
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        self.storageDirectory = documentsPath.appendingPathComponent("SerenaNet/Memory")
+        self.conversationHistoryPath = storageDirectory.appendingPathComponent("conversation_history.json")
+        self.embeddingsIndexPath = storageDirectory.appendingPathComponent("embeddings_index.json")
+        self.tierConfigPath = storageDirectory.appendingPathComponent("tier_config.json")
+
+        // Initialize tier config (default: free tier)
+        self.tierConfig = UserTierConfig(tier: .free)
+
+        // Create directory if needed
+        try? FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
+
+        // Load existing data
+        Task {
+            await loadFromStorage()
+        }
+    }
+
+    // MARK: - Initialization
+
+    /// Initialize the service and embedding model
+    public func initialize() async throws {
+        print("🧠 ConversationMemoryService: Initializing...")
+        // Initialize LocalEmbeddingService
+        try? await LocalEmbeddingService.shared.initialize()
+        await loadFromStorage()
+
+        // Auto-cleanup based on tier if needed
+        if tierConfig.shouldRunCleanup() {
+            await autoCleanup()
+        }
+
+        print("✅ ConversationMemoryService: Initialized successfully (Tier: \(tierConfig.currentTier.displayName))")
+    }
+
+    // MARK: - Tier Management
+
+    /// Get current user tier
+    public func getCurrentTier() -> UserTier {
+        return tierConfig.currentTier
+    }
+
+    /// Update user tier (e.g., when user upgrades to paid)
+    public func updateTier(to newTier: UserTier) async {
+        print("💎 Updating tier from \(tierConfig.currentTier.displayName) to \(newTier.displayName)")
+        tierConfig.currentTier = newTier
+        tierConfig.tierStartDate = Date()
+        await persistTierConfig()
+
+        // Don't auto-cleanup on upgrade (preserve old data)
+        print("✅ Tier updated to \(newTier.displayName)")
+    }
+
+    /// Get tier configuration
+    public func getTierConfig() -> UserTierConfig {
+        return tierConfig
+    }
+
+    // MARK: - Message Storage
+
+    /// Store a message with its embedding
+    public func storeMessage(_ message: Message, conversationId: UUID) async throws {
+        print("💾 Storing message with semantic embedding...")
+
+        // Generate embedding for the message content using LocalEmbeddingService
+        let embedding = try await LocalEmbeddingService.shared.embed(text: message.content)
+
+        // Create text embedding entry
+        let textEmbedding = TextEmbedding(
+            text: message.content,
+            embedding: embedding,
+            metadata: [
+                "message_id": message.id.uuidString,
+                "conversation_id": conversationId.uuidString,
+                "role": message.role.rawValue,
+                "timestamp": ISO8601DateFormatter().string(from: message.timestamp)
+            ]
+        )
+
+        // Create stored message
+        let storedMessage = StoredMessage(
+            message: message,
+            conversationId: conversationId,
+            embeddingId: textEmbedding.id
+        )
+
+        // Add to cache
+        conversationHistory.append(storedMessage)
+        embeddingsIndex[textEmbedding.id] = textEmbedding
+
+        // Enforce capacity limits
+        await enforceCapacityLimits()
+
+        // Persist to disk
+        await persistToStorage()
+
+        print("✅ Message stored with embedding")
+    }
+
+    /// Store multiple messages from a conversation
+    public func storeConversation(_ conversation: Conversation) async throws {
+        print("💾 Storing conversation with \(conversation.messages.count) messages...")
+
+        for message in conversation.messages {
+            // Check if message already exists
+            let exists = conversationHistory.contains { $0.message.id == message.id }
+            if !exists {
+                try await storeMessage(message, conversationId: conversation.id)
+            }
+        }
+
+        print("✅ Conversation stored successfully")
+    }
+
+    // MARK: - Semantic Search
+
+    /// Search for relevant messages using semantic similarity
+    public func semanticSearch(query: String, limit: Int = 10, minSimilarity: Float? = nil) async throws -> [SemanticSearchResult] {
+        print("🔍 Performing semantic search for: '\(query.prefix(50))...'")
+
+        // Generate embedding for query
+        let queryEmbedding = try await LocalEmbeddingService.shared.embed(text: query)
+
+        // Calculate similarity with all stored embeddings
+        var results: [(embedding: TextEmbedding, similarity: Float)] = []
+
+        for (_, textEmbedding) in embeddingsIndex {
+            let similarity = await LocalEmbeddingService.shared.cosineSimilarity(queryEmbedding, textEmbedding.embedding)
+            results.append((embedding: textEmbedding, similarity: similarity))
+        }
+
+        // Filter by minimum similarity threshold
+        let threshold = minSimilarity ?? semanticSearchThreshold
+        results = results.filter { $0.similarity >= threshold }
+
+        // Sort by similarity (highest first)
+        results.sort { $0.similarity > $1.similarity }
+
+        // Take top N results
+        let topResults = results.prefix(limit)
+
+        // Convert to search results
+        let searchResults = topResults.map { result in
+            SemanticSearchResult(
+                id: result.embedding.id,
+                text: result.embedding.text,
+                similarity: result.similarity,
+                metadata: result.embedding.metadata
+            )
+        }
+
+        print("✅ Found \(searchResults.count) relevant messages (threshold: \(threshold))")
+
+        return searchResults
+    }
+
+    /// Get contextually relevant messages for a new query
+    public func getRelevantContext(for query: String, maxMessages: Int = 5) async throws -> [Message] {
+        let searchResults = try await semanticSearch(query: query, limit: maxMessages)
+
+        // Convert search results to messages
+        var messages: [Message] = []
+
+        for result in searchResults {
+            // Find the stored message by embedding ID
+            if let storedMessage = conversationHistory.first(where: { $0.embeddingId == result.id }) {
+                messages.append(storedMessage.message)
+            }
+        }
+
+        return messages
+    }
+
+    /// Get recent conversation history
+    public func getRecentHistory(limit: Int = 20) async -> [StoredMessage] {
+        let sortedHistory = conversationHistory.sorted { $0.message.timestamp > $1.message.timestamp }
+        return Array(sortedHistory.prefix(limit))
+    }
+
+    /// Get conversation history for a specific conversation
+    public func getConversationHistory(conversationId: UUID) async -> [Message] {
+        let messages = conversationHistory
+            .filter { $0.conversationId == conversationId }
+            .sorted { $0.message.timestamp < $1.message.timestamp }
+            .map { $0.message }
+
+        return messages
+    }
+
+    // MARK: - All Conversations Access (for Serena)
+
+    /// Get all unique conversation IDs that have stored messages
+    public func getAllConversationIds() async -> [UUID] {
+        let uniqueIds = Set(conversationHistory.map { $0.conversationId })
+        return Array(uniqueIds).sorted { id1, id2 in
+            // Sort by most recent message in each conversation
+            let lastMsg1 = conversationHistory.filter { $0.conversationId == id1 }.max { $0.message.timestamp < $1.message.timestamp }
+            let lastMsg2 = conversationHistory.filter { $0.conversationId == id2 }.max { $0.message.timestamp < $1.message.timestamp }
+            return (lastMsg1?.message.timestamp ?? Date.distantPast) > (lastMsg2?.message.timestamp ?? Date.distantPast)
+        }
+    }
+
+    /// Search across ALL conversations (not just current one)
+    public func searchAllConversations(query: String, limit: Int = 20, minSimilarity: Float? = nil) async throws -> [ConversationSearchResult] {
+        print("🔍 Searching ALL conversations for: '\(query.prefix(50))...'")
+
+        // Use existing semantic search
+        let semanticResults = try await semanticSearch(query: query, limit: limit * 2, minSimilarity: minSimilarity)
+
+        // Group by conversation
+        var conversationResults: [ConversationSearchResult] = []
+
+        for result in semanticResults {
+            // Find the stored message
+            guard let storedMessage = conversationHistory.first(where: { $0.embeddingId == result.id }) else {
+                continue
+            }
+
+            conversationResults.append(ConversationSearchResult(
+                conversationId: storedMessage.conversationId,
+                message: storedMessage.message,
+                similarity: result.similarity,
+                snippet: result.text
+            ))
+        }
+
+        // Take top N
+        let topResults = Array(conversationResults.prefix(limit))
+
+        print("✅ Found \(topResults.count) results across \(Set(topResults.map { $0.conversationId }).count) conversations")
+
+        return topResults
+    }
+
+    /// Get summary of all conversations
+    public func getAllConversationsSummary() async -> [ConversationSummary] {
+        let conversationIds = await getAllConversationIds()
+        var summaries: [ConversationSummary] = []
+
+        for conversationId in conversationIds {
+            let messages = conversationHistory.filter { $0.conversationId == conversationId }
+            guard !messages.isEmpty else { continue }
+
+            let sortedMessages = messages.sorted { $0.message.timestamp < $1.message.timestamp }
+            guard let firstMessage = sortedMessages.first?.message,
+                  let lastMessage = sortedMessages.last?.message else {
+                continue
+            }
+
+            summaries.append(ConversationSummary(
+                conversationId: conversationId,
+                messageCount: messages.count,
+                firstMessageDate: firstMessage.timestamp,
+                lastMessageDate: lastMessage.timestamp,
+                preview: String(firstMessage.content.prefix(100))
+            ))
+        }
+
+        return summaries
+    }
+
+    // MARK: - User Context Management
+
+    /// Store user context (name, company, preferences, etc.)
+    public func storeUserContext(_ context: UserContext) async throws {
+        print("👤 Storing user context for \(context.name)...")
+
+        self.userContext = context
+
+        // Generate embeddings for user facts
+        for fact in context.facts {
+            let embedding = try await LocalEmbeddingService.shared.embed(text: fact)
+            let textEmbedding = TextEmbedding(
+                text: fact,
+                embedding: embedding,
+                metadata: [
+                    "type": "user_context",
+                    "user_name": context.name,
+                    "category": "fact"
+                ]
+            )
+            embeddingsIndex[textEmbedding.id] = textEmbedding
+        }
+
+        await persistToStorage()
+        print("✅ User context stored")
+    }
+
+    /// Get user context
+    public func getUserContext() async -> UserContext? {
+        return userContext
+    }
+
+    /// Update user context with new facts
+    public func addUserFact(_ fact: String) async throws {
+        guard var context = userContext else {
+            throw MemoryServiceError.userContextNotInitialized
+        }
+
+        context.facts.append(fact)
+        self.userContext = context
+
+        // Generate embedding for new fact
+        let embedding = try await LocalEmbeddingService.shared.embed(text: fact)
+        let textEmbedding = TextEmbedding(
+            text: fact,
+            embedding: embedding,
+            metadata: [
+                "type": "user_context",
+                "user_name": context.name,
+                "category": "fact"
+            ]
+        )
+        embeddingsIndex[textEmbedding.id] = textEmbedding
+
+        await persistToStorage()
+    }
+
+    // MARK: - Context Building
+
+    /// Build comprehensive context for a new message
+    public func buildContext(for userMessage: String, conversationId: UUID, includeUserContext: Bool = true) async throws -> ConversationContext {
+        print("🔨 Building context for new message...")
+
+        // Get recent conversation history
+        let recentMessages = await getConversationHistory(conversationId: conversationId)
+            .suffix(10) // Last 10 messages from this conversation
+
+        // Get semantically relevant past messages
+        let relevantMessages = try await getRelevantContext(for: userMessage, maxMessages: 5)
+
+        // Get user context if requested
+        let userCtx = includeUserContext ? await getUserContext() : nil
+
+        let context = ConversationContext(
+            recentMessages: Array(recentMessages),
+            relevantHistory: relevantMessages,
+            userContext: userCtx,
+            timestamp: Date()
+        )
+
+        print("✅ Context built: \(recentMessages.count) recent + \(relevantMessages.count) relevant messages")
+
+        return context
+    }
+
+    /// Generate system prompt with user context and memory
+    /// CRITICAL: This includes FULL tool definitions for AI awareness
+    public func generateSystemPrompt(includeMemory: Bool = true) async -> String {
+        var prompt = "You are Serena, an AI assistant for Folk Tech AI, created by Mike (the CEO).\n\n"
+
+        // Add user context if available
+        if let userContext = await getUserContext() {
+            prompt += "IMPORTANT USER CONTEXT:\n"
+            prompt += "- The user's name is \(userContext.name)\n"
+            if let role = userContext.role {
+                prompt += "- They are the \(role)\n"
+            }
+            if let company = userContext.company {
+                prompt += "- They work at \(company)\n"
+            }
+
+            if !userContext.facts.isEmpty {
+                prompt += "\nKnown facts about the user:\n"
+                for fact in userContext.facts.prefix(5) {
+                    prompt += "- \(fact)\n"
+                }
+            }
+
+            prompt += "\n"
+        }
+
+        // CRITICAL: Include ALL tool definitions
+        prompt += """
+        IMPORTANT - YOU HAVE REAL TOOLS (AND ONLY THESE TOOLS):
+        You have exactly 4 working tools. DO NOT claim to have weather, shopping, travel, communication, or any other tools.
+
+        CALENDAR TOOL - Use format: TOOL:calendar action:ACTION [params]
+          Actions: create_event, create_reminder, search_events, list_upcoming
+          Parameters: title, date, time (use HH:MM format, not start_time/end_time)
+          Example: "TOOL:calendar action:create_event title:Team Meeting date:tomorrow time:14:00"
+          Example: "TOOL:calendar action:create_event title:Downtime date:today time:21:39"
+
+        FILE TOOL - Use format: TOOL:file action:ACTION [params]
+          Actions: search, read, list, create, delete
+          Example: "TOOL:file action:search directory:~/Documents query:report"
+
+        APP TOOL - Use format: TOOL:app action:ACTION [params]
+          Actions: launch, quit, list_active
+          Example: "TOOL:app action:launch app_name:Safari"
+
+        EXECUTIVE TOOL - Use format: TOOL:executive role:ROLE operation:OPERATION
+          Roles: cfo, cto, coo
+          Example: "TOOL:executive role:cfo operation:portfolio_analysis"
+
+        IMPORTANT INSTRUCTIONS:
+        1. When a user asks you to DO something (schedule, find, open, analyze), OUTPUT THE TOOL CALL FIRST
+        2. Then explain what you're doing in natural language
+        3. Tool calls must be on their own line starting with "TOOL:"
+        4. Be conversational and helpful after the tool call
+
+        When responding:
+        - Remember details the user has shared
+        - Reference previous conversation context when relevant
+        - Maintain continuity across messages
+        - Be helpful, direct, and professional
+        - Use your tools when appropriate to help the user
+
+        """
+
+        return prompt
+    }
+
+    // MARK: - Statistics
+
+    /// Get memory statistics
+    public func getStatistics() async -> MemoryStatistics {
+        let userContextFactCount = userContext?.facts.count ?? 0
+
+        return MemoryStatistics(
+            totalMessages: conversationHistory.count,
+            totalEmbeddings: embeddingsIndex.count,
+            userContextFacts: userContextFactCount,
+            storageSize: await calculateStorageSize(),
+            lastUpdated: Date()
+        )
+    }
+
+    // MARK: - Cleanup
+
+    /// Clear old conversation history based on tier
+    public func cleanup(olderThan days: Int? = nil) async {
+        // Use tier-based retention if days not specified
+        let retentionDays = days ?? tierConfig.currentTier.memoryRetentionDays
+        let cutoffDate = Calendar.current.date(byAdding: .day, value: -retentionDays, to: Date())!
+
+        let initialCount = conversationHistory.count
+
+        // Remove old messages
+        conversationHistory.removeAll { storedMessage in
+            storedMessage.message.timestamp < cutoffDate
+        }
+
+        // Remove orphaned embeddings
+        let validEmbeddingIds = Set(conversationHistory.map { $0.embeddingId })
+        embeddingsIndex = embeddingsIndex.filter { id, _ in
+            validEmbeddingIds.contains(id) || embeddingsIndex[id]?.metadata["type"] == "user_context"
+        }
+
+        let removedCount = initialCount - conversationHistory.count
+
+        if removedCount > 0 {
+            print("🧹 Cleaned up \(removedCount) old messages (Tier: \(tierConfig.currentTier.displayName), Retention: \(retentionDays) days)")
+            await persistToStorage()
+        }
+
+        // Update last cleanup date
+        tierConfig.lastCleanupDate = Date()
+        await persistTierConfig()
+    }
+
+    /// Auto-cleanup based on tier retention policy
+    private func autoCleanup() async {
+        print("🔄 Running auto-cleanup based on \(tierConfig.currentTier.displayName) tier...")
+        await cleanup()
+    }
+
+    /// Clear all memory (for testing or reset)
+    public func clearAll() async {
+        conversationHistory.removeAll()
+        embeddingsIndex.removeAll()
+        userContext = nil
+        await persistToStorage()
+        print("🗑️ All conversation memory cleared")
+    }
+
+    // MARK: - Private Methods
+
+    private func enforceCapacityLimits() async {
+        let maxMessages = tierConfig.currentTier.maxHistoryMessages
+
+        if conversationHistory.count > maxMessages {
+            let excessCount = conversationHistory.count - maxMessages
+
+            // Sort by timestamp and remove oldest
+            conversationHistory.sort { $0.message.timestamp < $1.message.timestamp }
+            let toRemove = conversationHistory.prefix(excessCount)
+
+            // Remove embeddings for removed messages
+            for storedMessage in toRemove {
+                embeddingsIndex.removeValue(forKey: storedMessage.embeddingId)
+            }
+
+            conversationHistory.removeFirst(excessCount)
+
+            print("⚠️ Capacity limit reached (\(tierConfig.currentTier.displayName) tier: \(maxMessages) messages), removed \(excessCount) oldest messages")
+        }
+    }
+
+    private func loadFromStorage() async {
+        // Load tier config
+        if let tierData = try? Data(contentsOf: tierConfigPath),
+           let loadedConfig = try? JSONDecoder().decode(UserTierConfig.self, from: tierData) {
+            tierConfig = loadedConfig
+            print("💎 Loaded tier config: \(tierConfig.currentTier.displayName)")
+        }
+
+        // Load conversation history
+        if let historyData = try? Data(contentsOf: conversationHistoryPath),
+           let history = try? JSONDecoder().decode([StoredMessage].self, from: historyData) {
+            conversationHistory = history
+            print("📂 Loaded \(history.count) messages from storage")
+        }
+
+        // Load embeddings index
+        if let indexData = try? Data(contentsOf: embeddingsIndexPath) {
+            if let index = try? JSONDecoder().decode([String: TextEmbedding].self, from: indexData) {
+                // Convert String keys back to UUIDs
+                embeddingsIndex = Dictionary(uniqueKeysWithValues:
+                    index.compactMap { (key, value) in
+                        guard let uuid = UUID(uuidString: key) else { return nil }
+                        return (uuid, value)
+                    }
+                )
+                print("📂 Loaded \(embeddingsIndex.count) embeddings from storage")
+            }
+        }
+
+        // Load user context from embeddings metadata
+        if let userContextEmbedding = embeddingsIndex.values.first(where: { $0.metadata["type"] == "user_context" }),
+           let userName = userContextEmbedding.metadata["user_name"] {
+
+            let facts = embeddingsIndex.values
+                .filter { $0.metadata["type"] == "user_context" && $0.metadata["user_name"] == userName }
+                .map { $0.text }
+
+            userContext = UserContext(name: userName, facts: facts)
+            print("👤 Loaded user context for \(userName)")
+        }
+    }
+
+    private func persistToStorage() async {
+        // Persist conversation history
+        if let historyData = try? JSONEncoder().encode(conversationHistory) {
+            try? historyData.write(to: conversationHistoryPath)
+        }
+
+        // Persist embeddings index (convert UUID keys to strings for JSON)
+        let stringKeyedIndex = Dictionary(uniqueKeysWithValues:
+            embeddingsIndex.map { (key, value) in (key.uuidString, value) }
+        )
+
+        if let indexData = try? JSONEncoder().encode(stringKeyedIndex) {
+            try? indexData.write(to: embeddingsIndexPath)
+        }
+    }
+
+    private func persistTierConfig() async {
+        if let tierData = try? JSONEncoder().encode(tierConfig) {
+            try? tierData.write(to: tierConfigPath)
+        }
+    }
+
+    private func calculateStorageSize() async -> Int64 {
+        var totalSize: Int64 = 0
+
+        if let historySize = try? FileManager.default.attributesOfItem(atPath: conversationHistoryPath.path)[.size] as? Int64 {
+            totalSize += historySize
+        }
+
+        if let indexSize = try? FileManager.default.attributesOfItem(atPath: embeddingsIndexPath.path)[.size] as? Int64 {
+            totalSize += indexSize
+        }
+
+        return totalSize
+    }
+}
+
+// MARK: - Supporting Types
+
+/// A message stored with conversation and embedding references
+public struct StoredMessage: Codable, Identifiable {
+    public let id: UUID
+    public let message: Message
+    public let conversationId: UUID
+    public let embeddingId: UUID
+
+    public init(message: Message, conversationId: UUID, embeddingId: UUID) {
+        self.id = message.id
+        self.message = message
+        self.conversationId = conversationId
+        self.embeddingId = embeddingId
+    }
+}
+
+/// Text with its embedding
+public struct TextEmbedding: Codable, Identifiable {
+    public let id: UUID
+    public let text: String
+    public let embedding: [Float]
+    public let timestamp: Date
+    public var metadata: [String: String]
+
+    public init(text: String, embedding: [Float], metadata: [String: String] = [:]) {
+        self.id = UUID()
+        self.text = text
+        self.embedding = embedding
+        self.timestamp = Date()
+        self.metadata = metadata
+    }
+}
+
+/// Search result
+public struct SemanticSearchResult: Identifiable {
+    public let id: UUID
+    public let text: String
+    public let similarity: Float
+    public let metadata: [String: String]
+
+    public init(id: UUID, text: String, similarity: Float, metadata: [String: String] = [:]) {
+        self.id = id
+        self.text = text
+        self.similarity = similarity
+        self.metadata = metadata
+    }
+}
+
+/// User context information
+public struct UserContext: Codable {
+    public var name: String
+    public var role: String?
+    public var company: String?
+    public var facts: [String]
+
+    public init(name: String, role: String? = nil, company: String? = nil, facts: [String] = []) {
+        self.name = name
+        self.role = role
+        self.company = company
+        self.facts = facts
+    }
+}
+
+/// Context bundle for conversation
+public struct ConversationContext {
+    public let recentMessages: [Message]
+    public let relevantHistory: [Message]
+    public let userContext: UserContext?
+    public let timestamp: Date
+
+    public init(recentMessages: [Message], relevantHistory: [Message], userContext: UserContext?, timestamp: Date) {
+        self.recentMessages = recentMessages
+        self.relevantHistory = relevantHistory
+        self.userContext = userContext
+        self.timestamp = timestamp
+    }
+}
+
+/// Memory statistics
+public struct MemoryStatistics {
+    public let totalMessages: Int
+    public let totalEmbeddings: Int
+    public let userContextFacts: Int
+    public let storageSize: Int64
+    public let lastUpdated: Date
+
+    public var storageSizeMB: Double {
+        return Double(storageSize) / (1024 * 1024)
+    }
+}
+
+/// Errors
+public enum MemoryServiceError: Error, LocalizedError {
+    case userContextNotInitialized
+    case embeddingGenerationFailed
+    case storageError(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .userContextNotInitialized:
+            return "User context not initialized"
+        case .embeddingGenerationFailed:
+            return "Failed to generate embeddings"
+        case .storageError(let reason):
+            return "Storage error: \(reason)"
+        }
+    }
+}
+
+/// Search result with conversation context
+public struct ConversationSearchResult {
+    public let conversationId: UUID
+    public let message: Message
+    public let similarity: Float
+    public let snippet: String
+
+    public init(conversationId: UUID, message: Message, similarity: Float, snippet: String) {
+        self.conversationId = conversationId
+        self.message = message
+        self.similarity = similarity
+        self.snippet = snippet
+    }
+}
+
+/// Summary of a conversation
+public struct ConversationSummary {
+    public let conversationId: UUID
+    public let messageCount: Int
+    public let firstMessageDate: Date
+    public let lastMessageDate: Date
+    public let preview: String
+
+    public init(conversationId: UUID, messageCount: Int, firstMessageDate: Date, lastMessageDate: Date, preview: String) {
+        self.conversationId = conversationId
+        self.messageCount = messageCount
+        self.firstMessageDate = firstMessageDate
+        self.lastMessageDate = lastMessageDate
+        self.preview = preview
+    }
+}

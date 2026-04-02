@@ -1,0 +1,14 @@
+{
+  "name": "permission-classifier",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/permissions/classifier.rs",
+  "line_count": 603,
+  "why": "Hard-block vs advisory, context-aware verdicts, git subcommand rules",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

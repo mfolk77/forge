@@ -1,0 +1,3587 @@
+import Foundation
+import CoreGraphics
+import SwiftUI
+import os.log
+
+// DEBUG: File-based logging to trace RTAI query flow (disabled in production)
+private func debugLog(_ message: String) {
+    guard DebugSettings.fileLoggingEnabled else { return }
+    let logPath = NSHomeDirectory() + "/Documents/serena_rtai_debug.log"
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logLine = "[\(timestamp)] \(message)\n"
+    guard let logData = logLine.data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: logPath) {
+        handle.seekToEndOfFile()
+        handle.write(logData)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: logPath, contents: logData)
+    }
+}
+
+/// Sanitize a string for safe inclusion in an FTAI task parameter
+/// Prevents injection by replacing newlines and control characters
+private func sanitizeFTAI(_ value: String) -> String {
+    return value
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\t", with: " ")
+        .trimmingCharacters(in: .whitespaces)
+}
+
+public enum ConversationSortType: String, CaseIterable {
+    case mostRecent = "Most Recent"
+    case oldest = "Oldest"
+    case alphabetical = "Alphabetical"
+    case messageCount = "Message Count"
+}
+
+public struct MessageRelevanceScore {
+    public let message: Message
+    public let score: Double
+}
+
+public struct ContextStatistics {
+    public let totalMessages: Int
+    public let contextMessages: Int
+    public let totalExchanges: Int
+    public let contextExchanges: Int
+    public let compressionRatio: Double
+
+    public var isContextTrimmed: Bool {
+        return totalMessages > contextMessages
+    }
+
+    public var description: String {
+        return "Context: \(contextMessages)/\(totalMessages) messages (\(contextExchanges)/\(totalExchanges) exchanges), compression: \(String(format: "%.2f", compressionRatio))"
+    }
+}
+
+@MainActor
+public class ChatManager: ObservableObject {
+    @Published public var conversations: [Conversation] = []
+    @Published public var currentConversation: Conversation?
+    @Published public var isProcessing: Bool = false
+    @Published public var lastError: SerenaError?
+    @Published public var isAIEngineReady: Bool = false
+    @Published public var streamingResponse: String = ""  // For token-by-token display
+    @Published public var isStreaming: Bool = false  // True while streaming tokens
+
+    /// Three-state thinking mode: Auto (default), Instant, or Deep
+    @Published public var thinkingMode: ThinkingMode = .auto {
+        didSet {
+            // Persist preference
+            UserDefaults.standard.set(thinkingMode.rawValue, forKey: "serena_thinking_mode")
+        }
+    }
+
+    /// Whether Serena is currently engaging extended reasoning (for UI indicator)
+    @Published public var isThinking: Bool = false
+
+    /// Whether to show the daily tool limit banner (set when free user hits 3/day limit)
+    @Published public var showDailyLimitBanner: Bool = false
+
+    /// Whether to show the message limit banner (set when free user hits rolling window limit)
+    @Published public var showMessageLimitBanner: Bool = false
+
+    /// Legacy compatibility - maps to thinkingMode
+    public var thinkingModeEnabled: Bool {
+        get { thinkingMode == .deep }
+        set { thinkingMode = newValue ? .deep : .auto }
+    }
+
+    // MARK: - Pending Image Attachment
+    /// Stores extracted text from a dropped image, waiting for user to add context
+    @Published public var pendingImageAttachment: PendingImageAttachment?
+
+    /// Represents a pending image attachment with extracted OCR text
+    public struct PendingImageAttachment {
+        public let fileName: String
+        public let extractedText: String
+        public let imageURL: URL
+        public let timestamp: Date
+
+        public init(fileName: String, extractedText: String, imageURL: URL) {
+            self.fileName = fileName
+            self.extractedText = extractedText
+            self.imageURL = imageURL
+            self.timestamp = Date()
+        }
+    }
+
+    private let dataStore: DataStoreProtocol
+    private let errorManager: ErrorManager
+    private let voiceManager: VoiceManager
+    private let networkManager: NetworkConnectivityManager
+    private let aiEngine: any AIEngine
+    private let orchestrator: SerenaOrchestrator
+    private let performanceMonitor = PerformanceMonitor.shared
+    private let accessibilityManager = AccessibilityManager.shared
+    private let logger = Logger(subsystem: "com.serenanet.chat", category: "ChatManager")
+
+    // MARK: - Learning System (AKE)
+    /// Learning coordinator for Adaptive Knowledge Engine (System 1: Personal Learning)
+    private var learningCoordinator: LearningCoordinator?
+
+    /// Domain Expansion coordinator for Adaptive Knowledge Engine (System 2: Domain Expansion)
+    private var domainExpansionCoordinator: DomainExpansionCoordinator?
+
+    /// Heuristic pattern detector for real-time learning (System 1 primary path)
+    private let heuristicPatternDetector = HeuristicPatternDetector()
+
+    /// Negative feedback detector (ports from Windows V1.1)
+    private let negativeFeedbackDetector = NegativeFeedbackDetector()
+
+    /// Contradiction detector (ports from Windows V1.1)
+    private let contradictionDetector = ContradictionDetector()
+
+    /// Published learning statistics for UI
+    @Published public var learningStatistics: LearningStatistics?
+
+    /// Published domain expansion statistics for UI
+    @Published public var domainExpansionStatistics: DomainExpansionStatistics?
+
+    // MARK: - Personal Fact Extraction (Cross-Conversation Memory)
+    /// Extracts and persists important personal facts for cross-conversation memory
+    private let personalFactExtractor = PersonalFactExtractor.shared
+
+    /// Facts extracted from the most recent user message, pending LLM confirmation
+    /// Cleared after the LLM generates its response
+    private var pendingFactConfirmations: [ExtractedFact] = []
+
+    // MARK: - JIT Permission Flow
+    /// Pending permission request — set when a tool needs a permission
+    @Published public var pendingPermissionRequest: PermissionRequestFlow.Request?
+    /// Original user message to re-execute after permission is granted
+    public var pendingOriginalMessage: String?
+
+    // MARK: - Screen Context
+    /// Screen OCR context for LLM injection — expires after 120s
+    private var lastScreenContext: (text: String, screenshot: CGImage?, timestamp: Date)?
+
+    // MARK: - Idle-Based Learning
+    /// Messages queued for learning (processed when idle)
+    private var pendingLearningMessages: [Message] = []
+
+    /// Timer for idle-based learning trigger
+    private var learningIdleTask: Task<Void, Never>?
+
+    /// Active learning LLM task — cancelled when user sends a message to free the inference queue
+    private var learningProcessingTask: Task<Void, Never>?
+
+    /// Idle time before triggering learning (30 seconds)
+    private let learningIdleInterval: TimeInterval = 30.0
+
+    // Public convenience initializer for SerenaNet
+    public convenience init() {
+        self.init(dataStore: nil, errorManager: nil, voiceManager: nil, networkManager: nil, aiEngine: nil, configManager: nil)
+    }
+
+    // Internal initializer for dependency injection in tests
+    init(dataStore: DataStoreProtocol? = nil, errorManager: ErrorManager? = nil, voiceManager: VoiceManager? = nil, networkManager: NetworkConnectivityManager? = nil, aiEngine: (any AIEngine)? = nil, configManager: ConfigManager? = nil) {
+        self.errorManager = errorManager ?? ErrorManager()
+        self.voiceManager = voiceManager ?? VoiceManager()
+        self.networkManager = networkManager ?? NetworkConnectivityManager()
+        self.aiEngine = aiEngine ?? MixtralEngine()
+        
+        let config = configManager ?? ConfigManager()
+        self.orchestrator = SerenaOrchestrator(aiEngine: self.aiEngine, configManager: config)
+        
+        if let dataStore = dataStore {
+            self.dataStore = dataStore
+            logger.info("✅ Using injected data store")
+        } else {
+            do {
+                let persistentStore = try DataStore()
+                self.dataStore = persistentStore
+                logger.info("✅ Using persistent data store")
+
+                // Initialize Learning Coordinator with concrete DataStore (System 1)
+                // Disabled until tested — writes to SQLite on every message
+                if FeatureFlags.learningCoordinatorEnabled, let mixtralEngine = self.aiEngine as? MixtralEngine {
+                    self.learningCoordinator = LearningCoordinator(dataStore: persistentStore, llmEngine: mixtralEngine)
+                    logger.info("🧠 Learning coordinator initialized (System 1)")
+
+                    // Initialize Domain Expansion Coordinator (System 2)
+                    if FeatureFlags.system2DomainExpansionEnabled {
+                        let dec = DomainExpansionCoordinator(dataStore: persistentStore, llmEngine: mixtralEngine)
+                        self.domainExpansionCoordinator = dec
+                        logger.info("🌐 Domain expansion coordinator initialized (System 2)")
+                    }
+
+                    // Initialize ProactiveIntegrationBridge BEFORE wiring DEC
+                    // This ensures the bridge's ProactiveCoordinator exists when DEC is configured
+                    if FeatureFlags.proactiveIntelligenceEnabled {
+                        Task { @MainActor in
+                            await ProactiveIntegrationBridge.shared.initialize()
+                            // Now wire DEC if it was created
+                            if let dec = self.domainExpansionCoordinator {
+                                await ProactiveIntegrationBridge.shared.configureDomainExpansion(dec)
+                            }
+                            await ProactiveIntegrationBridge.shared.start()
+                            logger.info("🌉 ProactiveIntegrationBridge initialized and started")
+                        }
+                    }
+                }
+            } catch {
+                logger.error("❌ Failed to initialize persistent DataStore: \(error.localizedDescription)")
+                logger.warning("⚠️ Falling back to in-memory data store - data will NOT be persisted!")
+                self.dataStore = InMemoryDataStore()
+                Task { @MainActor in
+                    self.errorManager.handle(.databaseError(error.localizedDescription), context: "ChatManager initialization")
+                }
+            }
+        }
+
+        // Load saved thinking mode preference
+        if let savedMode = UserDefaults.standard.string(forKey: "serena_thinking_mode"),
+           let mode = ThinkingMode(rawValue: savedMode) {
+            self.thinkingMode = mode
+            logger.info("🧠 Loaded thinking mode: \(mode.displayName)")
+        } else {
+            self.thinkingMode = .instant  // Default to instant — Qwen 3.5 thinking needs validation
+            logger.info("🧠 Using default thinking mode: Instant")
+        }
+
+        // Initialize RTAI system and AI engine
+        Task {
+            await initializeRTAIAndAI()
+        }
+    }
+    
+    // MARK: - AI Engine and RTAI Management
+
+    private func initializeRTAIAndAI() async {
+        logger.info("🚀 ChatManager: Initializing RTAI and AI systems...")
+
+        // First load existing conversations from database
+        logger.info("📂 ChatManager: Loading saved conversations...")
+        await loadConversations()
+        logger.info("✅ ChatManager: Loaded \(self.conversations.count) conversations")
+
+        // Initialize RTAI system
+        let rtaiSuccess = RTAIBridge.initializeShared()
+        if rtaiSuccess {
+            logger.info("✅ ChatManager: RTAI system initialized successfully")
+        } else {
+            logger.error("⚠️ ChatManager: RTAI initialization failed, using fallback responses")
+        }
+
+        // Load custom briefing triggers from user preferences (non-blocking)
+        Task {
+            await IntentDetector.shared.loadCustomBriefingTriggers()
+        }
+
+        // Then initialize AI engine
+        await initializeAIEngine()
+    }
+    
+    private func initializeAIEngine() async {
+        logger.debug("🔍 DEBUG: ChatManager.initializeAIEngine() called")
+        do {
+            logger.debug("🔍 DEBUG: About to call aiEngine.initialize()")
+            try await aiEngine.initialize()
+            logger.debug("🔍 DEBUG: aiEngine.initialize() completed successfully")
+
+            // Update ready state on main actor
+            await MainActor.run {
+                self.isAIEngineReady = self.aiEngine.isReady
+                logger.info("✅ ChatManager: AI engine ready state updated: \(self.isAIEngineReady)")
+            }
+        } catch {
+            logger.error("🔍 DEBUG: aiEngine.initialize() failed with error: \(error)")
+            logger.error("💡 ChatManager: AI engine failed, but RTAI can provide responses")
+            errorManager.handle(.aiModelInitializationFailed(error.localizedDescription), context: "AI engine initialization")
+
+            await MainActor.run {
+                self.isAIEngineReady = false
+            }
+        }
+    }
+    
+    // MARK: - Network Status
+    
+    /// Check if the app is currently offline
+    public var isOffline: Bool {
+        return !networkManager.isConnected
+    }
+    
+    /// Get current network status message
+    public var networkStatusMessage: String {
+        return networkManager.getStatusMessage()
+    }
+    
+    /// Get offline mode guidance
+    public var offlineModeGuidance: String {
+        return networkManager.getOfflineModeGuidance()
+    }
+    
+    /// Access to network manager for UI components
+    public var networkConnectivityManager: NetworkConnectivityManager {
+        return networkManager
+    }
+    
+    // MARK: - Conversation Management
+    
+    public func loadConversations() async {
+        do {
+            conversations = try await dataStore.loadConversations()
+            
+            // Sort conversations by most recent first
+            conversations.sort { $0.updatedAt > $1.updatedAt }
+            
+            // Set current conversation to the most recent one, or create new if none exist
+            if let mostRecent = conversations.first {
+                currentConversation = mostRecent
+            } else {
+                createNewConversation()
+            }
+            
+            lastError = nil
+        } catch {
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Loading conversations")
+            createNewConversation()
+        }
+    }
+    
+    public func createNewConversation() {
+        // Create a new empty conversation without intro message
+        // The intro is shown in the UI (ChatView) when there are no messages
+        let newConversation = Conversation()
+
+        currentConversation = newConversation
+        conversations.insert(newConversation, at: 0)
+
+        // Track conversation count for feedback prompt
+        FeedbackManager.shared.recordConversation()
+
+        // Track for analytics
+        Task { @MainActor in
+            AnalyticsManager.shared.trackConversationStarted()
+        }
+
+        // Save the new conversation
+        Task {
+            do {
+                try await dataStore.saveConversation(newConversation)
+                logger.info("✅ Saved new conversation")
+            } catch {
+                logger.error("❌ Failed to save new conversation: \(error)")
+            }
+        }
+    }
+
+    /// Inject a proactive message from TCA (Temporal Context Awareness)
+    /// This is called when the ProactiveScheduler has a follow-up for the user
+    public func injectProactiveMessage(_ content: String) {
+        guard var conversation = currentConversation else {
+            logger.warning("⚠️ Cannot inject proactive message: no current conversation")
+            return
+        }
+
+        // Create an assistant message with the proactive content
+        let proactiveMessage = Message(content: content, role: .assistant)
+        conversation.messages.append(proactiveMessage)
+        conversation.updatedAt = Date()
+
+        // Update in memory
+        currentConversation = conversation
+        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
+            conversations[index] = conversation
+        }
+
+        // Save asynchronously
+        Task {
+            do {
+                try await dataStore.saveConversation(conversation)
+                logger.info("💭 Injected proactive TCA message into conversation")
+            } catch {
+                logger.error("❌ Failed to save proactive message: \(error)")
+            }
+        }
+    }
+
+    /// Rename a conversation
+    public func renameConversation(_ conversation: Conversation, newTitle: String) async {
+        guard var updatedConversation = conversations.first(where: { $0.id == conversation.id }) else {
+            logger.error("❌ Cannot rename: conversation not found")
+            return
+        }
+
+        let trimmedTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else {
+            logger.error("❌ Cannot rename: empty title")
+            return
+        }
+
+        updatedConversation.title = trimmedTitle
+        updatedConversation.updatedAt = Date()
+
+        // Update in array
+        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
+            conversations[index] = updatedConversation
+        }
+
+        // Update current conversation if it's the same one
+        if currentConversation?.id == conversation.id {
+            currentConversation = updatedConversation
+        }
+
+        // Save to database
+        do {
+            try await dataStore.saveConversation(updatedConversation)
+            logger.info("✅ Renamed conversation to: \(trimmedTitle)")
+        } catch {
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Renaming conversation")
+        }
+    }
+
+    public func selectConversation(_ conversation: Conversation) {
+        guard conversations.contains(where: { $0.id == conversation.id }) else {
+            lastError = SerenaError.conversationNotFound
+            return
+        }
+        currentConversation = conversation
+    }
+    
+    /// Get conversation by ID
+    public func getConversation(id: UUID) -> Conversation? {
+        return conversations.first { $0.id == id }
+    }
+    
+    /// Get the number of conversations
+    public var conversationCount: Int {
+        return conversations.count
+    }
+    
+    /// Check if there are any conversations
+    public var hasConversations: Bool {
+        return !conversations.isEmpty
+    }
+    
+    // MARK: - Search and Filtering
+    
+    /// Search conversations by title or message content
+    public func searchConversations(query: String) -> [Conversation] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmedQuery.isEmpty else { return conversations }
+        
+        return conversations.filter { conversation in
+            // Search in title
+            if conversation.title.lowercased().contains(trimmedQuery) {
+                return true
+            }
+            
+            // Search in message content
+            return conversation.messages.contains { message in
+                message.content.lowercased().contains(trimmedQuery)
+            }
+        }
+    }
+    
+    /// Filter conversations by date range
+    public func filterConversations(from startDate: Date? = nil, to endDate: Date? = nil) -> [Conversation] {
+        return conversations.filter { conversation in
+            if let startDate = startDate, conversation.createdAt < startDate {
+                return false
+            }
+            if let endDate = endDate, conversation.createdAt > endDate {
+                return false
+            }
+            return true
+        }
+    }
+    
+    /// Filter conversations by message count
+    public func filterConversations(minMessages: Int? = nil, maxMessages: Int? = nil) -> [Conversation] {
+        return conversations.filter { conversation in
+            let messageCount = conversation.messages.count
+            if let minMessages = minMessages, messageCount < minMessages {
+                return false
+            }
+            if let maxMessages = maxMessages, messageCount > maxMessages {
+                return false
+            }
+            return true
+        }
+    }
+    
+    /// Get conversations sorted by different criteria
+    public func getSortedConversations(by sortType: ConversationSortType) -> [Conversation] {
+        switch sortType {
+        case .mostRecent:
+            return conversations.sorted { $0.updatedAt > $1.updatedAt }
+        case .oldest:
+            return conversations.sorted { $0.updatedAt < $1.updatedAt }
+        case .alphabetical:
+            return conversations.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .messageCount:
+            return conversations.sorted { $0.messages.count > $1.messages.count }
+        }
+    }
+    
+    /// Get recent conversations (last N conversations)
+    public func getRecentConversations(limit: Int = 10) -> [Conversation] {
+        let sortedConversations = conversations.sorted { $0.updatedAt > $1.updatedAt }
+        return Array(sortedConversations.prefix(limit))
+    }
+    
+    // MARK: - Context Window Management
+    
+    /// Maximum number of exchanges to maintain in context (25 exchanges = 50 messages)
+    private let maxContextExchanges = 25
+    
+    /// Get context messages for AI processing with intelligent trimming
+    public func getContextMessages(for conversation: Conversation) -> [Message] {
+        return getContextMessagesWithRelevanceScoring(conversation: conversation)
+    }
+    
+    /// Get context messages with relevance scoring for better retention
+    private func getContextMessagesWithRelevanceScoring(conversation: Conversation) -> [Message] {
+        let messages = conversation.messages
+        let maxMessages = maxContextExchanges * 2 // Each exchange is user + assistant
+        
+        // If we're within the limit, return all messages
+        if messages.count <= maxMessages {
+            return messages
+        }
+        
+        // Score messages for relevance
+        let scoredMessages = scoreMessagesForRelevance(messages)
+        
+        // Always keep the most recent messages
+        let recentMessages = Array(messages.suffix(maxMessages / 2))
+        
+        // Select additional messages based on relevance scores
+        let remainingSlots = maxMessages - recentMessages.count
+        let olderMessages = Array(messages.dropLast(recentMessages.count))
+        let selectedOlderMessages = selectTopScoredMessages(scoredMessages, from: olderMessages, count: remainingSlots)
+        
+        // Combine and sort by timestamp to maintain conversation flow
+        let contextMessages = (selectedOlderMessages + recentMessages).sorted { $0.timestamp < $1.timestamp }
+        
+        return contextMessages
+    }
+    
+    /// Score messages based on relevance criteria
+    private func scoreMessagesForRelevance(_ messages: [Message]) -> [MessageRelevanceScore] {
+        return messages.map { message in
+            var score: Double = 0.0
+            
+            // Base score for all messages
+            score += 1.0
+            
+            // Higher score for longer messages (more content)
+            let contentLength = Double(message.content.count)
+            score += min(contentLength / 100.0, 3.0) // Cap at 3 points for length
+            
+            // Higher score for messages with questions (user engagement)
+            if message.content.contains("?") {
+                score += 2.0
+            }
+            
+            // Higher score for messages with code or technical terms
+            let technicalTerms = ["func", "class", "struct", "import", "let", "var", "if", "for", "while", "return", "error", "exception"]
+            let technicalTermCount = technicalTerms.reduce(0) { count, term in
+                count + (message.content.lowercased().contains(term) ? 1 : 0)
+            }
+            score += Double(technicalTermCount) * 0.5
+            
+            // Higher score for assistant messages that provide explanations
+            if message.role == .assistant {
+                if message.content.contains("because") || message.content.contains("explanation") || message.content.contains("example") {
+                    score += 1.5
+                }
+            }
+            
+            // Recency bonus (more recent messages get higher scores)
+            let timeSinceMessage = Date().timeIntervalSince(message.timestamp)
+            let recencyBonus = max(0, 2.0 - (timeSinceMessage / 3600.0)) // Bonus decreases over hours
+            score += recencyBonus
+            
+            return MessageRelevanceScore(message: message, score: score)
+        }
+    }
+    
+    /// Select top scored messages from a collection
+    private func selectTopScoredMessages(_ scoredMessages: [MessageRelevanceScore], from messages: [Message], count: Int) -> [Message] {
+        let relevantScores = scoredMessages.filter { scoredMessage in
+            messages.contains { $0.id == scoredMessage.message.id }
+        }
+        
+        let sortedByScore = relevantScores.sorted { $0.score > $1.score }
+        let selectedScores = Array(sortedByScore.prefix(count))
+        
+        return selectedScores.map { $0.message }
+    }
+    
+    /// Trim conversation context when it exceeds limits
+    public func trimConversationContext(_ conversation: inout Conversation) {
+        let maxTotalMessages = maxContextExchanges * 4 // Allow 2x the context limit before trimming
+        
+        if conversation.messages.count > maxTotalMessages {
+            // Keep the most recent messages and some high-relevance older messages
+            let recentMessages = Array(conversation.messages.suffix(maxTotalMessages / 2))
+            let olderMessages = selectHighRelevanceMessages(from: conversation.messages, excluding: recentMessages, count: maxTotalMessages / 2)
+            let trimmedMessages = recentMessages + olderMessages
+            
+            conversation.messages = trimmedMessages.sorted { $0.timestamp < $1.timestamp }
+        }
+    }
+    
+    /// Select high relevance messages excluding already selected ones
+    private func selectHighRelevanceMessages(from messages: [Message], excluding excludedMessages: [Message], count: Int) -> [Message] {
+        let excludedIds = Set(excludedMessages.map { $0.id })
+        let candidateMessages = messages.filter { !excludedIds.contains($0.id) }
+        
+        let scoredMessages = scoreMessagesForRelevance(candidateMessages)
+        let sortedByScore = scoredMessages.sorted { $0.score > $1.score }
+        let selectedScores = Array(sortedByScore.prefix(count))
+        
+        return selectedScores.map { $0.message }
+    }
+    
+    /// Get context statistics for debugging/monitoring
+    public func getContextStatistics(for conversation: Conversation) -> ContextStatistics {
+        let totalMessages = conversation.messages.count
+        let contextMessages = getContextMessages(for: conversation)
+        let contextSize = contextMessages.count
+        let exchanges = totalMessages / 2
+        let contextExchanges = contextSize / 2
+        
+        return ContextStatistics(
+            totalMessages: totalMessages,
+            contextMessages: contextSize,
+            totalExchanges: exchanges,
+            contextExchanges: contextExchanges,
+            compressionRatio: totalMessages > 0 ? Double(contextSize) / Double(totalMessages) : 1.0
+        )
+    }
+    
+    // MARK: - Voice Input
+    
+    /// Access to the voice manager for UI components
+    var voiceInputManager: VoiceManager {
+        return self.voiceManager
+    }
+    
+    /// Start voice input and return transcription when complete
+    public func startVoiceInput() async throws -> String {
+        do {
+            // Validate that voice recognition can proceed offline
+            try networkManager.validateOfflineOperation(.voiceRecognition)
+            
+            // Request permissions if needed
+            if voiceManager.permissionStatus != .authorized {
+                let granted = await voiceManager.requestPermissions()
+                if !granted {
+                    throw SerenaError.voicePermissionDenied
+                }
+            }
+            
+            // Start recording
+            try await voiceManager.startRecording()
+            
+            // Wait for user to stop recording (this would be handled by UI)
+            // For now, we'll return empty string as this method is meant to be called by UI
+            return ""
+        } catch {
+            if let serenaError = error as? SerenaError {
+                lastError = serenaError
+                errorManager.handle(serenaError, context: "Starting voice input")
+                throw serenaError
+            } else {
+                let serenaError = SerenaError.voiceRecognitionFailed(error.localizedDescription)
+                lastError = serenaError
+                errorManager.handle(serenaError, context: "Starting voice input")
+                throw serenaError
+            }
+        }
+    }
+    
+    /// Stop voice input and process the transcription
+    public func stopVoiceInput() async throws -> String {
+        let transcription = await voiceManager.stopRecording()
+        
+        if !transcription.isEmpty {
+            // Automatically send the transcribed message
+            await sendMessage(transcription)
+        }
+        
+        return transcription
+    }
+    
+    /// Send a voice message (transcription + send)
+    public func sendVoiceMessage() async throws {
+        do {
+            let transcription = try await stopVoiceInput()
+            if transcription.isEmpty {
+                throw SerenaError.emptyMessage
+            }
+        } catch {
+            throw error
+        }
+    }
+    
+    /// Check if voice input is available
+    public var isVoiceInputAvailable: Bool {
+        return voiceManager.permissionStatus == .authorized
+    }
+    
+    /// Check if currently recording voice
+    public var isRecordingVoice: Bool {
+        return voiceManager.isRecording
+    }
+    
+    // MARK: - Message Handling
+
+    public func sendMessage(_ text: String) async {
+        debugLog("📨 ChatManager.sendMessage: ENTRY with text: '\(text)'")
+        logger.debug("🔄 ChatManager.sendMessage: Starting with text: '\(text)'")
+        SessionLogger.shared.separator()
+        SessionLogger.shared.userMessage(text)
+
+        // Set processing flag EARLY so typing indicator shows immediately
+        isProcessing = true
+        streamingResponse = ""  // Clear any previous streaming response
+
+        // CRITICAL: Yield immediately to allow SwiftUI to render the typing indicator
+        // Without this, the UI won't update until the first await in the method
+        await Task.yield()
+
+        // Handle special diagnostic commands
+        // Admin commands available in all builds (password protected)
+        // Debug commands only in DEBUG builds
+        if await handleDebugCommand(text) {
+            isProcessing = false  // Reset flag for command handling
+            return
+        }
+
+        // Check for pending image attachment and combine with user message
+        var finalText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let attachment = pendingImageAttachment {
+            // Combine image context with user's message
+            let imageContext = "[Image: \(attachment.fileName)]\nExtracted text:\n\(attachment.extractedText)"
+            if finalText.isEmpty {
+                finalText = imageContext
+            } else {
+                finalText = "\(imageContext)\n\nUser context: \(finalText)"
+            }
+            // Clear the pending attachment
+            await MainActor.run { self.pendingImageAttachment = nil }
+            logger.info("📎 Combined pending image with user message")
+        }
+
+        let trimmedText = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            logger.error("❌ ChatManager.sendMessage: Empty message")
+            lastError = SerenaError.emptyMessage
+            isProcessing = false  // Reset flag for empty message
+            return
+        }
+
+        // Track message sent for analytics
+        Task { @MainActor in
+            AnalyticsManager.shared.trackMessageSent()
+
+            // Fire first_message_sent exactly once per install
+            if !UserDefaults.standard.bool(forKey: "HasSentFirstMessage") {
+                UserDefaults.standard.set(true, forKey: "HasSentFirstMessage")
+                AnalyticsManager.shared.track("first_message_sent")
+            }
+        }
+
+        logger.debug("🔄 ChatManager.sendMessage: Checking conversation...")
+        // Ensure we have a current conversation
+        if currentConversation == nil {
+            logger.debug("🔄 ChatManager.sendMessage: Creating new conversation")
+            createNewConversation()
+        }
+        
+        guard var conversation = currentConversation else {
+            logger.error("❌ ChatManager.sendMessage: No conversation available")
+            lastError = SerenaError.conversationNotFound
+            isProcessing = false  // Reset flag when no conversation
+            return
+        }
+        
+        logger.debug("🔄 ChatManager.sendMessage: Conversation found: \(conversation.id)")
+        
+        do {
+            logger.debug("🔄 ChatManager.sendMessage: Adding user message...")
+            // Add user message
+            let userMessage = Message(content: trimmedText, role: .user)
+            conversation.addMessage(userMessage)
+            currentConversation = conversation
+
+            // Track interaction for relationship progression (disabled until personality tested)
+            if FeatureFlags.personalityEnabled {
+                RelationshipTracker.shared.recordInteraction()
+            }
+            
+            logger.debug("🔄 ChatManager.sendMessage: Updating conversation array...")
+            // Update conversations array
+            updateConversationInArray(conversation)
+            
+            logger.debug("🔄 ChatManager.sendMessage: Saving conversation...")
+            // Save conversation
+            try await dataStore.saveConversation(conversation)
+
+            // Queue message for idle-based learning (avoids competing with AI response)
+            queueMessageForLearning(userMessage)
+
+            // PRE-LLM fact extraction: catch explicit "remember" commands immediately
+            // These shouldn't depend on the model emitting <serena_facts> — store now
+            let preLLMFacts = await personalFactExtractor.extractAndSave(from: trimmedText)
+            if !preLLMFacts.isEmpty {
+                logger.info("💾 Pre-LLM fact extraction stored \(preLLMFacts.count) fact(s)")
+                SessionLogger.shared.log("FACTS", "Pre-LLM extracted \(preLLMFacts.count) fact(s) from: \(trimmedText.prefix(80))")
+                pendingFactConfirmations = preLLMFacts
+            }
+
+            // Extract and save personal facts for cross-conversation memory
+            // Runs before AI response so we can inject confirmation directives into the LLM prompt
+            let messageToExtract = trimmedText
+
+            // Real-time negative feedback detection (AKE System 1)
+            // Runs before correction flow so pure rejections can delete facts directly
+            if FeatureFlags.learningCoordinatorEnabled {
+                let recentKeys = pendingFactConfirmations.map { $0.fact }
+                if let feedback = await negativeFeedbackDetector.detect(in: messageToExtract, recentFactKeys: recentKeys) {
+                    logger.info("👎 Negative feedback detected (\(String(describing: feedback.severity))): \(feedback.matchedPattern)")
+                    SessionLogger.shared.negativeFeedback(severity: String(describing: feedback.severity), pattern: feedback.matchedPattern)
+                    // Pure rejection = delete recent facts; correction = let correction flow handle it
+                    if await negativeFeedbackDetector.isPureRejection(messageToExtract) {
+                        for fact in pendingFactConfirmations {
+                            let _ = await UserFTAIManager.shared.deleteExtractedFact(
+                                fact.fact, category: fact.category
+                            )
+                        }
+                        pendingFactConfirmations = []
+                        logger.info("🗑️ Deleted \(recentKeys.count) fact(s) from pure rejection")
+                        AnalyticsManager.shared.track("memory_fact_rejected")
+                    }
+                }
+            }
+
+            // Check for corrections to previously stored facts
+            // If no pending confirmations, check RTAI-stored facts for correction targets
+            var correctionTargets = pendingFactConfirmations
+            if correctionTargets.isEmpty {
+                // Load stored user facts so corrections work across sessions
+                let storedFacts = await UserFTAIManager.shared.getAllFacts()
+                correctionTargets = storedFacts.map { fact in
+                    ExtractedFact(fact: "User's \(fact.key) is \(fact.value)", category: fact.category, priority: 10)
+                }
+            }
+            if !correctionTargets.isEmpty {
+                let corrections = await PersonalFactExtractor.shared.detectCorrection(
+                    in: messageToExtract,
+                    recentFacts: correctionTargets
+                )
+                if !corrections.isEmpty {
+                    var newConfirmations: [ExtractedFact] = []
+                    for correction in corrections {
+                        // Delete the incorrect fact (use deleteExtractedFact to parse the key properly)
+                        let _ = await UserFTAIManager.shared.deleteExtractedFact(
+                            correction.originalFact.fact,
+                            category: correction.originalFact.category
+                        )
+                        // Store corrected fact if a new value was provided
+                        if !correction.correctedValue.isEmpty {
+                            let correctedFact = correction.originalFact.fact
+                                .replacingOccurrences(of: "is \\w+$", with: "is \(correction.correctedValue)", options: .regularExpression)
+                            await UserFTAIManager.shared.addExtractedFact(
+                                correctedFact,
+                                category: correction.originalFact.category,
+                                priority: correction.originalFact.priority
+                            )
+                            newConfirmations.append(ExtractedFact(
+                                fact: correctedFact,
+                                category: correction.originalFact.category,
+                                priority: correction.originalFact.priority
+                            ))
+                        }
+                        #if DEBUG
+                        print("🔄 [PersonalFacts] Corrected fact: \(correction.originalFact.fact) → \(correction.correctedValue)")
+                        #endif
+                        SessionLogger.shared.correctionApplied(old: correction.originalFact.fact, new: correction.correctedValue)
+                    }
+                    pendingFactConfirmations = newConfirmations
+                    AnalyticsManager.shared.track("memory_fact_corrected")
+                } else {
+                    // No correction — previous facts were implicitly confirmed
+                    AnalyticsManager.shared.track("memory_fact_confirmed")
+                    pendingFactConfirmations = []
+                }
+            }
+
+            // Fact extraction moved to post-response: the LLM handles semantic understanding
+            // after it finishes generating the user's response. See extractFactsWithLLM().
+
+            // TCA: Track future events for proactive follow-ups
+            // Also check if user mentioned outcome of a tracked event
+            Task {
+                // Check if user mentioned outcome of something we're tracking
+                await ConversationEventTracker.shared.checkForOutcomeMention(trimmedText)
+
+                // Check if this message mentions a future event to track
+                if let result = await ConversationEventTracker.shared.analyzeAndTrack(message: trimmedText) {
+                    #if DEBUG
+                    print("📅 [TCA] Tracking event: '\(result.event.topic)' for follow-up on \(result.event.followUpDate)")
+                    #endif
+                }
+            }
+
+            // Analytics: Track morning briefing engagement
+            // If user sends a message after a briefing, they engaged with it
+            trackBriefingEngagementIfApplicable(conversation: conversation)
+
+            // Check message rate limit for free users before MLX inference
+            let messageCheck = SubscriptionService.shared.canSendMessage()
+            if !messageCheck.allowed {
+                logger.info("🚫 Message limit reached: \(messageCheck.reason ?? "limit hit")")
+                let limitMessage = Message(
+                    content: messageCheck.reason ?? "You've reached your daily message limit. Upgrade to Serena Plus for unlimited messages.",
+                    role: .assistant
+                )
+                conversation.addMessage(limitMessage)
+                currentConversation = conversation
+                updateConversationInArray(conversation)
+                try await dataStore.saveConversation(conversation)
+                showMessageLimitBanner = true
+                isProcessing = false
+                isStreaming = false
+                AnalyticsManager.shared.track("message_limit_reached", properties: [
+                    "messages_in_window": "\(SubscriptionService.shared.messagesInWindow)"
+                ])
+                return
+            }
+
+            // Record this message against the rolling window
+            SubscriptionService.shared.recordMessageSent()
+
+            logger.debug("🔄 ChatManager.sendMessage: About to generate AI response...")
+            // Generate AI response
+            await generateAIResponse()
+            
+            logger.debug("✅ ChatManager.sendMessage: Completed successfully")
+            lastError = nil
+        } catch {
+            logger.error("❌ ChatManager.sendMessage: Error: \(error)")
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Sending message")
+            isProcessing = false  // Reset flag on error
+            isStreaming = false
+            streamingResponse = ""
+        }
+    }
+    
+    /// Add a message to the current conversation without triggering AI response
+    public func addMessage(_ message: Message) async {
+        guard var conversation = currentConversation else {
+            createNewConversation()
+            guard var conversation = currentConversation else { return }
+            conversation.addMessage(message)
+            currentConversation = conversation
+            updateConversationInArray(conversation)
+            await saveCurrentConversation()
+            return
+        }
+        
+        conversation.addMessage(message)
+        currentConversation = conversation
+        updateConversationInArray(conversation)
+        await saveCurrentConversation()
+    }
+    
+    /// Get message count for current conversation
+    public var currentMessageCount: Int {
+        return currentConversation?.messages.count ?? 0
+    }
+    
+    /// Get the last message from current conversation
+    public var lastMessage: Message? {
+        return currentConversation?.lastMessage
+    }
+    
+    private func generateAIResponse() async {
+        debugLog("🤖 ChatManager.generateAIResponse: ENTRY")
+        logger.debug("🤖 ChatManager.generateAIResponse: Starting...")
+        guard var conversation = currentConversation else {
+            logger.error("❌ generateAIResponse: No current conversation")
+            return
+        }
+
+        logger.debug("🤖 generateAIResponse: Setting isProcessing = true")
+        isProcessing = true
+        streamingResponse = ""  // Reset streaming response
+        isStreaming = true  // Start streaming mode
+
+        // Cancel any background learning LLM work to free the inference queue for user
+        if let task = learningProcessingTask {
+            task.cancel()
+            learningProcessingTask = nil
+            logger.info("🧠 Cancelled background learning task — user inference takes priority")
+        }
+
+        // TIMING: Track where delays occur
+        let aiStartTime = Date()
+        #if DEBUG
+        print("⏱️ [TIMING] generateAIResponse started")
+        #endif
+
+        do {
+            // Validate that AI inference can proceed (should always work offline)
+            try networkManager.validateOfflineOperation(.aiInference)
+            #if DEBUG
+            print("⏱️ [TIMING] Network validation: \(String(format: "%.2f", Date().timeIntervalSince(aiStartTime)))s")
+            #endif
+
+            // Get context messages for AI processing
+            var contextMessages = getContextMessages(for: conversation)
+            #if DEBUG
+            print("⏱️ [TIMING] Context messages: \(String(format: "%.2f", Date().timeIntervalSince(aiStartTime)))s (\(contextMessages.count) messages)")
+            #endif
+
+            // Get the last user message
+            guard let lastUserMessage = conversation.messages.last?.content else {
+                throw SerenaError.emptyMessage
+            }
+
+            logger.debug("🤖 generateAIResponse: About to generate response for: '\(lastUserMessage)'")
+
+            // TCA: Record user interaction for behavioral learning
+            let anticipatoryEngine = AnticipatoryEngine.shared
+            anticipatoryEngine.recordUserAction(
+                categorizeUserAction(lastUserMessage),
+                context: ["hour": "\(Calendar.current.component(.hour, from: Date()))"]
+            )
+
+            // TCA: Check for follow-up requests (e.g., "follow up in 3 days")
+            checkForFollowUpRequest(lastUserMessage)
+
+            // INTENT DETECTION: Check if user wants an action (before LLM call)
+            // This doesn't touch memory/context - just detects and executes actions
+            if FeatureFlags.toolCallingEnabled {
+                if let intent = IntentDetector.shared.detectIntent(from: lastUserMessage) {
+                    logger.info("🎯 Intent detected: \(intent)")
+                    SessionLogger.shared.intentDetected("\(intent)")
+                    let actionResult = await executeIntent(intent)
+                    if let result = actionResult {
+                        // Action was executed - create response with result
+                        let actionResponse = Message(content: result, role: .assistant)
+                        conversation.addMessage(actionResponse)
+                        currentConversation = conversation
+                        updateConversationInArray(conversation)
+                        try await dataStore.saveConversation(conversation)
+
+                        // System 2: Feed web search queries to Domain Expansion
+                        // When IntentDetector routes to web search, the LLM is bypassed
+                        // so the normal confidence check never fires. Feed the query directly
+                        // so System 2 can detect knowledge gaps and build domain knowledge.
+                        if case .webSearch(let query) = intent,
+                           let expansionCoordinator = domainExpansionCoordinator,
+                           FeatureFlags.system2DomainExpansionEnabled {
+                            Task.detached { [logger] in
+                                await expansionCoordinator.logLowConfidenceQuery(
+                                    query: query,
+                                    response: result,
+                                    confidence: 0.3  // Web search fallback = low model confidence
+                                )
+                                logger.info("🌐 System 2: Web search query fed to domain expansion: '\(query.prefix(50))'")
+                            }
+                        }
+
+                        isProcessing = false
+                        isStreaming = false
+                        streamingResponse = ""
+                        logger.info("✅ Action executed successfully")
+                        return  // Skip LLM call - action was handled
+                    }
+                }
+            }
+
+            // SCREEN CONTEXT INJECTION: If we have recent screen data, inject it into the LLM context
+            // NOTE: We inject into contextMessages (ephemeral), NOT conversation.messages (persistent/UI)
+            // VLM: Also pass the raw screenshot to MLXEngine for native vision inference
+            if let screenCtx = lastScreenContext,
+               Date().timeIntervalSince(screenCtx.timestamp) < 120 {
+                let age = Int(Date().timeIntervalSince(screenCtx.timestamp))
+                let truncated = String(screenCtx.text.prefix(3000))
+                let contextNote = "[Screen Context] The user's screen currently shows (captured \(age)s ago):\n\(truncated)"
+                let screenMessage = Message(content: contextNote, role: .user)
+                contextMessages.insert(screenMessage, at: max(0, contextMessages.count - 1))
+
+                // Pass raw screenshot to MLXEngine for VLM inference (one-shot, auto-clears)
+                // OCR text is still injected above as fallback context
+                if let screenshot = screenCtx.screenshot,
+                   let mixtralEngine = aiEngine as? MixtralEngine,
+                   let mlx = mixtralEngine.mlxEngine {
+                    mlx.pendingScreenImage = screenshot
+                    logger.info("🖼️ Passed screen image to MLXEngine for VLM (\(screenshot.width)x\(screenshot.height))")
+                }
+
+                logger.info("🖥️ Injected screen context into LLM (\(truncated.count) chars, \(age)s old)")
+            }
+
+            // RTAI: Check if RTAI should handle this query (structured/deterministic responses)
+            // RTAI handles medical protocols, structured tasks, etc. with high confidence
+            debugLog("🔍 ChatManager: About to call RTAIManager.isRTAITask for: '\(lastUserMessage.prefix(50))'")
+            #if DEBUG
+            print("⏱️ [TIMING] Pre-RTAI check: \(String(format: "%.2f", Date().timeIntervalSince(aiStartTime)))s")
+            #endif
+            if RTAIManager.shared.isRTAITask(lastUserMessage) {
+                debugLog("✅ ChatManager: isRTAITask returned TRUE")
+                logger.info("⚡ RTAI routing enabled - attempting RTAI processing")
+                SessionLogger.shared.rtaiResult(query: lastUserMessage, found: true)
+                do {
+                    let rtaiResponse = try await RTAIManager.shared.handle(lastUserMessage)
+                    logger.info("✅ RTAI handled query successfully")
+
+                    // RTAI response - create message and return
+                    let rtaiMessage = Message(content: rtaiResponse, role: .assistant)
+                    conversation.addMessage(rtaiMessage)
+                    currentConversation = conversation
+                    updateConversationInArray(conversation)
+                    try await dataStore.saveConversation(conversation)
+                    isProcessing = false
+                    isStreaming = false
+                    streamingResponse = rtaiResponse
+                    return  // Skip LLM call - RTAI handled it
+                } catch {
+                    // Low confidence or error - fall through to LLM
+                    logger.info("🔄 RTAI confidence too low, falling back to LLM: \(error.localizedDescription)")
+                    debugLog("🔄 ChatManager: RTAI threw error: \(error.localizedDescription)")
+                }
+            } else {
+                debugLog("❌ ChatManager: isRTAITask returned FALSE")
+            }
+
+            // RTAI-MISS FALLBACK: If RTAI didn't handle it and it's a knowledge question,
+            // try web search before falling through to LLM (which may hallucinate)
+            if FeatureFlags.webSearchEnabled && IntentDetector.shared.isKnowledgeQuestion(lastUserMessage) {
+                logger.info("🔎 RTAI-miss fallback: knowledge question detected, trying web search")
+                SessionLogger.shared.intentDetected("webSearch_fallback(\(lastUserMessage.prefix(60)))")
+                let searchExecutor = RealToolExecutor.shared
+                let ftaiTask = "task: web_search\nquery: \(lastUserMessage)"
+                if let result = try? await searchExecutor.execute(ftaiTask), result.success, !result.output.isEmpty {
+                    let searchResponse = Message(content: "🔎 \(result.output)", role: .assistant)
+                    conversation.addMessage(searchResponse)
+                    currentConversation = conversation
+                    updateConversationInArray(conversation)
+                    try await dataStore.saveConversation(conversation)
+                    isProcessing = false
+                    isStreaming = false
+                    streamingResponse = "🔎 \(result.output)"
+                    SessionLogger.shared.log("WEBSEARCH", "fallback succeeded for: \(lastUserMessage.prefix(60))")
+                    return  // Web search handled it
+                } else {
+                    SessionLogger.shared.log("WEBSEARCH", "fallback returned no results, falling through to LLM")
+                }
+            }
+
+            // Generate AI response using SerenaOrchestrator with streaming
+            debugLog("🤖 ChatManager: Proceeding to LLM inference")
+            SessionLogger.shared.llmStarted()
+            #if DEBUG
+            print("⏱️ [TIMING] Pre-LLM inference: \(String(format: "%.2f", Date().timeIntervalSince(aiStartTime)))s")
+            #endif
+            logger.debug("🤖 generateAIResponse: Calling orchestrator.processInputStreaming with context: \(contextMessages.count) messages")
+
+            // Determine thinking behavior based on mode
+            // Instant = always /no_think (force quick)
+            // Auto = detector decides: simple → /no_think, complex → think
+            // Deep = never /no_think (force thinking)
+            let suppressThinking: Bool
+            switch self.thinkingMode {
+            case .instant:
+                suppressThinking = true
+            case .auto:
+                // Use complexity detector - simple queries get /no_think
+                suppressThinking = !QueryComplexityDetector.requiresReasoning(lastUserMessage)
+            case .deep:
+                suppressThinking = false
+            }
+            logger.info("🧠 Thinking mode: \(self.thinkingMode.rawValue), suppressThinking=\(suppressThinking)")
+            #if DEBUG
+            print("🧠 [ChatManager] mode=\(self.thinkingMode.rawValue), query='\(lastUserMessage.prefix(30))', suppressThinking=\(suppressThinking)")
+            #endif
+
+            // Update thinking indicator for UI
+            self.isThinking = !suppressThinking
+
+            // Configure MLXEngine thinking behavior
+            if let mixtralEngine = aiEngine as? MixtralEngine {
+                mixtralEngine.suppressThinking = suppressThinking
+            }
+
+            var responseText = ""
+            let toolParser = ToolCallParser.shared  // Create parser early for real-time cleanup
+
+            // Inject fact confirmation directive into MLXEngine for this response only
+            if !pendingFactConfirmations.isEmpty {
+                let directive = FactConfirmationDirective.generate(for: pendingFactConfirmations)
+                if !directive.isEmpty, let mixtralEngine = aiEngine as? MixtralEngine {
+                    mixtralEngine.pendingFactDirective = directive
+                }
+            }
+
+            // Try streaming first, fall back to non-streaming
+            do {
+                var tokenCount = 0
+                let streamStartTime = Date()
+                logger.debug("🌊 Starting to receive streaming tokens...")
+
+                for try await token in orchestrator.processInputStreaming(lastUserMessage, context: contextMessages) {
+                    responseText += token
+                    tokenCount += 1
+
+                    // Log first token timing
+                    if tokenCount == 1 {
+                        let ttft = Date().timeIntervalSince(streamStartTime)
+                        let totalTTFT = Date().timeIntervalSince(aiStartTime)
+                        logger.info("⏱️ FIRST TOKEN received after \(String(format: "%.2f", ttft))s (stream) / \(String(format: "%.2f", totalTTFT))s (total)")
+                        #if DEBUG
+                        print("⏱️ [TIMING] FIRST TOKEN: stream=\(String(format: "%.2f", ttft))s, total=\(String(format: "%.2f", totalTTFT))s")
+                        #endif
+                    }
+
+                    // Clean response in real-time so UI never shows raw JSON/artifacts
+                    // But show thinking blocks formatted nicely so users see activity
+                    var displayText = toolParser.removeToolCalls(from: responseText)
+
+                    // DYNAMIC DETECTION: Update isThinking based on actual model output
+                    // This handles the case where /no_think doesn't work with MLX Qwen3
+                    // Set isThinking=true when we see <think>, false when we see </think>
+                    if responseText.contains("<think>") && !responseText.contains("</think>") {
+                        if !self.isThinking {
+                            self.isThinking = true
+                            #if DEBUG
+                            print("🧠 [DYNAMIC] Detected <think> in stream - showing thinking indicator")
+                            #endif
+                        }
+                    } else if responseText.contains("</think>") && self.isThinking {
+                        self.isThinking = false
+                        #if DEBUG
+                        print("🧠 [DYNAMIC] Detected </think> in stream - hiding thinking indicator")
+                        #endif
+                    }
+
+                    // Strip thinking blocks from display — user sees isThinking indicator in UI instead
+                    // Show only the post-thinking answer, not raw reasoning
+                    if let thinkRegex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: []) {
+                        let range = NSRange(displayText.startIndex..., in: displayText)
+                        displayText = thinkRegex.stringByReplacingMatches(in: displayText, options: [], range: range, withTemplate: "")
+                    }
+                    // Handle incomplete thinking block (still streaming) — hide everything after <think>
+                    if let thinkStart = displayText.range(of: "<think>") {
+                        displayText = String(displayText[displayText.startIndex..<thinkStart.lowerBound])
+                    }
+
+                    // Safety net: Strip plain-text thinking that Qwen 3.5 outputs without <think> tags
+                    // Model sometimes outputs "Thinking Process:\n1. **Analyze..." as regular content
+                    // During streaming, returns empty while reasoning is in progress (answer not yet generated)
+                    let beforeStrip = displayText
+                    displayText = Self.stripPlainTextThinking(displayText)
+
+                    // If stripping removed everything, model is still reasoning — show thinking indicator
+                    if displayText.isEmpty && !beforeStrip.isEmpty {
+                        if !self.isThinking {
+                            self.isThinking = true
+                            #if DEBUG
+                            print("🧠 [DYNAMIC] Plain-text reasoning detected in stream - showing thinking indicator")
+                            #endif
+                        }
+                    } else if !displayText.isEmpty && self.isThinking && displayText != beforeStrip {
+                        // Answer appeared after reasoning was stripped — hide thinking indicator
+                        self.isThinking = false
+                        #if DEBUG
+                        print("🧠 [DYNAMIC] Answer emerged after reasoning - hiding thinking indicator")
+                        #endif
+                    }
+
+                    // Strip <serena_facts> block from display (model learning — not for user)
+                    if let factsStart = displayText.range(of: "<serena_facts>") {
+                        displayText = String(displayText[displayText.startIndex..<factsStart.lowerBound])
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+
+                    streamingResponse = displayText
+
+                    // Yield to allow SwiftUI to process UI updates
+                    await Task.yield()
+                }
+
+                let totalTime = Date().timeIntervalSince(streamStartTime)
+                logger.info("🌊 Streaming complete: \(tokenCount) tokens in \(String(format: "%.2f", totalTime))s")
+                #if DEBUG
+                print("🌊 Streaming: \(tokenCount) tokens in \(String(format: "%.2f", totalTime))s")
+                #endif
+            } catch {
+                // Fall back to non-streaming if streaming fails
+                logger.warning("⚠️ Streaming failed, falling back to non-streaming: \(error)")
+                responseText = try await orchestrator.processInput(lastUserMessage, context: contextMessages)
+                var displayText = toolParser.removeToolCalls(from: responseText)
+                // Strip thinking blocks from display — only show the answer
+                if let thinkRegex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: []) {
+                    let range = NSRange(displayText.startIndex..., in: displayText)
+                    displayText = thinkRegex.stringByReplacingMatches(in: displayText, options: [], range: range, withTemplate: "")
+                }
+                // Safety net: Strip plain-text thinking
+                displayText = Self.stripPlainTextThinking(displayText)
+                // Strip <serena_facts> block from display
+                if let factsStart = displayText.range(of: "<serena_facts>") {
+                    displayText = String(displayText[displayText.startIndex..<factsStart.lowerBound])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                streamingResponse = displayText
+            }
+
+            isStreaming = false  // Streaming complete
+            isThinking = false   // Thinking complete
+            logger.debug("🤖 generateAIResponse: Generated response (\(responseText.count) chars): '\(responseText.prefix(100))...'")
+            SessionLogger.shared.llmResponse(responseText, tokenCount: responseText.split(separator: " ").count, duration: Date().timeIntervalSince(aiStartTime))
+            #if DEBUG
+            print(responseText)
+            #endif
+
+            // V1: Tool calling is disabled via feature flag for stability
+            // When disabled, we sanitize the response to remove any tool artifacts
+            if FeatureFlags.toolCallingEnabled {
+                // Parse and execute tool calls (V1.1+ when re-enabled)
+                let toolCalls = toolParser.parseToolCalls(from: responseText)
+
+                if !toolCalls.isEmpty {
+                    logger.debug("🔧 generateAIResponse: Found \(toolCalls.count) tool call(s)")
+
+                    let toolExecutor = RealToolExecutor.shared
+                    var lookupResults: [String] = []
+
+                    for toolCall in toolCalls {
+                        #if DEBUG
+                        print("🔧 Executing tool: \(toolCall.tool) action: \(toolCall.action ?? "none")")
+                        #endif
+
+                        do {
+                            let toolResult = try await toolExecutor.execute(toolCall.ftaiTask)
+
+                            // Check if tool requires upgrade (daily limit reached)
+                            if toolResult.requiresUpgrade {
+                                let upgradeMessage = """
+                                🔒 **Daily Tool Limit Reached**
+
+                                You've used your 3 free tool calls for today.
+
+                                Upgrade to Serena Plus ($20/month) for:
+                                • Unlimited tool calls
+                                • Proactive AI (TCA) - Serena reaches out to YOU
+                                • 7-day free trial available
+
+                                Your limit resets at midnight.
+                                """
+                                responseText = upgradeMessage
+                                streamingResponse = upgradeMessage
+
+                                // Trigger the daily limit banner overlay
+                                showDailyLimitBanner = true
+
+                                logger.warning("🔒 Tool gated - user needs upgrade: \(toolCall.tool)")
+                                break  // Stop processing more tools
+                            }
+
+                            // Handle JIT permission requests
+                            if let needed = toolResult.permissionNeeded {
+                                let request = PermissionRequestFlow.buildRequest(for: needed)
+                                responseText = request.message
+                                streamingResponse = request.message
+                                pendingPermissionRequest = request
+                                pendingOriginalMessage = lastUserMessage
+                                logger.info("Permission requested: \(needed.rawValue) for tool \(toolCall.tool)")
+                                break
+                            }
+
+                            if let denied = toolResult.permissionDenied {
+                                let message = PermissionRequestFlow.previouslyDeniedMessage(for: denied)
+                                responseText += "\n\n" + message
+                                streamingResponse = toolParser.removeToolCalls(from: responseText)
+                                logger.info("Permission denied: \(denied.rawValue) for tool \(toolCall.tool)")
+                                break
+                            }
+
+                            // Check if this is a lookup-type tool that needs follow-up generation
+                            let isLookupTool = toolCall.tool == "memory" && toolCall.action == "lookup"
+
+                            if isLookupTool && !toolResult.output.isEmpty {
+                                // Collect lookup results for follow-up generation
+                                lookupResults.append(toolResult.output)
+                                logger.debug("🔍 Lookup tool result collected: \(toolResult.output.prefix(100))")
+                            } else if toolResult.success {
+                                // Successful tool — show result or confirmation
+                                let output = toolResult.output.isEmpty ? "Action completed." : toolResult.output
+                                responseText += "\n\n✅ " + output
+                                streamingResponse = toolParser.removeToolCalls(from: responseText)
+                                logger.debug("✅ Tool executed successfully: \(output.prefix(100))")
+                            } else if let error = toolResult.error, !error.isEmpty {
+                                // Tool failed with an error — surface it to the user
+                                responseText += "\n\n⚠️ " + error
+                                streamingResponse = toolParser.removeToolCalls(from: responseText)
+                                logger.warning("⚠️ Tool returned error: \(error.prefix(100))")
+                            }
+                        } catch {
+                            logger.error("❌ Tool execution failed: \(error.localizedDescription)")
+                            responseText += "\n\n⚠️ Tool execution failed: \(error.localizedDescription)"
+                            streamingResponse = toolParser.removeToolCalls(from: responseText)
+                        }
+                    }
+
+                    // If we have lookup results, make a follow-up LLM call with the retrieved facts
+                    if !lookupResults.isEmpty {
+                        logger.debug("🔄 Making follow-up LLM call with \(lookupResults.count) lookup result(s)")
+
+                        // Build a context message with the lookup results
+                        let toolResultMessage = "TOOL RESULT - Here is the information from the user's stored facts:\n" + lookupResults.joined(separator: "\n") + "\n\nNow please respond to the user's question using this information."
+
+                        // Create updated context with original message and tool result
+                        var followUpContext = contextMessages
+                        followUpContext.append(Message(content: lastUserMessage, role: .user))
+                        followUpContext.append(Message(content: toolResultMessage, role: .assistant))
+
+                        // Make follow-up LLM call
+                        do {
+                            let followUpResponse = try await orchestrator.processInput(
+                                "Continue your response using the tool result above.",
+                                context: followUpContext
+                            )
+                            // Use follow-up response as final response
+                            responseText = toolParser.removeToolCalls(from: followUpResponse)
+                            streamingResponse = responseText
+                            logger.debug("✅ Follow-up generation complete: \(responseText.prefix(100))")
+                        } catch {
+                            // Fall back to showing lookup results directly
+                            logger.error("❌ Follow-up generation failed: \(error.localizedDescription)")
+                            responseText = "I found this information: " + lookupResults.joined(separator: ", ")
+                            streamingResponse = responseText
+                        }
+                    } else {
+                        // Remove raw tool call lines for cleaner response
+                        let cleanedResponse = toolParser.removeToolCalls(from: responseText)
+                        // If stripping tool calls left nothing visible, keep the tool results
+                        // (they were already appended with ✅ or ⚠️ prefixes)
+                        if cleanedResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            // responseText has tool results appended — just strip the raw tool_call tags
+                            responseText = responseText.replacingOccurrences(of: #"<tool_call>[\s\S]*?</tool_call>"#, with: "", options: .regularExpression)
+                        } else {
+                            responseText = cleanedResponse
+                        }
+                        streamingResponse = responseText
+                    }
+                }
+            } else {
+                // V1: Tool calling DISABLED - sanitize response to remove any tool artifacts
+                responseText = sanitizeResponse(responseText)
+                streamingResponse = responseText
+                logger.debug("🧹 Response sanitized (tool calling disabled)")
+            }
+
+            // Extract and store personal facts from <serena_facts> block (inline learning)
+            if FeatureFlags.learningCoordinatorEnabled {
+                extractAndStoreInlineFacts(from: responseText)
+            }
+
+            // Strip thinking blocks from saved message (keeps history clean)
+            // Users saw thinking during streaming, but saved response is just the answer
+            var savedResponseText = responseText
+
+            // Strip <serena_facts> block from saved message (learning data, not conversation)
+            if let factsRegex = try? NSRegularExpression(pattern: "<serena_facts>[\\s\\S]*?</serena_facts>", options: []) {
+                let range = NSRange(savedResponseText.startIndex..., in: savedResponseText)
+                savedResponseText = factsRegex.stringByReplacingMatches(in: savedResponseText, options: [], range: range, withTemplate: "")
+            }
+
+            if let regex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: []) {
+                let range = NSRange(savedResponseText.startIndex..., in: savedResponseText)
+                savedResponseText = regex.stringByReplacingMatches(in: savedResponseText, options: [], range: range, withTemplate: "")
+            }
+            // Strip plain-text thinking from saved message too
+            savedResponseText = Self.stripPlainTextThinking(savedResponseText)
+            savedResponseText = savedResponseText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let assistantMessage = Message(content: savedResponseText, role: .assistant)
+            logger.debug("🤖 generateAIResponse: Created assistant message with ID: \(assistantMessage.id)")
+
+            conversation.addMessage(assistantMessage)
+            logger.debug("🤖 generateAIResponse: Added message to conversation (now has \(conversation.messages.count) messages)")
+
+            // Trim context if conversation is getting too long
+            trimConversationContext(&conversation)
+
+            logger.debug("🤖 generateAIResponse: Updating currentConversation (ID: \(conversation.id))")
+            currentConversation = conversation
+            streamingResponse = ""  // Clear streaming response now that message is added
+            logger.debug("🤖 generateAIResponse: currentConversation updated - should trigger UI refresh")
+
+            // Update conversations array
+            updateConversationInArray(conversation)
+            logger.debug("🤖 generateAIResponse: Updated conversations array")
+
+            // Save conversation (works offline with local storage)
+            try await dataStore.saveConversation(conversation)
+            logger.debug("🤖 generateAIResponse: Conversation saved to data store")
+
+            // Process message for learning (background, non-blocking)
+            if FeatureFlags.learningCoordinatorEnabled, let coordinator = learningCoordinator {
+                // Direct teaching: long user message (200+ chars) with teaching signal
+                // Queued as detached task so MLX inference has completed before we call the LLM again
+                let isTeachingContent = Self.isTeachingIntent(lastUserMessage)
+                if isTeachingContent {
+                    Task.detached { [lastUserMessage] in
+                        // Small delay to ensure current MLX inference is fully done
+                        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+                        let count = await coordinator.teachDirectly(content: lastUserMessage)
+                        await MainActor.run {
+                            self.logger.info("🧠 Direct teaching produced \(count) entries")
+                        }
+                    }
+                } else {
+                    Task.detached { [assistantMessage] in
+                        await coordinator.processMessage(assistantMessage)
+                    }
+                }
+            }
+
+            // Check for low-confidence responses and log for domain expansion (System 2)
+            let llmConfidence = extractConfidence(from: responseText)
+            if let expansionCoordinator = domainExpansionCoordinator,
+               FeatureFlags.system2DomainExpansionEnabled {
+                if llmConfidence < 0.6 {
+                    Task.detached { [lastUserMessage, responseText, llmConfidence] in
+                        await expansionCoordinator.logLowConfidenceQuery(
+                            query: lastUserMessage,
+                            response: responseText,
+                            confidence: llmConfidence
+                        )
+                    }
+                    logger.info("🌐 Low-confidence response detected (\(String(format: "%.2f", llmConfidence))) - logged for domain expansion")
+                }
+            }
+
+            // Layer 2: Feed LLM confidence into ConfidenceMap (disabled until tested)
+            if FeatureFlags.proactiveIntelligenceEnabled {
+                Task.detached { [lastUserMessage, llmConfidence] in
+                    await ProactiveIntegrationBridge.shared.observeLLMResponse(
+                        query: lastUserMessage, confidence: llmConfidence
+                    )
+                }
+            }
+
+            // Inline fact extraction now happens above (from <serena_facts> block in response)
+            // No separate LLM inference needed — the model learns during its natural response
+
+            // Announce AI response for accessibility
+            accessibilityManager.announceAIResponse(responseText)
+
+            lastError = nil
+            logger.debug("✅ generateAIResponse: COMPLETED SUCCESSFULLY - UI should now show response")
+        } catch {
+            logger.error("❌ generateAIResponse: ERROR occurred: \(error.localizedDescription)")
+            let serenaError: SerenaError
+            if let existingError = error as? SerenaError {
+                serenaError = existingError
+            } else {
+                serenaError = SerenaError.aiProcessingError(error.localizedDescription)
+            }
+
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Generating AI response")
+        }
+
+        logger.debug("🤖 generateAIResponse: Setting isProcessing = false")
+        isProcessing = false
+        isStreaming = false
+        logger.debug("🤖 generateAIResponse: Method finished")
+    }
+    
+
+    
+    // MARK: - Intent Execution (Tool Calling)
+
+    /// Execute a detected intent and return a response string
+    /// Returns nil if execution fails (falls back to LLM)
+    /// Check a ToolResult for JIT permission needs. Returns a user-facing message if permission
+    /// is needed/denied, or nil if the tool executed normally (caller should handle result.success).
+    private func checkToolResultForPermission(_ result: ToolResult) -> String? {
+        if let needed = result.permissionNeeded {
+            let request = PermissionRequestFlow.buildRequest(for: needed)
+            pendingPermissionRequest = request
+            pendingOriginalMessage = currentConversation?.messages.last(where: { $0.role == .user })?.content
+            return request.message
+        }
+        if let denied = result.permissionDenied {
+            return PermissionRequestFlow.previouslyDeniedMessage(for: denied)
+        }
+        return nil
+    }
+
+    private func executeIntent(_ intent: IntentDetector.Intent) async -> String? {
+        let toolExecutor = RealToolExecutor.shared
+
+        switch intent {
+        case .launchApp(let appName):
+            let ftaiTask = """
+            task: app.launch
+            app_name: \(appName)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "✅ \(result.output)"
+                } else {
+                    return "I tried to open \(appName) but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to launch app: \(error)")
+                return nil  // Fall back to LLM
+            }
+
+        case .openURL(let url):
+            let ftaiTask = """
+            task: browser.open_url
+            url: \(url)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🌐 \(result.output)"
+                } else {
+                    return "I tried to open \(url) but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to open URL: \(error)")
+                return nil  // Fall back to LLM
+            }
+
+        case .composeEmail(let to, let subject, let body):
+            return await executeComposeEmailIntent(to: to, subject: subject, body: body)
+
+        case .viewCalendar(let date):
+            let calendarDate = date ?? "today"
+            let ftaiTask = """
+            task: calendar.view_events
+            date: \(calendarDate)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📅 \(result.output)"
+                }
+            } catch {
+                logger.error("❌ Failed to view calendar: \(error)")
+            }
+            return nil
+
+        case .createCalendarEvent(let title, let date, let time, let isAllDay):
+            let eventTitle = title ?? "New Event"
+            let eventDate = date ?? "today"
+
+            var ftaiTask: String
+            if isAllDay {
+                ftaiTask = """
+                task: calendar.create_event
+                title: \(eventTitle)
+                date: \(eventDate)
+                is_all_day: true
+                """
+            } else {
+                let eventTime = time ?? "9am"
+                ftaiTask = """
+                task: calendar.create_event
+                title: \(eventTitle)
+                date: \(eventDate)
+                time: \(eventTime)
+                """
+            }
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "✅ \(result.output)"
+                } else {
+                    return "I tried to create the event but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to create calendar event: \(error)")
+                return nil
+            }
+
+        case .deleteCalendarEvent(let title, let date, let time):
+            // Build FTAI task for calendar delete
+            var ftaiTask = "task: calendar.delete_event\n"
+            if let title = title {
+                ftaiTask += "title: \(sanitizeFTAI(title))\n"
+            }
+            if let date = date {
+                ftaiTask += "date: \(sanitizeFTAI(date))\n"
+            }
+            if let time = time {
+                ftaiTask += "time: \(sanitizeFTAI(time))\n"
+            }
+
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🗑️ \(result.output)"
+                } else {
+                    return "I tried to delete the event but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to delete calendar event: \(error)")
+                return nil
+            }
+
+        case .modifyCalendarEvent(let title, let date, let time, let newTitle, let newDate, let newTime):
+            // Build FTAI task for calendar update
+            var ftaiTask = "task: calendar.update_event\n"
+            if let title = title {
+                ftaiTask += "title: \(sanitizeFTAI(title))\n"
+            }
+            if let date = date {
+                ftaiTask += "date: \(sanitizeFTAI(date))\n"
+            }
+            if let time = time {
+                ftaiTask += "time: \(sanitizeFTAI(time))\n"
+            }
+            if let newTitle = newTitle {
+                ftaiTask += "new_title: \(sanitizeFTAI(newTitle))\n"
+            }
+            if let newDate = newDate {
+                ftaiTask += "new_date: \(sanitizeFTAI(newDate))\n"
+            }
+            if let newTime = newTime {
+                ftaiTask += "new_time: \(sanitizeFTAI(newTime))\n"
+            }
+
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "✏️ \(result.output)"
+                } else {
+                    return "I tried to update the event but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to modify calendar event: \(error)")
+                return nil
+            }
+
+        case .createReminder(let title, let date, let time, let recurrence):
+            // SAFETY: Reject reminders with suspiciously long titles (likely false-positive from pasted docs)
+            // Real reminder titles are short; documentation pastes create 100+ char "titles"
+            let reminderTitle = title ?? "Reminder"
+            if reminderTitle.count > 100 {
+                logger.warning("⚠️ Rejecting reminder with suspicious long title (\(reminderTitle.count) chars) - likely false positive from pasted documentation")
+                return nil
+            }
+
+            // Build FTAI task for reminder (goes to Reminders app, NOT Calendar)
+            let reminderDate = date ?? "today"
+
+            var ftaiTask = "task: calendar.create_reminder\n"
+            ftaiTask += "title: \(sanitizeFTAI(reminderTitle))\n"
+            ftaiTask += "date: \(sanitizeFTAI(reminderDate))\n"
+            if let time = time {
+                ftaiTask += "time: \(sanitizeFTAI(time))\n"
+            }
+            if let recurrence = recurrence {
+                ftaiTask += "recurrence: \(sanitizeFTAI(recurrence))\n"
+            }
+
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "⏰ \(result.output)"
+                } else {
+                    return "I tried to create the reminder but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to create reminder: \(error)")
+                return nil
+            }
+
+        case .createNote(let title, let content):
+            let noteTitle = title ?? "New Note"
+            let noteContent = content ?? ""
+
+            let ftaiTask = """
+            task: notes.add
+            title: \(noteTitle)
+            content: \(noteContent)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📝 \(result.output)"
+                } else {
+                    return "I tried to create the note but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to create note: \(error)")
+                return nil
+            }
+
+        case .appendToNote(let noteTitle, let item):
+            let ftaiTask = """
+            task: notes.append
+            title: \(noteTitle)
+            content: \(item)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return result.output
+                } else {
+                    return "I couldn't add '\(item)' to the note: \(result.error ?? "Note not found")"
+                }
+            } catch {
+                logger.error("❌ Failed to append to note: \(error)")
+                return nil
+            }
+
+        case .deleteNote(let title):
+            let ftaiTask = """
+            task: notes.delete
+            title: \(title)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return result.output
+                } else {
+                    return "I couldn't delete the note '\(title)': \(result.error ?? "Note not found")"
+                }
+            } catch {
+                logger.error("❌ Failed to delete note: \(error)")
+                return nil
+            }
+
+        case .searchFiles(let query, let directory):
+            // If no directory specified, search across all common directories
+            if directory == nil {
+                return await searchInMultipleDirectories(query: query)
+            }
+
+            // Search in specific directory
+            let ftaiTask = """
+            task: file.search
+            query: \(query)
+            directory: \(directory!)
+            recursive: true
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🔍 \(result.output)"
+                } else {
+                    return "🔍 No files matching '\(query)' found in \(directory!)"
+                }
+            } catch {
+                logger.error("❌ Failed to search files: \(error)")
+            }
+            return nil
+
+        case .listDirectory(let directory):
+            let ftaiTask = """
+            task: file.list
+            directory: \(directory)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📁 \(result.output)"
+                } else {
+                    return "Could not list contents of \(directory): \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to list directory: \(error)")
+            }
+            return nil
+
+        case .readFile(let path):
+            let ftaiTask = """
+            task: file.read
+            path: \(path)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📄 \(result.output)"
+                } else {
+                    return "Could not read file: \(result.error ?? "File not found")"
+                }
+            } catch {
+                logger.error("❌ Failed to read file: \(error)")
+            }
+            return nil
+
+        case .openFile(let path):
+            let ftaiTask = """
+            task: file.open
+            path: \(path)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📂 \(result.output)"
+                } else {
+                    return "Could not open file: \(result.error ?? "File not found")"
+                }
+            } catch {
+                logger.error("❌ Failed to open file: \(error)")
+            }
+            return nil
+
+        case .playMusic(let query, let artist, let playlist, let app):
+            let appName = sanitizeFTAI(app ?? "music")
+            var ftaiTask = "task: media.play\napp: \(appName)\n"
+
+            if let playlist = playlist {
+                ftaiTask += "playlist: \(sanitizeFTAI(playlist))\n"
+            } else if let query = query {
+                ftaiTask += "track: \(sanitizeFTAI(query))\n"
+                if let artist = artist {
+                    ftaiTask += "artist: \(sanitizeFTAI(artist))\n"
+                }
+            }
+
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🎵 \(result.output)"
+                } else {
+                    return "I tried to play music but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to play music: \(error)")
+                return nil
+            }
+
+        case .controlMusic(let action, let app):
+            let appName = app ?? "music"
+            let actionStr: String
+            switch action {
+            case .play:
+                actionStr = "play"
+            case .pause:
+                actionStr = "pause"
+            case .stop:
+                actionStr = "stop"
+            case .next:
+                actionStr = "next"
+            case .previous:
+                actionStr = "previous"
+            case .shuffle:
+                actionStr = "shuffle"
+            case .volumeUp:
+                return await executeSystemVolumeIntent(direction: "up")
+            case .volumeDown:
+                return await executeSystemVolumeIntent(direction: "down")
+            }
+
+            let ftaiTask = """
+            task: media.\(actionStr)
+            app: \(appName)
+            """
+
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🎵 \(result.output)"
+                } else {
+                    return "I tried to control music but encountered an issue: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to control music: \(error)")
+                return nil
+            }
+
+        case .webSearch(let query):
+            let ftaiTask = """
+            task: web_search
+            query: \(query)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🔎 \(result.output)"
+                } else {
+                    return "I couldn't search for '\(query)': \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to web search: \(error)")
+                return nil
+            }
+
+        case .openSearchResult(let index):
+            let result = await toolExecutor.openSearchResult(index: index)
+            if result.success {
+                // Parse the structured output: URL, TITLE, CONTENT
+                let output = result.output
+                var url = ""
+                var title = ""
+                var content = ""
+
+                for line in output.components(separatedBy: "\n") {
+                    if line.hasPrefix("URL:") {
+                        url = String(line.dropFirst(4))
+                    } else if line.hasPrefix("TITLE:") {
+                        title = String(line.dropFirst(6))
+                    } else if line.hasPrefix("CONTENT:") {
+                        content = String(line.dropFirst(8))
+                    }
+                }
+
+                // If we have content, ask LLM to summarize it nicely
+                if !content.isEmpty {
+                    let summaryPrompt = "I just opened this webpage for the user. Summarize it briefly and helpfully in 2-3 sentences. Title: \(title). Content: \(content)"
+
+                    do {
+                        // Use bypassRTAI: true to avoid RTAI matching years/numbers in content
+                        let summary = try await orchestrator.processInput(summaryPrompt, context: [], bypassRTAI: true)
+                        return "🌐 Opened \(url)\n\n\(summary)"
+                    } catch {
+                        // Fallback if LLM fails
+                        logger.warning("⚠️ LLM summary failed: \(error)")
+                        return "🌐 Opened \(url)"
+                    }
+                } else {
+                    return "🌐 Opened \(url)"
+                }
+            } else {
+                return result.error ?? "Couldn't open that result."
+            }
+
+        case .morningBriefing:
+            // DEBUG: Log execution attempt
+            let debugPath = NSHomeDirectory() + "/Documents/serena_briefing_debug.log"
+            func logBriefingDebug(_ message: String) {
+                guard let logData = message.data(using: .utf8),
+                      let handle = FileHandle(forWritingAtPath: debugPath) else { return }
+                handle.seekToEndOfFile()
+                handle.write(logData)
+                handle.closeFile()
+            }
+            logBriefingDebug("[\(Date())] 🎯 executeIntent(.morningBriefing) called\n")
+
+            let ftaiTask = "task: briefing.generate"
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    logBriefingDebug("[\(Date())] ✅ Briefing generated successfully\n")
+                    return "🌅 \(result.output)"
+                } else {
+                    logBriefingDebug("[\(Date())] ❌ Briefing failed: \(result.error ?? "Unknown")\n")
+                    return "I couldn't generate your briefing: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logBriefingDebug("[\(Date())] ❌ Exception in briefing: \(error)\n")
+                logger.error("❌ Failed to generate briefing: \(error)")
+                return nil  // Fall back to LLM
+            }
+
+        case .setBriefingTrigger(let phrase):
+            await IntentDetector.shared.addCustomBriefingTrigger(phrase)
+            return "Got it! From now on, when you say \"\(phrase)\", I'll give you your morning briefing. 🌅"
+
+        case .screenContext:
+            let ftaiTask = "task: screen.context"
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                // Handle JIT permission request
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    // Stash screen context for LLM injection instead of returning raw output
+                    // Also grab the raw screenshot for VLM passthrough if available
+                    let screenshot = ScreenToolHandler.lastScreenshot
+                    ScreenToolHandler.lastScreenshot = nil  // consume it
+                    lastScreenContext = (text: result.output, screenshot: screenshot, timestamp: Date())
+                    logger.info("🖥️ Screen context captured (\(result.output.count) chars, hasImage=\(screenshot != nil)), will inject into LLM")
+                    return nil  // Continue to LLM so it can reason about the screen
+                } else {
+                    return result.error ?? "I couldn't read your screen. Make sure Accessibility permission is granted."
+                }
+            } catch {
+                logger.error("❌ Failed to read screen: \(error)")
+                return "I couldn't read your screen. Please grant Accessibility permission in System Settings > Privacy & Security > Accessibility."
+            }
+
+        case .screenInteraction(let instruction):
+            // Parse instruction → ScreenAction(s)
+            let actions = IntentDetector.shared.parseScreenActions(from: instruction)
+            guard !actions.isEmpty else {
+                return "I understood you want to interact with the screen, but I couldn't parse the specific action from: \"\(instruction)\". Try something like \"click on Submit\" or \"type hello into the search field\"."
+            }
+
+            let screenAgent = ScreenAgent()
+
+            // Wire up confirmation handler — user already requested the action explicitly
+            await screenAgent.setConfirmationHandler { (reason: String) -> Bool in
+                return true
+            }
+
+            let request = ScreenRequest(intent: instruction, targetApp: nil, actions: actions)
+            let result = await screenAgent.execute(request: request)
+            return result.description
+
+        case .listRunningApps:
+            let ftaiTask = "task: app.list_active"
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📱 \(result.output)"
+                } else {
+                    return "I couldn't list running apps: \(result.error ?? "Unknown error")"
+                }
+            } catch {
+                logger.error("❌ Failed to list running apps: \(error)")
+                return nil
+            }
+
+        case .openFolder(let path):
+            let expandedPath = NSString(string: path).expandingTildeInPath
+            let ftaiTask = """
+            task: file.open
+            path: \(expandedPath)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "📂 \(result.output)"
+                } else {
+                    return "I couldn't open the folder: \(result.error ?? "Folder not found")"
+                }
+            } catch {
+                logger.error("❌ Failed to open folder: \(error)")
+                return nil
+            }
+
+        case .forgetMemory(let query):
+            let ftaiTask = """
+            task: memory.forget
+            query: \(query)
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "🗑️ \(result.output)"
+                } else {
+                    return result.error ?? "I couldn't find a matching memory to forget."
+                }
+            } catch {
+                logger.error("❌ Failed to forget memory: \(error)")
+                return nil
+            }
+
+        case .systemCommand(let action, let params):
+            var ftaiTask = "task: system.\(action)"
+            for (key, value) in params {
+                ftaiTask += "\n\(key): \(value)"
+            }
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success {
+                    return "⚙️ \(result.output)"
+                }
+                return result.error
+            } catch {
+                return nil
+            }
+
+        case .fileSearch(let query):
+            let results = await FileSearchEngine.search(query: query, maxResults: 5)
+            if results.isEmpty {
+                return "🔍 No files found matching \"\(query)\""
+            }
+            let formatted = results.prefix(5).enumerated().map { (i, r) in
+                "\(i + 1). **\(r.name)** — \(r.path)"
+            }.joined(separator: "\n")
+            return "🔍 Files matching \"\(query)\":\n\(formatted)"
+
+        case .windowSnap(let layoutStr, _):
+            guard let layout = WindowSnapManager.parseLayout(layoutStr) else {
+                return "Unknown layout: \(layoutStr). Available: left, right, top, bottom, maximize, center, topLeft, topRight, bottomLeft, bottomRight"
+            }
+            let result = WindowSnapManager.shared.snapFrontWindow(to: layout)
+            return result.userMessage
+
+        case .calculate(let expression):
+            guard let result = CalculatorEngine.evaluate(expression) else {
+                return nil  // Couldn't evaluate — let LLM try
+            }
+            return "🧮 \(result.expression) = **\(result.formatted)**"
+
+        case .conversation:
+            return nil  // Let LLM handle it
+        }
+    }
+
+    /// Helper for system volume control
+    private func executeSystemVolumeIntent(direction: String) async -> String? {
+        let toolExecutor = RealToolExecutor.shared
+        let ftaiTask = """
+        task: system.volume_\(direction)
+        """
+
+        do {
+            let result = try await toolExecutor.execute(ftaiTask)
+            if let permMsg = checkToolResultForPermission(result) { return permMsg }
+            if result.success {
+                return "🔊 \(result.output)"
+            }
+        } catch {
+            logger.error("❌ Failed to adjust volume: \(error)")
+        }
+        return nil
+    }
+
+    /// Helper for searching files across multiple common directories
+    private func searchInMultipleDirectories(query: String) async -> String? {
+        let toolExecutor = RealToolExecutor.shared
+        let directories = ["~/Documents", "~/Downloads", "~/Desktop"]
+        var allResults: [(dir: String, file: String, isDir: Bool)] = []
+
+        for dir in directories {
+            let ftaiTask = """
+            task: file.search
+            query: \(query)
+            directory: \(dir)
+            recursive: true
+            """
+            do {
+                let result = try await toolExecutor.execute(ftaiTask)
+                if let permMsg = checkToolResultForPermission(result) { return permMsg }
+                if result.success && !result.output.contains("Found 0 file") {
+                    // Extract file list from output (format: "📁 filename" or "📄 filename")
+                    let lines = result.output.components(separatedBy: "\n")
+                    for line in lines {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        if trimmed.hasPrefix("📁 ") {
+                            let filename = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                            allResults.append((dir: dir, file: filename, isDir: true))
+                        } else if trimmed.hasPrefix("📄 ") {
+                            let filename = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                            allResults.append((dir: dir, file: filename, isDir: false))
+                        }
+                    }
+                }
+            } catch {
+                logger.warning("Search in \(dir) failed: \(error)")
+            }
+        }
+
+        if allResults.isEmpty {
+            return "🔍 No files matching '\(query)' found in Documents, Downloads, or Desktop."
+        }
+
+        let resultList = allResults.prefix(20).map { result -> String in
+            let icon = result.isDir ? "📁" : "📄"
+            let shortDir = result.dir.replacingOccurrences(of: "~/", with: "")
+            return "\(icon) \(shortDir)/\(result.file)"
+        }.joined(separator: "\n")
+        let moreNote = allResults.count > 20 ? "\n(and \(allResults.count - 20) more...)" : ""
+        return "🔍 Found \(allResults.count) file(s) matching '\(query)':\n\(resultList)\(moreNote)"
+    }
+
+    /// Helper for composing emails via mailto: URL (works with any email client)
+    private func executeComposeEmailIntent(to: String, subject: String?, body: String?) async -> String? {
+        // Clean the email address (remove trailing punctuation)
+        let cleanedTo = to.trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!? "))
+
+        // Build mailto: URL - more reliable than AppleScript
+        var mailtoString = "mailto:\(cleanedTo)"
+        var params: [String] = []
+
+        if let subject = subject {
+            if let encoded = subject.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                params.append("subject=\(encoded)")
+            }
+        }
+
+        if let body = body {
+            if let encoded = body.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                params.append("body=\(encoded)")
+            }
+        }
+
+        if !params.isEmpty {
+            mailtoString += "?" + params.joined(separator: "&")
+        }
+
+        guard let mailtoURL = URL(string: mailtoString) else {
+            logger.error("❌ Failed to create mailto URL: \(mailtoString)")
+            return "I couldn't create an email to \(cleanedTo)"
+        }
+
+        // Open with default email client
+        let workspace = NSWorkspace.shared
+        workspace.open(mailtoURL)
+
+        logger.info("📧 Opened mailto: \(cleanedTo)")
+
+        if let subject = subject {
+            return "📧 Composing email to \(cleanedTo) with subject \"\(subject)\""
+        } else {
+            return "📧 Composing email to \(cleanedTo)"
+        }
+    }
+
+    // MARK: - Data Persistence
+
+    private func saveCurrentConversation() async {
+        guard let conversation = currentConversation else { return }
+        
+        do {
+            try await dataStore.saveConversation(conversation)
+            lastError = nil
+        } catch {
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Saving conversation")
+        }
+    }
+    
+    public func deleteConversation(_ conversation: Conversation) async {
+        do {
+            try await dataStore.deleteConversation(id: conversation.id)
+            conversations.removeAll { $0.id == conversation.id }
+            
+            if currentConversation?.id == conversation.id {
+                currentConversation = conversations.first
+                if currentConversation == nil {
+                    createNewConversation()
+                }
+            }
+            
+            lastError = nil
+        } catch {
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Deleting conversation")
+        }
+    }
+    
+    public func clearAllConversations() async {
+        do {
+            try await dataStore.clearAllData()
+            conversations.removeAll()
+            createNewConversation()
+            lastError = nil
+        } catch {
+            let serenaError = SerenaError.databaseError(error.localizedDescription)
+            lastError = serenaError
+            errorManager.handle(serenaError, context: "Clearing conversations")
+        }
+    }
+    
+    // MARK: - Drag and Drop Support
+
+    /// Image file extensions
+    private let imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
+
+    /// Handle dropped text content
+    public func handleDroppedText(_ text: String) {
+        Task {
+            await sendMessage(text)
+        }
+    }
+
+    /// Handle dropped file URLs
+    public func handleDroppedFile(_ url: URL) {
+        Task {
+            let fileExtension = url.pathExtension.lowercased()
+            let fileName = url.lastPathComponent
+
+            // Check if it's an image file
+            if imageExtensions.contains(fileExtension) {
+                await handleDroppedImage(url)
+                return
+            }
+
+            // Handle text files
+            do {
+                let content = try String(contentsOf: url, encoding: .utf8)
+                let message = "File: \(fileName)\n\n\(content)"
+                await sendMessage(message)
+            } catch {
+                let errorMessage = "Could not read file: \(fileName)\nError: \(error.localizedDescription)"
+                await sendMessage(errorMessage)
+            }
+        }
+    }
+
+    /// Handle dropped image files using OCR
+    /// Instead of auto-sending, stores as pending attachment so user can add context
+    private func handleDroppedImage(_ url: URL) async {
+        let fileName = url.lastPathComponent
+        logger.info("🖼️ Processing dropped image: \(fileName)")
+
+        // Extract text from image using Vision framework
+        let result = await ImageTextExtractor.shared.extractText(from: url)
+
+        if result.success, let extractedText = result.text {
+            // Store as pending attachment instead of auto-sending
+            // User can now type context before sending
+            await MainActor.run {
+                self.pendingImageAttachment = PendingImageAttachment(
+                    fileName: fileName,
+                    extractedText: extractedText,
+                    imageURL: url
+                )
+            }
+            logger.info("📎 Image attached: \(fileName) - waiting for user context")
+        } else {
+            // Still auto-send error messages so user knows something went wrong
+            let errorMessage = "Could not process image: \(fileName)\n\(result.description)"
+            await sendMessage(errorMessage)
+        }
+    }
+
+    /// Clear the pending image attachment
+    public func clearPendingAttachment() {
+        pendingImageAttachment = nil
+    }
+    
+    // MARK: - Menu Support
+    
+    /// Clear the current conversation
+    public func clearCurrentConversation() {
+        guard var conversation = currentConversation else { return }
+        conversation.messages.removeAll()
+        currentConversation = conversation
+        updateConversationInArray(conversation)
+        
+        Task {
+            await saveCurrentConversation()
+        }
+    }
+    
+    /// Delete the current conversation
+    public func deleteCurrentConversation() {
+        guard let conversation = currentConversation else { return }
+        Task {
+            await deleteConversation(conversation)
+        }
+    }
+    
+    /// Copy the last assistant response to clipboard
+    public func copyLastResponse() {
+        guard let conversation = currentConversation else { return }
+        
+        // Find the last assistant message
+        let lastAssistantMessage = conversation.messages.reversed().first { $0.role == .assistant }
+        
+        if let message = lastAssistantMessage {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(message.content, forType: .string)
+        }
+    }
+    
+    /// Check if we can copy the last response
+    public var canCopyLastResponse: Bool {
+        guard let conversation = currentConversation else { return false }
+        return conversation.messages.contains { $0.role == .assistant }
+    }
+    
+    /// Start voice input (for menu command)
+    public func startVoiceInput() {
+        Task {
+            do {
+                accessibilityManager.announceVoiceInputStart()
+                _ = try await startVoiceInput()
+            } catch {
+                // Error handling is already done in the async method
+            }
+        }
+    }
+    
+    // MARK: - Helper Methods
+
+    private func updateConversationInArray(_ conversation: Conversation) {
+        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
+            conversations[index] = conversation
+            // Move to front if it's not already there
+            if index != 0 {
+                conversations.remove(at: index)
+                conversations.insert(conversation, at: 0)
+            }
+        } else {
+            // Add new conversation to the front
+            conversations.insert(conversation, at: 0)
+        }
+    }
+
+    /// Track morning briefing engagement when user sends a message after a briefing
+    /// This is a silent backend event - no user-facing changes
+    private func trackBriefingEngagementIfApplicable(conversation: Conversation) {
+        // Check if any recent assistant message was a briefing
+        // Look at the last 3 assistant messages for briefing content
+        let recentAssistantMessages = conversation.messages
+            .suffix(6) // Last 6 messages (could be 3 user + 3 assistant)
+            .filter { $0.role == .assistant }
+            .suffix(3) // Last 3 assistant messages
+
+        // Briefing indicators in the message content
+        let briefingIndicators = [
+            "Here's your briefing",
+            "Good morning! Here's your briefing",
+            "Today's Schedule",
+            "Coming Up",
+            "Due Today",
+            "Overdue Tasks"
+        ]
+
+        let hasBriefing = recentAssistantMessages.contains { message in
+            briefingIndicators.contains { indicator in
+                message.content.contains(indicator)
+            }
+        }
+
+        if hasBriefing {
+            // User sent a message after seeing a briefing - they engaged
+            AnalyticsManager.shared.trackMorningBriefingEngaged()
+            logger.debug("📊 Morning briefing engagement tracked")
+        }
+    }
+
+    // MARK: - JIT Permission Handling
+
+    /// Called when user taps "Allow" on a permission request in chat
+    public func handlePermissionGrant() async {
+        guard let request = pendingPermissionRequest,
+              let originalMessage = pendingOriginalMessage else { return }
+
+        let permission = request.permission
+
+        if request.isSettingsRedirect {
+            PermissionManager.shared.openSettings(permission)
+            // Clear pending — user needs to come back and re-ask
+            pendingPermissionRequest = nil
+            pendingOriginalMessage = nil
+        } else {
+            let status = await PermissionManager.shared.request(permission)
+            pendingPermissionRequest = nil
+            pendingOriginalMessage = nil
+
+            if status == .granted {
+                // Re-execute the original message now that permission is granted
+                await sendMessage(originalMessage)
+            } else {
+                PermissionManager.shared.markDeclinedThisSession(permission)
+                let denialMsg = PermissionRequestFlow.denialMessage()
+                await addMessage(Message(content: denialMsg, role: .assistant))
+            }
+        }
+    }
+
+    /// Called when user taps "Not now" on a permission request in chat
+    public func handlePermissionDenial() async {
+        guard let request = pendingPermissionRequest else { return }
+        PermissionManager.shared.markDeclinedThisSession(request.permission)
+        pendingPermissionRequest = nil
+        pendingOriginalMessage = nil
+
+        let denialMsg = PermissionRequestFlow.denialMessage()
+        await addMessage(Message(content: denialMsg, role: .assistant))
+    }
+
+    // MARK: - Data Store Access
+
+    /// Get the data store for use by other services
+    /// Used by ConversationDatasetBuilder for style adaptation
+    public func getDataStore() -> DataStoreProtocol {
+        return dataStore
+    }
+
+    // MARK: - Learning System (AKE) Public API
+
+    /// Manually trigger the learning pipeline
+    /// - Returns: Number of new knowledge entries created
+    @discardableResult
+    public func runLearningPipeline() async -> Int {
+        guard let coordinator = learningCoordinator else {
+            logger.warning("🧠 Learning coordinator not available")
+            return 0
+        }
+
+        logger.info("🧠 Manually triggering learning pipeline...")
+        let entries = await coordinator.runLearningPipeline()
+
+        // Update published statistics
+        learningStatistics = await coordinator.getStatistics()
+
+        logger.info("🧠 Learning pipeline complete: \(entries.count) entries created")
+        return entries.count
+    }
+
+    /// Teach content directly — bypasses all thresholds.
+    /// Queues LLM extraction after current response to avoid MLX concurrency.
+    /// - Parameter content: The content to teach (press release, article, long text, etc.)
+    /// - Returns: Number of new knowledge entries created
+    @discardableResult
+    public func teachDirectly(content: String) async -> Int {
+        guard let coordinator = learningCoordinator else {
+            logger.warning("🧠 Learning coordinator not available for direct teaching")
+            return 0
+        }
+
+        logger.info("🧠 Direct teaching: \(content.count) chars")
+        let entries = await coordinator.teachDirectly(content: content)
+
+        // Update published statistics
+        learningStatistics = await coordinator.getStatistics()
+
+        logger.info("🧠 Direct teaching complete: \(entries.count) entries created")
+        return entries.count
+    }
+
+    /// Get current learning statistics
+    public func getLearningStatistics() async -> LearningStatistics? {
+        guard let coordinator = learningCoordinator else {
+            return nil
+        }
+        let stats = await coordinator.getStatistics()
+        learningStatistics = stats
+        return stats
+    }
+
+    /// Check if learning system is available
+    public var isLearningEnabled: Bool {
+        return learningCoordinator != nil
+    }
+
+    /// Reset learning system state
+    public func resetLearning() async {
+        guard let coordinator = learningCoordinator else { return }
+        await coordinator.reset()
+        learningStatistics = await coordinator.getStatistics()
+        logger.info("🧠 Learning system reset")
+    }
+
+    // MARK: - Idle-Based Learning (Private)
+
+    /// Queue a message for later learning (when idle)
+    /// Also runs heuristic pattern detection in real-time (no LLM, no blocking).
+    private func queueMessageForLearning(_ message: Message) {
+        pendingLearningMessages.append(message)
+        resetLearningIdleTimer()
+        logger.info("🧠 Queued message for learning (pending: \(self.pendingLearningMessages.count))")
+
+        // Real-time heuristic pattern detection (System 1 primary path)
+        if FeatureFlags.learningCoordinatorEnabled && message.role == .user {
+            Task.detached { [weak self] in
+                guard let self else { return }
+                let patterns = await self.heuristicPatternDetector.analyzeMessage(
+                    id: message.id.uuidString,
+                    content: message.content,
+                    timestamp: message.timestamp
+                )
+                if !patterns.isEmpty {
+                    self.logger.info("🧠 Heuristic detected \(patterns.count) pattern(s) in real-time")
+                    // Feed patterns into MitosisManager for clustering
+                    if FeatureFlags.mitosisClusteringEnabled {
+                        for pattern in patterns {
+                            await MitosisManager.shared.recordQuery(
+                                topic: pattern.topic,
+                                keywords: pattern.keywords,
+                                messageID: message.id.uuidString
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Inline Fact Extraction (from model response)
+
+    /// Extract and store personal facts from the model's <serena_facts> block.
+    /// The model learns during its natural response — no separate inference needed.
+    /// Facts are embedded in the response via system prompt instructions.
+    private func extractAndStoreInlineFacts(from response: String) {
+        guard let startRange = response.range(of: "<serena_facts>"),
+              let endRange = response.range(of: "</serena_facts>") else {
+            SessionLogger.shared.noInlineFacts()
+            return // No facts block — model didn't detect personal facts
+        }
+
+        let jsonStr = String(response[startRange.upperBound..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        SessionLogger.shared.inlineFactsDetected(raw: jsonStr)
+        let facts = parseInlineFacts(jsonStr)
+        guard !facts.isEmpty else { return }
+
+        logger.info("🧠 Model extracted \(facts.count) inline fact(s)")
+
+        Task.detached(priority: .utility) { [weak self, facts] in
+            guard let self else { return }
+            for (key, value) in facts {
+                await UserFTAIManager.shared.addFact(
+                    key: key, value: value,
+                    category: .personal, priority: 10
+                )
+                self.logger.info("💾 Inline fact stored: \(key) = \(value)")
+                SessionLogger.shared.factStored(key: key, value: value)
+            }
+
+            // Track for contradiction detection on next message
+            await MainActor.run {
+                self.pendingFactConfirmations = facts.map {
+                    ExtractedFact(fact: "\($0.key): \($0.value)", category: .personal, priority: 10)
+                }
+            }
+
+            await AnalyticsManager.shared.track("memory_inline_extraction", value: "\(facts.count)")
+        }
+    }
+
+    /// Parse JSON array of {key, value} objects from inline facts block
+    private func parseInlineFacts(_ jsonStr: String) -> [(key: String, value: String)] {
+        guard let startIdx = jsonStr.firstIndex(of: "["),
+              let endIdx = jsonStr.lastIndex(of: "]") else {
+            return []
+        }
+
+        let arrayStr = String(jsonStr[startIdx...endIdx])
+        guard let data = arrayStr.data(using: .utf8) else { return [] }
+
+        do {
+            guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                return []
+            }
+
+            return array.compactMap { dict in
+                guard let key = dict["key"] as? String,
+                      let value = dict["value"] as? String,
+                      !key.isEmpty, !value.isEmpty else { return nil }
+                // Security: strip null bytes, limit length, reject injection payloads
+                let cleanKey = key.replacingOccurrences(of: "\0", with: "").prefix(100)
+                let cleanValue = value.replacingOccurrences(of: "\0", with: "").prefix(500)
+                guard !cleanKey.contains("@tool_call"),
+                      !cleanValue.contains("@tool_call") else { return nil }
+                // Filter non-personal keys: model sometimes tags topics/interests as "facts"
+                let lowerKey = cleanKey.lowercased()
+                let nonPersonalKeys = [
+                    "interest", "topic", "question", "query", "context", "subject",
+                    "research", "search", "request", "task", "asked about",
+                    "looking for", "wants to know", "curious about"
+                ]
+                guard !nonPersonalKeys.contains(where: { lowerKey.contains($0) }) else {
+                    self.logger.info("🧠 Filtered non-personal fact key: \(cleanKey)")
+                    SessionLogger.shared.log("FACTS", "REJECTED non-personal key: \(cleanKey) = \(cleanValue.prefix(60))")
+                    return nil
+                }
+                return (key: String(cleanKey), value: String(cleanValue))
+            }
+        } catch {
+            logger.debug("🧠 Failed to parse inline facts JSON: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Reset the idle timer - called after each user interaction.
+    /// Uses Task.detached to avoid MainActor/RunLoop contention (original Timer caused CPU freeze Dec 2025).
+    private func resetLearningIdleTimer() {
+        guard FeatureFlags.learningCoordinatorEnabled else { return }
+
+        // Cancel previous idle task
+        learningIdleTask?.cancel()
+
+        let interval = learningIdleInterval
+
+        // Detached task avoids MainActor run loop — safe from CPU freeze
+        learningIdleTask = Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+
+            guard !Task.isCancelled else { return }
+
+            await self?.processQueuedLearningMessages()
+        }
+    }
+
+    /// Process queued messages when idle (no user activity for 30+ seconds)
+    private func processQueuedLearningMessages() async {
+        guard !pendingLearningMessages.isEmpty else { return }
+        guard let coordinator = learningCoordinator else { return }
+
+        // Don't process if we're currently handling a user request
+        if isProcessing {
+            logger.debug("🧠 Skipping learning: user request in progress")
+            resetLearningIdleTimer() // Try again later
+            return
+        }
+
+        let messages = pendingLearningMessages
+        pendingLearningMessages.removeAll()
+
+        logger.info("🧠 Processing \(messages.count) queued messages for learning (idle trigger)")
+
+        // Track the learning task so it can be cancelled when user sends a message
+        learningProcessingTask = Task.detached(priority: .utility) { [weak self] in
+            for message in messages {
+                // Check cancellation between each message — user inference takes priority
+                guard !Task.isCancelled else {
+                    await MainActor.run {
+                        self?.logger.info("🧠 Learning cancelled — user inference takes priority")
+                    }
+                    return
+                }
+                _ = await coordinator.processMessage(message)
+            }
+
+            // Update statistics on MainActor
+            await MainActor.run { [weak self] in
+                Task {
+                    self?.learningStatistics = await coordinator.getStatistics()
+                }
+            }
+        }
+
+        // Wait for completion (or cancellation)
+        await learningProcessingTask?.value
+        learningProcessingTask = nil
+    }
+
+    // MARK: - Domain Expansion (AKE System 2) Public API
+
+    /// Manually trigger the domain expansion pipeline
+    /// - Returns: Number of new knowledge entries created
+    @discardableResult
+    public func runDomainExpansionPipeline() async -> Int {
+        guard let coordinator = domainExpansionCoordinator else {
+            logger.warning("🌐 Domain expansion coordinator not available")
+            return 0
+        }
+
+        logger.info("🌐 Manually triggering domain expansion pipeline...")
+        let entries = await coordinator.runExpansionPipeline(force: true)
+
+        // Update published statistics
+        domainExpansionStatistics = await coordinator.getStatistics()
+
+        logger.info("🌐 Domain expansion pipeline complete: \(entries.count) entries created")
+        return entries.count
+    }
+
+    /// Get current domain expansion statistics
+    public func getDomainExpansionStatistics() async -> DomainExpansionStatistics? {
+        guard let coordinator = domainExpansionCoordinator else {
+            return nil
+        }
+        let stats = await coordinator.getStatistics()
+        domainExpansionStatistics = stats
+        return stats
+    }
+
+    /// Check if domain expansion is available
+    public var isDomainExpansionEnabled: Bool {
+        return domainExpansionCoordinator != nil && FeatureFlags.system2DomainExpansionEnabled
+    }
+
+    /// Reset domain expansion system state
+    public func resetDomainExpansion() async {
+        guard let coordinator = domainExpansionCoordinator else { return }
+        await coordinator.reset()
+        domainExpansionStatistics = await coordinator.getStatistics()
+        logger.info("🌐 Domain expansion system reset")
+    }
+
+    /// Research a specific topic on-demand
+    /// - Parameter topic: The topic to research
+    /// - Returns: Created domain knowledge or nil
+    public func researchTopic(_ topic: String) async -> DomainKnowledge? {
+        guard let coordinator = domainExpansionCoordinator else {
+            logger.warning("🌐 Domain expansion coordinator not available")
+            return nil
+        }
+
+        logger.info("🌐 Researching topic: \(topic)")
+        let knowledge = await coordinator.researchTopic(topic)
+
+        // Update statistics
+        domainExpansionStatistics = await coordinator.getStatistics()
+
+        return knowledge
+    }
+
+    // MARK: - Debug & Admin Commands
+
+    /// Handle debug/admin commands that start with "/" - returns true if handled
+    /// Admin commands (password-protected) available in all builds
+    /// Basic debug commands only in DEBUG builds
+    private func handleDebugCommand(_ text: String) async -> Bool {
+        let command = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // First, check AdminDiagnosticSuite for password-protected commands (all builds)
+        let (handled, result) = await AdminDiagnosticSuite.shared.handleCommand(command)
+        if handled {
+            if let result = result {
+                addDiagnosticResult(result)
+            }
+            return true
+        }
+
+        #if DEBUG
+        // Fall through to basic debug commands (available without admin in DEBUG builds)
+        let lowerCommand = command.lowercased()
+
+        // /diagnose - Run MLXEngine deadlock diagnostics
+        if lowerCommand == "/diagnose" || lowerCommand == "/diag" {
+            await runDeadlockDiagnostic()
+            return true
+        }
+
+        // /memory - Check memory stats
+        if lowerCommand == "/memory" || lowerCommand == "/mem" {
+            await showMemoryStats()
+            return true
+        }
+
+        // /stress - Run rapid-fire stress test
+        if lowerCommand == "/stress" {
+            await runStressTest()
+            return true
+        }
+
+        // /help-debug - Show available debug commands
+        if lowerCommand == "/help-debug" || lowerCommand == "/debug" {
+            showDebugHelp()
+            return true
+        }
+        #endif
+
+        return false
+    }
+
+    #if DEBUG
+    /// Show debug command help
+    private func showDebugHelp() {
+        let helpText = """
+        === DEBUG COMMANDS ===
+
+        Available in DEBUG builds:
+          /diagnose   - Run streaming deadlock test
+          /stress     - Run rapid-fire stress test
+          /memory     - Show memory statistics
+          /help-debug - Show this help
+
+        Admin Mode (password protected):
+          /admin <password>  - Enter admin mode
+          /help-admin        - Show admin commands
+
+        Admin commands unlock additional tests:
+          /full, /perf, /rtai, /tools, /tca, /status
+        """
+        addDiagnosticResult(helpText)
+    }
+    #endif
+
+    #if DEBUG
+    /// Run MLXEngine deadlock diagnostic
+    private func runDeadlockDiagnostic() async {
+        logger.info("🔬 Starting deadlock diagnostic...")
+
+        // Create a system message to show we're running diagnostics
+        guard var conversation = currentConversation else {
+            createNewConversation()
+            guard var _ = currentConversation else { return }
+            return
+        }
+
+        let systemMessage = Message(content: "🔬 Running MLXEngine deadlock diagnostic...", role: .assistant)
+        conversation.addMessage(systemMessage)
+        currentConversation = conversation
+
+        // Run the diagnostic
+        guard let engine = aiEngine as? MixtralEngine else {
+            addDiagnosticResult("❌ MixtralEngine not available")
+            return
+        }
+
+        var results: [String] = []
+        results.append("=== DEADLOCK DIAGNOSTIC ===")
+        results.append("Testing MainActor + streaming interaction\n")
+
+        // Test 1: Basic streaming
+        results.append("--- Test 1: Basic Streaming ---")
+        let startTime = Date()
+        var tokenCount = 0
+
+        do {
+            let stream = try await engine.generateStreamingResponse(
+                for: "Say hello briefly",
+                context: []
+            )
+
+            for await _ in stream {
+                tokenCount += 1
+                if tokenCount >= 20 {
+                    break // Quick test
+                }
+            }
+
+            let duration = Date().timeIntervalSince(startTime)
+            results.append("✅ Basic streaming: \(tokenCount) tokens in \(String(format: "%.2f", duration))s")
+
+        } catch {
+            results.append("❌ Basic streaming failed: \(error.localizedDescription)")
+        }
+
+        // Test 2: Sequential requests (2 quick ones)
+        results.append("\n--- Test 2: Sequential Requests ---")
+        for i in 1...2 {
+            let seqStart = Date()
+            var seqTokens = 0
+
+            do {
+                let stream = try await engine.generateStreamingResponse(
+                    for: "Request \(i): Hi",
+                    context: []
+                )
+
+                for await _ in stream {
+                    seqTokens += 1
+                    if seqTokens >= 10 { break }
+                }
+
+                let seqDuration = Date().timeIntervalSince(seqStart)
+                results.append("✅ Request \(i): \(seqTokens) tokens in \(String(format: "%.2f", seqDuration))s")
+
+            } catch {
+                results.append("❌ Request \(i) failed: \(error.localizedDescription)")
+            }
+        }
+
+        // Summary
+        results.append("\n=== DIAGNOSTIC COMPLETE ===")
+        if tokenCount > 0 {
+            results.append("✅ NO DEADLOCK DETECTED - Streaming works correctly")
+        } else {
+            results.append("⚠️ POTENTIAL ISSUE - No tokens received")
+        }
+
+        addDiagnosticResult(results.joined(separator: "\n"))
+    }
+
+    /// Show memory statistics
+    private func showMemoryStats() async {
+        logger.info("📊 Checking memory stats...")
+
+        guard let engine = aiEngine as? MixtralEngine else {
+            addDiagnosticResult("❌ MixtralEngine not available")
+            return
+        }
+
+        let stats = await engine.getMemoryStats()
+        let result = """
+        === MEMORY STATS ===
+        Total Usage: \(ByteCountFormatter.string(fromByteCount: stats.totalMemoryUsage, countStyle: .memory))
+        Model Usage: \(ByteCountFormatter.string(fromByteCount: stats.modelMemoryUsage, countStyle: .memory))
+        Cache Usage: \(ByteCountFormatter.string(fromByteCount: stats.cacheMemoryUsage, countStyle: .memory))
+        Available: \(ByteCountFormatter.string(fromByteCount: stats.availableMemory, countStyle: .memory))
+        Pressure: \(stats.memoryPressureLevel)
+        """
+
+        addDiagnosticResult(result)
+    }
+
+    /// Run rapid-fire stress test
+    private func runStressTest() async {
+        logger.info("💥 Starting stress test...")
+
+        guard let engine = aiEngine as? MixtralEngine else {
+            addDiagnosticResult("❌ MixtralEngine not available")
+            return
+        }
+
+        var results: [String] = []
+        results.append("=== STRESS TEST (5 rapid requests) ===")
+
+        var successCount = 0
+        for i in 1...5 {
+            let start = Date()
+            var tokens = 0
+
+            do {
+                let stream = try await engine.generateStreamingResponse(
+                    for: "Quick \(i)",
+                    context: []
+                )
+
+                for await _ in stream {
+                    tokens += 1
+                    if tokens >= 5 { break }
+                }
+
+                let duration = Date().timeIntervalSince(start)
+                results.append("✅ Request \(i): \(tokens) tokens in \(String(format: "%.2f", duration))s")
+                successCount += 1
+
+            } catch {
+                results.append("❌ Request \(i): \(error.localizedDescription)")
+            }
+
+            // Minimal delay
+            try? await Task.sleep(nanoseconds: 50_000_000) // 0.05s
+        }
+
+        results.append("\nSuccess rate: \(successCount)/5 (\(successCount * 20)%)")
+        addDiagnosticResult(results.joined(separator: "\n"))
+    }
+    #endif
+
+    /// Add diagnostic result as assistant message (available in all builds for admin commands)
+    private func addDiagnosticResult(_ result: String) {
+        guard var conversation = currentConversation else { return }
+
+        let message = Message(content: result, role: .assistant)
+        conversation.addMessage(message)
+        currentConversation = conversation
+        updateConversationInArray(conversation)
+
+        // Save asynchronously
+        Task {
+            try? await dataStore.saveConversation(conversation)
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    /// Strip plain-text thinking/reasoning that Qwen 3.5 outputs without <think> tags.
+    /// The model leaks reasoning in multiple formats:
+    ///   1. "Thinking Process:\n1. **Analyze..."
+    ///   2. "Okay, let me start by understanding..."
+    ///   3. "Wait, but according to the instructions..."
+    /// All share a common signal: they reference internal system details (system prompt,
+    /// remembered facts, RTAI, instructions) that should NEVER appear in user output.
+    static func stripPlainTextThinking(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return text }
+
+        // SIGNAL 1: Contains references to internal system details
+        // A proper response NEVER mentions these — if present, reasoning leaked
+        let internalLeakSignals = [
+            "system prompt", "system instruction", "system message",
+            "remembered facts", "rtai library", "rtai",
+            "according to the instructions", "the instructions say",
+            "analyze the request", "analyze system",
+            "thinking process", "/no_think",
+            "as an llm", "as a model",
+            "prompt context", "prompt provided"
+        ]
+
+        let lower = trimmed.lowercased()
+        let hasInternalLeak = internalLeakSignals.contains { lower.contains($0) }
+
+        // SIGNAL 2: Starts with reasoning preamble patterns
+        let reasoningStarters = [
+            "okay, let me", "ok, let me", "let me start by",
+            "let me think", "let me analyze", "let me understand",
+            "first, i need to", "first, let me",
+            "i need to analyze", "i need to understand",
+            "thinking process"
+        ]
+        let startsWithReasoning = reasoningStarters.contains { lower.hasPrefix($0) }
+
+        // Only strip if we have strong evidence of reasoning leak
+        guard hasInternalLeak || (startsWithReasoning && trimmed.count > 200) else {
+            return text
+        }
+
+        // Strategy: Find the actual answer buried after the reasoning.
+        // The model typically puts reasoning first, then the real answer as the last
+        // paragraph(s) that don't contain internal references.
+
+        // Split into paragraphs (double newline separated)
+        let paragraphs = trimmed.components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        // If only one paragraph, try line-based splitting
+        if paragraphs.count <= 1 {
+            return stripByLines(trimmed, internalLeakSignals: internalLeakSignals)
+        }
+
+        // Find the last paragraph(s) that don't contain internal leak signals
+        // Work backwards from the end — the answer is usually at the bottom
+        var answerParagraphs: [String] = []
+        for paragraph in paragraphs.reversed() {
+            let paraLower = paragraph.lowercased()
+            let isReasoning = internalLeakSignals.contains { paraLower.contains($0) }
+                || paraLower.hasPrefix("wait,")
+                || paraLower.hasPrefix("wait ")
+                || paraLower.hasPrefix("okay, let me")
+                || paraLower.hasPrefix("ok, let me")
+                || paraLower.hasPrefix("let me ")
+                || paraLower.contains("**analyze")
+                || paraLower.contains("**step")
+                || (paraLower.first?.isNumber == true && paraLower.contains("**"))
+
+            if isReasoning {
+                break  // Stop collecting — everything above this is reasoning
+            }
+            answerParagraphs.insert(paragraph, at: 0)
+        }
+
+        let answer = answerParagraphs.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // During streaming, the answer may not exist yet — return empty to hide reasoning
+        // The caller (streaming loop) will show the isThinking indicator instead
+        // Once the full response is in, the answer will be at the end
+        return answer
+    }
+
+    /// Fallback: strip reasoning by lines when paragraph splitting doesn't work
+    private static func stripByLines(_ text: String, internalLeakSignals: [String]) -> String {
+        let lines = text.components(separatedBy: "\n")
+        var answerLines: [String] = []
+
+        for line in lines.reversed() {
+            let lineLower = line.lowercased().trimmingCharacters(in: .whitespaces)
+            let isReasoning = internalLeakSignals.contains { lineLower.contains($0) }
+                || lineLower.hasPrefix("wait,")
+                || lineLower.hasPrefix("okay, let me")
+                || lineLower.hasPrefix("let me start")
+                || lineLower.contains("**analyze")
+            if isReasoning { break }
+            answerLines.insert(line, at: 0)
+        }
+
+        let answer = answerLines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return answer
+    }
+
+    /// Sanitize AI response to remove JSON artifacts, tool calls, and schemas
+    /// This ensures clean text-only output when tool calling is disabled
+    /// - Parameter response: The raw AI response
+    /// - Returns: Clean text response suitable for display
+    private func sanitizeResponse(_ response: String) -> String {
+        var clean = response
+
+        // Remove <tool_call>...</tool_call> blocks
+        clean = clean.replacingOccurrences(
+            of: #"<tool_call>[\s\S]*?</tool_call>"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove <tools>...</tools> schema blocks (JSON vomit fix)
+        clean = clean.replacingOccurrences(
+            of: #"<tools>[\s\S]*?</tools>"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove standalone JSON objects (tool schemas)
+        clean = clean.replacingOccurrences(
+            of: #"\{[^{}]*"type"\s*:\s*"function"[^{}]*\}"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove TOOL: lines
+        clean = clean.replacingOccurrences(
+            of: #"TOOL:[^\n]*\n?"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove any remaining JSON arrays that look like tool definitions
+        clean = clean.replacingOccurrences(
+            of: #"\[\s*\{[^]]*"function"[^]]*\}\s*\]"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove XML-style function calls like <launch_app ... />
+        clean = clean.replacingOccurrences(
+            of: #"<\w+[^>]*/>"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Remove phrases that reference tool usage when tools are disabled
+        let toolPhrases = [
+            "To open or interact with",
+            "you must use the tools",
+            "Here's how:",
+            "I'll use the",
+            "Let me use the",
+            "Using the tool"
+        ]
+        for phrase in toolPhrases {
+            clean = clean.replacingOccurrences(of: phrase, with: "", options: .caseInsensitive)
+        }
+
+        // Clean up excessive whitespace
+        clean = clean.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // If after sanitization the response is too short, provide a helpful message
+        if clean.count < 5 {
+            return "I understand. Is there anything else I can help you with?"
+        }
+
+        return clean
+    }
+
+    /// Extract confidence level from AI response
+    /// - Parameter response: The AI response text
+    /// - Returns: Confidence score between 0.0 and 1.0
+    private func extractConfidence(from response: String) -> Double {
+        let lowerResponse = response.lowercased()
+
+        // High uncertainty phrases (very low confidence)
+        let highUncertaintyPhrases = [
+            "i don't know",
+            "i'm not sure",
+            "i cannot confirm",
+            "i don't have information",
+            "i'm unable to",
+            "i cannot find",
+            "unfortunately, i don't",
+            "i don't have access to"
+        ]
+
+        for phrase in highUncertaintyPhrases {
+            if lowerResponse.contains(phrase) {
+                return 0.3  // Very low confidence
+            }
+        }
+
+        // Medium uncertainty phrases
+        let mediumUncertaintyPhrases = [
+            "unclear",
+            "possibly",
+            "might be",
+            "could be",
+            "i think",
+            "it seems",
+            "appears to be",
+            "i believe",
+            "not certain"
+        ]
+
+        for phrase in mediumUncertaintyPhrases {
+            if lowerResponse.contains(phrase) {
+                return 0.5  // Medium confidence
+            }
+        }
+
+        // Check for hedging language
+        let hedgingPhrases = [
+            "generally",
+            "typically",
+            "usually",
+            "in most cases",
+            "it depends"
+        ]
+
+        for phrase in hedgingPhrases {
+            if lowerResponse.contains(phrase) {
+                return 0.7  // Moderate confidence
+            }
+        }
+
+        // Default: reasonably confident
+        return 0.85
+    }
+
+    // MARK: - TCA Proactive Follow-ups
+
+    /// Check if user is requesting a follow-up (e.g., "remind me about this in 3 days")
+    private func checkForFollowUpRequest(_ message: String) {
+        let lower = message.lowercased()
+
+        // Pattern: "follow up in X days" or "check back in X days"
+        let patterns = [
+            #"follow\s*up\s+(?:on\s+this\s+)?in\s+(\d+)\s+days?"#,
+            #"check\s+back\s+in\s+(\d+)\s+days?"#,
+            #"remind\s+me\s+(?:about\s+this\s+)?in\s+(\d+)\s+days?"#,
+        ]
+
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               let match = regex.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)) {
+                // Extract days
+                if let daysRange = Range(match.range(at: 1), in: lower),
+                   let days = Int(lower[daysRange]) {
+                    // Extract topic from conversation context
+                    let topic = extractTopicFromConversation()
+                    ProactiveScheduler.shared.scheduleFollowUp(topic: topic, inDays: days, context: message)
+                    logger.info("📅 Scheduled follow-up in \(days) days for: \(topic)")
+                    return
+                }
+            }
+        }
+    }
+
+    /// Extract the topic from recent conversation for follow-up context
+    private func extractTopicFromConversation() -> String {
+        guard let conversation = currentConversation else {
+            return "our conversation"
+        }
+
+        // Get recent messages
+        let recentMessages = conversation.messages.suffix(5)
+        let userMessages = recentMessages.filter { $0.role == .user }
+
+        // Use the first substantial user message as the topic
+        for message in userMessages {
+            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if content.count > 10 && content.count < 100 {
+                return content
+            }
+        }
+
+        return "what we discussed"
+    }
+
+    // MARK: - TCA Behavioral Categorization
+
+    /// Categorize user message into action type for behavioral learning
+    private func categorizeUserAction(_ message: String) -> String {
+        let lower = message.lowercased()
+
+        // Weather check — specific category for pattern detection
+        if lower.contains("weather") || lower.contains("temperature") || lower.contains("forecast")
+            || lower.contains("rain") || lower.contains("sunny") || lower.contains("cold outside") || lower.contains("hot outside") {
+            return "weather_check"
+        }
+
+        // Briefing/morning
+        if lower.contains("morning") || lower.contains("brief") {
+            return "morning_briefing"
+        }
+
+        // Calendar
+        if lower.contains("calendar") || lower.contains("schedule") || lower.contains("meeting") || lower.contains("event") {
+            return "calendar_check"
+        }
+
+        // Reminders
+        if lower.contains("remind") || lower.contains("reminder") {
+            return "create_reminder"
+        }
+
+        // Notes
+        if lower.contains("note") || lower.contains("notes") {
+            return "notes_action"
+        }
+
+        // Music
+        if lower.contains("play") || lower.contains("music") || lower.contains("song") || lower.contains("pause") || lower.contains("stop") {
+            return "media_control"
+        }
+
+        // Screen/context
+        if lower.contains("screen") || lower.contains("looking at") {
+            return "screen_context"
+        }
+
+        // Web search
+        if lower.contains("search") || lower.contains("google") {
+            return "web_search"
+        }
+
+        // Email
+        if lower.contains("email") || lower.contains("mail") {
+            return "email_action"
+        }
+
+        // App launch — use specific app names for better pattern detection
+        if lower.contains("open") || lower.contains("launch") {
+            // Detect specific apps for granular TCA patterns
+            let appNames = ["safari", "chrome", "firefox", "notes", "calendar", "mail",
+                            "music", "spotify", "messages", "slack", "terminal", "finder",
+                            "xcode", "vscode", "code"]
+            for app in appNames {
+                if lower.contains(app) {
+                    return "app_launch_\(app)"
+                }
+            }
+            return "app_launch"
+        }
+
+        // File operations
+        if lower.contains("file") || lower.contains("folder") || lower.contains("document") || lower.contains("~/") {
+            return "file_operation"
+        }
+
+        // General conversation
+        return "conversation"
+    }
+
+    // MARK: - Teaching Intent Detection
+
+    /// Detect if a user message is explicit teaching content.
+    /// Triggers: long content (200+ chars) with teaching signal words,
+    /// or "learn this" / "teach you" / "here's info about" prefixes.
+    static func isTeachingIntent(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        let length = message.count
+
+        // Short messages are never teaching content
+        guard length >= 100 else { return false }
+
+        // Explicit teaching signals (any length >= 100)
+        let teachingPrefixes = [
+            "learn this", "remember this", "here's info",
+            "here is info", "teach you", "let me teach",
+            "study this", "memorize this", "learn about",
+            "here's what i know about", "here is what i know about",
+            "save this", "know this"
+        ]
+
+        for prefix in teachingPrefixes {
+            if lower.hasPrefix(prefix) || lower.contains(prefix) {
+                return true
+            }
+        }
+
+        // Long paste (500+ chars) — likely an article, press release, or reference material
+        if length >= 500 {
+            return true
+        }
+
+        return false
+    }
+}
+

@@ -1,0 +1,14 @@
+{
+  "name": "serena-two-stage-tests",
+  "category": "testing-methodology",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/TwoStage/StyleCoordinatorTwoStageTests.swift",
+  "line_count": 444,
+  "why": "Two-stage methodology: negative control + positive validation",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

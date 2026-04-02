@@ -1,0 +1,13 @@
+{
+  "name": "serena-mcp-client",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/MCP/MCPClient.swift",
+  "line_count": 420,
+  "why": "JSON-RPC client, request/response correlation, timeout handling",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,13 @@
+{
+  "name": "bash-tool-execution",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/tools/bash.rs",
+  "line_count": 615,
+  "why": "Shell execution, working dir persistence, timeout, streaming output",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,1 @@
+{"name": "knowledge-sampler", "category": "inference", "source_file": "/Users/michaelfolk/Developer/forge/src/inference/knowledge_sampler.rs", "line_count":      536, "why": "Forge inference/knowledge_sampler.rs", "distill_as": ["instruction", "conversation"]}

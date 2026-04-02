@@ -1,0 +1,602 @@
+import Foundation
+import os.log
+
+/// Central orchestrator that routes between RTAI tasks and standard LLM queries
+@MainActor
+class SerenaOrchestrator: ObservableObject {
+    @Published private(set) var isProcessing = false
+    @Published private(set) var lastProcessingType: ProcessingType?
+    @Published private(set) var mcpStatus: MCPStatus = .notConfigured
+
+    private let aiEngine: any AIEngine
+    private let rtaiManager: RTAIManager
+    private let configManager: ConfigManager
+    private let logger = Logger(subsystem: "com.serenanet.orchestrator", category: "SerenaOrchestrator")
+
+    // NEW: Knowledge expansion integration
+    private let knowledgeExpansion: KnowledgeExpansionService?
+    private let adapterSystem: MinimalAdapterSystem?
+
+    // NEW: Hybrid routing (RTAI → Adapter → Base Model)
+    private let hybridRouter: HybridAdapterRouter?
+
+    // MCP integration
+    private let mcpClientManager = MCPClientManager.shared
+    private let mcpToolBridge = MCPToolBridge.shared
+
+    enum ProcessingType {
+        case rtai
+        case adapter
+        case standardLLM
+        case mcp
+    }
+
+    enum MCPStatus {
+        case notConfigured
+        case connecting
+        case connected(serverCount: Int)
+        case error(String)
+    }
+
+    init(aiEngine: any AIEngine, configManager: ConfigManager) {
+        self.aiEngine = aiEngine
+        self.rtaiManager = RTAIManager.shared
+        self.configManager = configManager
+
+        // Initialize knowledge expansion if enabled
+        let config = SerenaConfig.shared
+        if config.features.knowledgeExpansionEnabled {
+            let keService = KnowledgeExpansionService.shared
+            self.knowledgeExpansion = keService
+            self.adapterSystem = MinimalAdapterSystem(
+                config: config,
+                knowledgeExpansionService: keService
+            )
+            logger.info("✅ Knowledge expansion enabled")
+        } else {
+            self.knowledgeExpansion = nil
+            self.adapterSystem = nil
+            logger.info("ℹ️  Knowledge expansion disabled")
+        }
+
+        // Initialize hybrid routing if enabled
+        if config.features.hybridRoutingEnabled {
+            let adapterCache = AdapterCacheManager()
+            HybridAdapterRouter.initializeShared(
+                rtaiManager: self.rtaiManager,
+                adapterCache: adapterCache,
+                config: config
+            )
+            self.hybridRouter = HybridAdapterRouter.shared
+            // Wire up the base model provider to use our AIEngine
+            self.hybridRouter?.setBaseModelProvider { [weak self] query, context in
+                guard let self = self else { throw SerenaError.aiModelNotLoaded }
+                return try await self.aiEngine.generateResponse(for: query, context: context)
+            }
+            logger.info("✅ Hybrid routing enabled (RTAI → Adapter → Base Model)")
+        } else {
+            self.hybridRouter = nil
+            logger.info("ℹ️  Hybrid routing disabled")
+        }
+    }
+    
+    // MARK: - Main Processing Entry Point
+
+    /// Process user input through appropriate AI system
+    /// - Parameters:
+    ///   - input: The user's input text
+    ///   - context: Previous conversation messages
+    ///   - bypassRTAI: If true, skip RTAI and go directly to LLM (use for internal system prompts like summaries)
+    func processInput(_ input: String, context: [Message] = [], bypassRTAI: Bool = false) async throws -> String {
+        isProcessing = true
+        defer { isProcessing = false }
+
+        logger.info("Processing input (length: \(input.count), bypassRTAI: \(bypassRTAI))")
+
+        // Check if RTAI is enabled and if this is an RTAI task (unless bypassed)
+        if !bypassRTAI && configManager.userConfig.rtaiEnabled && rtaiManager.isRTAITask(input) {
+            return try await handleRTAITask(input, context: context)
+        } else {
+            return try await handleStandardLLMQuery(input, context: context, bypassRTAI: bypassRTAI)
+        }
+    }
+
+    /// Process user input with streaming (token by token) through AI system
+    func processInputStreaming(_ input: String, context: [Message] = []) -> AsyncThrowingStream<String, Error> {
+        return AsyncThrowingStream { continuation in
+            Task {
+                await MainActor.run { self.isProcessing = true }
+                defer { Task { await MainActor.run { self.isProcessing = false } } }
+
+                self.logger.info("🌊 Processing input with streaming (length: \(input.count))")
+
+                // NOTE: RTAI check is already done by ChatManager before calling this method.
+                // Skipping duplicate RTAI check here to avoid double-processing queries that
+                // fall through with low confidence (saves ~1-2s per query).
+
+                // Use streaming for LLM queries
+                do {
+                    // Build the prompt using the same logic as non-streaming
+                    // We need to call the AI engine's streaming method
+                    guard self.aiEngine.isReady else {
+                        throw SerenaError.aiModelNotLoaded
+                    }
+
+                    await MainActor.run { self.lastProcessingType = .standardLLM }
+                    self.logger.info("🌊 Starting streaming from AI engine...")
+
+                    // Get the streaming response from the AI engine
+                    let stream = try await self.aiEngine.generateStreamingResponse(for: input, context: context)
+
+                    for await token in stream {
+                        continuation.yield(token)
+                    }
+
+                    self.logger.info("🌊 Streaming complete")
+                    continuation.finish()
+
+                } catch {
+                    self.logger.error("❌ Streaming failed: \(error.localizedDescription)")
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+    
+    // MARK: - RTAI Task Handling
+    
+    private func handleRTAITask(_ input: String, context: [Message] = []) async throws -> String {
+        lastProcessingType = .rtai
+        logger.info("Routing to RTAI system")
+
+        do {
+            let result = try await rtaiManager.handle(input)
+            logger.info("RTAI task completed successfully")
+
+            // Layer 2: Feed RTAI success into ConfidenceMap (disabled until tested)
+            if FeatureFlags.proactiveIntelligenceEnabled {
+                Task.detached { await ProactiveIntegrationBridge.shared.observeRTAIQuery(
+                    query: input, topic: input, confidence: 0.9, wasSuccessful: true
+                ) }
+            }
+
+            return result
+        } catch {
+            logger.error("RTAI task failed: \(error.localizedDescription)")
+
+            // Layer 2: Feed RTAI failure into ConfidenceMap (disabled until tested)
+            if FeatureFlags.proactiveIntelligenceEnabled {
+                Task.detached { await ProactiveIntegrationBridge.shared.observeFallback(
+                    query: input, topic: input, fromSource: .rtai, toSource: .llm, finalConfidence: 0.3
+                ) }
+            }
+
+            // Fallback to standard LLM if RTAI fails - PRESERVE CONTEXT!
+            logger.info("Falling back to standard LLM processing with \(context.count) context messages")
+            return try await handleStandardLLMQuery(input, context: context)
+        }
+    }
+    
+    // MARK: - Standard LLM Query Handling
+
+    private func handleStandardLLMQuery(_ input: String, context: [Message], bypassRTAI: Bool = false) async throws -> String {
+        logger.info("Routing to standard LLM system (bypassRTAI: \(bypassRTAI))")
+
+        // RTAI result - only populated if we don't bypass
+        var rtaiResult = RTAIProcessingResult(success: false, response: "", processingTimeMs: 0, confidence: 0.0, errorMessage: nil)
+
+        // Skip RTAI bridge if bypassed (used for internal system prompts like summaries)
+        if !bypassRTAI {
+            // First try the RTAI bridge for intelligent processing
+            let rtaiBridge = RTAIBridge.shared
+            rtaiResult = await rtaiBridge.processText(input, context: context)
+
+            // Only use RTAI for very high confidence reflexive responses (0.85+)
+            // This allows the AI engine to handle most queries with conversation context
+            if rtaiResult.success && rtaiResult.confidence > 0.85 {
+                logger.info("RTAI bridge provided high-confidence reflexive response (\(String(format: "%.2f", rtaiResult.confidence)))")
+                lastProcessingType = .rtai
+
+                // Layer 2: Feed high-confidence RTAI hit into ConfidenceMap (disabled until tested)
+                if FeatureFlags.proactiveIntelligenceEnabled {
+                    let conf = rtaiResult.confidence
+                    Task.detached { await ProactiveIntegrationBridge.shared.observeRTAIQuery(
+                        query: input, topic: input, confidence: conf, wasSuccessful: true
+                    ) }
+                }
+
+                // Log for knowledge expansion (non-blocking)
+                if let ke = knowledgeExpansion {
+                    Task.detached {
+                        let domain = KnowledgeExpansionService.classifyDomain(query: input)
+                        await ke.logInteraction(query: input, response: rtaiResult.response, domain: domain)
+                    }
+                }
+
+                return rtaiResult.response
+            }
+        }
+
+        // Prefer AI engine for context-aware responses
+        guard aiEngine.isReady else {
+            // If AI engine not ready but RTAI gave us something, use it
+            if rtaiResult.success && !rtaiResult.response.isEmpty {
+                logger.info("Using RTAI response as fallback (AI engine not ready)")
+                lastProcessingType = .rtai
+                return rtaiResult.response
+            }
+            throw SerenaError.aiModelNotLoaded
+        }
+
+        // NEW: Try adapter system if enabled
+        if let adapters = adapterSystem {
+            do {
+                let adapterResponse = try await adapters.query(input) { query in
+                    // Fallback to AI engine
+                    return try await self.aiEngine.generateResponse(for: query, context: context)
+                }
+
+                // Log the interaction (non-blocking)
+                if let ke = knowledgeExpansion {
+                    Task.detached {
+                        await ke.logInteraction(
+                            query: input,
+                            response: adapterResponse.text,
+                            domain: adapterResponse.domain
+                        )
+                    }
+                }
+
+                // Update processing type based on source
+                switch adapterResponse.source {
+                case .adapter:
+                    lastProcessingType = .adapter
+                    logger.info("✅ Adapter response (\(String(format: "%.0f", adapterResponse.responseTime))ms)")
+                case .baseModel:
+                    lastProcessingType = .standardLLM
+                    logger.info("✅ Base model response (\(String(format: "%.0f", adapterResponse.responseTime))ms)")
+                }
+
+                return adapterResponse.text
+
+            } catch {
+                logger.warning("Adapter system failed, falling back to AI engine: \(error.localizedDescription)")
+            }
+        }
+
+        // Standard AI engine query
+        do {
+            lastProcessingType = .standardLLM
+            logger.info("🟠 SerenaOrchestrator: Calling aiEngine.generateResponse...")
+            let result = try await aiEngine.generateResponse(for: input, context: context)
+            logger.info("🟠 SerenaOrchestrator: Got result from aiEngine (\(result.count) chars): '\(result.prefix(100))...'")
+            logger.info("🟠 SerenaOrchestrator: Standard LLM query completed successfully with context (\(context.count) messages)")
+
+            // Log for knowledge expansion (non-blocking)
+            if let ke = knowledgeExpansion {
+                Task.detached {
+                    let domain = KnowledgeExpansionService.classifyDomain(query: input)
+                    await ke.logInteraction(query: input, response: result, domain: domain)
+                }
+            }
+
+            // Layer 2: Feed LLM response confidence into ConfidenceMap (disabled until tested)
+            if FeatureFlags.proactiveIntelligenceEnabled {
+                Task.detached { await ProactiveIntegrationBridge.shared.observeLLMResponse(
+                    query: input, confidence: 0.75
+                ) }
+            }
+
+            logger.info("🟠 SerenaOrchestrator: Returning result (\(result.count) chars)")
+            return result
+        } catch {
+            logger.error("❌ SerenaOrchestrator: Standard LLM query failed: \(error.localizedDescription)")
+
+            // Final fallback to RTAI if available
+            if rtaiResult.success && !rtaiResult.response.isEmpty {
+                logger.info("Using RTAI as final fallback")
+                lastProcessingType = .rtai
+                return rtaiResult.response
+            }
+
+            throw error
+        }
+    }
+    
+    // MARK: - Orchestrator Status
+    
+    /// Check if the orchestrator is ready to process requests
+    var isReady: Bool {
+        return aiEngine.isReady
+    }
+    
+    /// Get current processing status
+    var processingStatus: String {
+        if isProcessing {
+            switch lastProcessingType {
+            case .rtai:
+                return "Processing RTAI task..."
+            case .adapter:
+                return "Processing with specialized adapter..."
+            case .standardLLM:
+                return "Processing with AI model..."
+            case .mcp:
+                return "Processing with MCP tool..."
+            case .none:
+                return "Processing..."
+            }
+        } else {
+            return "Ready"
+        }
+    }
+
+    /// Trigger knowledge expansion sync (when docked)
+    func syncKnowledgeExpansion() async -> (success: Bool, message: String) {
+        guard let ke = knowledgeExpansion else {
+            return (false, "Knowledge expansion not enabled")
+        }
+
+        logger.info("🏠 Triggering knowledge expansion sync...")
+        let result = await ke.syncAndExpandWhenDocked()
+
+        if result.success {
+            // Reload adapters after expansion
+            if let adapters = adapterSystem {
+                await adapters.reloadAdapters()
+                logger.info("🔄 Adapters reloaded")
+            }
+        }
+
+        return result
+    }
+
+    /// Get knowledge expansion statistics
+    func getKnowledgeExpansionStats() -> (bufferCount: Int, canSync: Bool, adaptersLoaded: Int) {
+        guard let ke = knowledgeExpansion else {
+            return (0, false, 0)
+        }
+
+        let bufferStats = ke.getBufferStats()
+        let adaptersLoaded = adapterSystem?.getLoadedAdapters().count ?? 0
+
+        return (bufferStats.count, bufferStats.canSync, adaptersLoaded)
+    }
+    
+    /// Check if RTAI is currently enabled
+    var isRTAIEnabled: Bool {
+        return configManager.userConfig.rtaiEnabled
+    }
+    
+    // MARK: - Configuration Management
+    
+    /// Toggle RTAI functionality
+    func toggleRTAI(_ enabled: Bool) {
+        configManager.userConfig.rtaiEnabled = enabled
+        configManager.saveConfiguration()
+        
+        logger.info("RTAI \(enabled ? "enabled" : "disabled")")
+    }
+    
+    // MARK: - Diagnostics and Monitoring
+    
+    /// Get orchestrator diagnostics
+    func getDiagnostics() -> OrchestratorDiagnostics {
+        let rtaiStats = rtaiManager.getExecutionStats()
+        
+        return OrchestratorDiagnostics(
+            isReady: isReady,
+            isRTAIEnabled: isRTAIEnabled,
+            aiEngineReady: aiEngine.isReady,
+            aiEngineMemoryUsage: aiEngine.memoryUsage,
+            rtaiStats: rtaiStats,
+            lastProcessingType: lastProcessingType
+        )
+    }
+    
+    /// Get recent RTAI executions for monitoring
+    func getRecentRTAIExecutions(limit: Int = 5) -> [RTAIExecution] {
+        return rtaiManager.getRecentExecutions(limit: limit)
+    }
+    
+    // MARK: - Example RTAI Task Generation
+    
+    /// Generate example RTAI task for testing/demonstration
+    func generateExampleRTAITask(type: RTAITaskType = .summary) -> String {
+        switch type {
+        case .summary:
+            return """
+            @taskid: generateSummary
+            input: This is a long document that needs to be summarized for quick understanding.
+            tool: summarizer_v1
+            route: default
+            verify: signature
+            """
+            
+        case .analysis:
+            return """
+            @taskid: analyze
+            input: User feedback data from the last quarter showing mixed satisfaction scores.
+            tool: analyzer_v2
+            route: priority
+            verify: checksum
+            """
+            
+        case .translation:
+            return """
+            @taskid: translate
+            input: Hello, how are you doing today?
+            tool: translator_v1
+            route: default
+            verify: none
+            """
+            
+        case .extraction:
+            return """
+            @taskid: extract
+            input: Extract key metrics from the quarterly report document.
+            tool: extractor_v1
+            route: default
+            verify: signature
+            """
+        }
+    }
+}
+
+// MARK: - Supporting Types
+
+enum RTAITaskType: CaseIterable {
+    case summary
+    case analysis
+    case translation
+    case extraction
+    
+    var displayName: String {
+        switch self {
+        case .summary:
+            return "Summary"
+        case .analysis:
+            return "Analysis"
+        case .translation:
+            return "Translation"
+        case .extraction:
+            return "Extraction"
+        }
+    }
+}
+
+struct OrchestratorDiagnostics {
+    let isReady: Bool
+    let isRTAIEnabled: Bool
+    let aiEngineReady: Bool
+    let aiEngineMemoryUsage: Int64
+    let rtaiStats: RTAIStats
+    let lastProcessingType: SerenaOrchestrator.ProcessingType?
+
+    var memoryUsageFormatted: String {
+        let mb = Double(aiEngineMemoryUsage) / (1024 * 1024)
+        return String(format: "%.1f MB", mb)
+    }
+
+    var statusSummary: String {
+        if !isReady {
+            return "Not Ready - AI Engine Loading"
+        } else if isRTAIEnabled {
+            return "Ready - RTAI Enabled"
+        } else {
+            return "Ready - Standard Mode"
+        }
+    }
+}
+
+// MARK: - MCP Integration Extension
+
+extension SerenaOrchestrator {
+    /// Initialize MCP servers based on stored API keys
+    /// Called during app startup, after other services are ready
+    /// Gated by SERENA_MCP_ENABLED feature flag (disabled by default)
+    func initializeMCPServers() async {
+        // Check feature flag - MCP is disabled by default (personal builds only)
+        guard SerenaConfig.shared.features.mcpEnabled else {
+            logger.info("🔌 MCP disabled (set SERENA_MCP_ENABLED=true to enable)")
+            mcpStatus = .notConfigured
+            return
+        }
+
+        logger.info("🔌 Initializing MCP servers...")
+        mcpStatus = .connecting
+
+        var connectedCount = 0
+        var errors: [String] = []
+
+        // Check for Notion API key and connect if available
+        if let notionKey = MCPKeychainManager.shared.retrieveNotionAPIKey() {
+            do {
+                await mcpClientManager.setupNotionServer(apiKey: notionKey)
+                try await mcpClientManager.connect(serverName: "notion")
+                connectedCount += 1
+                logger.info("✅ Connected to Notion MCP server")
+            } catch {
+                let msg = "Notion MCP failed: \(error.localizedDescription)"
+                errors.append(msg)
+                logger.error("❌ \(msg)")
+            }
+        }
+
+        // Check for GitHub token and connect if available
+        if let githubToken = MCPKeychainManager.shared.retrieveGitHubToken() {
+            do {
+                await mcpClientManager.setupGitHubServer(token: githubToken)
+                try await mcpClientManager.connect(serverName: "github")
+                connectedCount += 1
+                logger.info("✅ Connected to GitHub MCP server")
+            } catch {
+                let msg = "GitHub MCP failed: \(error.localizedDescription)"
+                errors.append(msg)
+                logger.error("❌ \(msg)")
+            }
+        }
+
+        // Register MCP tools after connecting
+        if connectedCount > 0 {
+            do {
+                try await self.mcpToolBridge.registerMCPTools()
+                logger.info("✅ Registered \(self.mcpToolBridge.registeredToolNames.count) MCP tools")
+            } catch {
+                logger.error("❌ Failed to register MCP tools: \(error.localizedDescription)")
+            }
+        }
+
+        // Update status
+        if connectedCount > 0 {
+            mcpStatus = .connected(serverCount: connectedCount)
+            logger.info("🔌 MCP initialized: \(connectedCount) server(s) connected")
+        } else if !errors.isEmpty {
+            mcpStatus = .error(errors.joined(separator: "; "))
+        } else {
+            mcpStatus = .notConfigured
+            logger.info("🔌 No MCP servers configured (no API keys found)")
+        }
+    }
+
+    /// Shutdown all MCP servers
+    /// Called during app termination
+    func shutdownMCPServers() async {
+        logger.info("🔌 Shutting down MCP servers...")
+
+        // Unregister tools
+        mcpToolBridge.unregisterAllTools()
+
+        // Disconnect all servers
+        do {
+            try await mcpClientManager.disconnectAll()
+            logger.info("✅ All MCP servers disconnected")
+        } catch {
+            logger.error("❌ Error disconnecting MCP servers: \(error.localizedDescription)")
+        }
+
+        mcpStatus = .notConfigured
+    }
+
+    /// Get list of connected MCP servers
+    var connectedMCPServers: [String] {
+        get async {
+            return await mcpClientManager.connectedServers
+        }
+    }
+
+    /// Get list of available MCP tools
+    var availableMCPTools: [String] {
+        return mcpToolBridge.registeredToolNames
+    }
+
+    /// Check if an MCP tool is available
+    func hasMCPTool(_ name: String) -> Bool {
+        return mcpToolBridge.isMCPTool(name)
+    }
+
+    /// Execute an MCP tool directly
+    func executeMCPTool(name: String, arguments: [String: Any]) async throws -> ToolResult {
+        lastProcessingType = .mcp
+        return try await mcpToolBridge.executeMCPTool(name: name, arguments: arguments)
+    }
+}

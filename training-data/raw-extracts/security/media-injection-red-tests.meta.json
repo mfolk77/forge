@@ -1,0 +1,13 @@
+{
+  "name": "media-injection-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/MediaInjectionRedTests.swift",
+  "line_count": 118,
+  "why": "EXIF injection",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

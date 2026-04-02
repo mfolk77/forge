@@ -1,0 +1,1479 @@
+import XCTest
+import CryptoKit
+@testable import SerenaCore
+
+/// Red tests for VA Lighthouse API integration
+/// Target files:
+///   - Sources/SerenaCore/Services/VA/VAModels.swift
+///   - Sources/SerenaCore/Services/VA/VAAuthManager.swift
+///   - Sources/SerenaCore/Services/VA/VAAPIClient.swift
+///   - Sources/SerenaCore/Services/VA/VADataCache.swift
+///   - Sources/SerenaCore/Services/VA/VAToolHandler.swift
+///
+/// Tests use fabricated but realistic veteran data to validate all VA module
+/// functionality without needing real API access or sandbox credentials.
+
+// MARK: - Mock Veteran Data Factory
+
+/// Generates realistic mock VA data for testing
+private enum MockVeteranData {
+    static let now = Date()
+
+    // MARK: - Tokens
+
+    static func validTokens(scopes: [VAScope] = VAScope.allCases) -> VATokens {
+        VATokens(
+            accessToken: "mock-access-token-abc123",
+            refreshToken: "mock-refresh-token-xyz789",
+            expiresAt: now.addingTimeInterval(3600), // 1 hour from now
+            scope: scopes.map(\.rawValue).joined(separator: " "),
+            tokenType: "Bearer"
+        )
+    }
+
+    static func expiredTokens() -> VATokens {
+        VATokens(
+            accessToken: "mock-expired-token",
+            refreshToken: "mock-refresh-token",
+            expiresAt: now.addingTimeInterval(-3600), // 1 hour ago
+            scope: "claim.read",
+            tokenType: "Bearer"
+        )
+    }
+
+    static func expiringTokens(inSeconds seconds: TimeInterval = 120) -> VATokens {
+        VATokens(
+            accessToken: "mock-expiring-token",
+            refreshToken: "mock-refresh-token",
+            expiresAt: now.addingTimeInterval(seconds),
+            scope: VAScope.allCases.map(\.rawValue).joined(separator: " "),
+            tokenType: "Bearer"
+        )
+    }
+
+    // MARK: - Claims
+
+    static func activeClaims() -> [VAClaim] {
+        [
+            VAClaim(
+                id: "claim-001",
+                type: "compensation",
+                status: .evidenceGathering,
+                submittedDate: now.addingTimeInterval(-86400 * 30), // 30 days ago
+                lastUpdated: now.addingTimeInterval(-86400 * 2), // 2 days ago
+                description: "Increase for PTSD (currently 50%)",
+                phase: 3,
+                documentsNeeded: true,
+                decisionLetterSent: false
+            ),
+            VAClaim(
+                id: "claim-002",
+                type: "compensation",
+                status: .preparationForDecision,
+                submittedDate: now.addingTimeInterval(-86400 * 90), // 90 days ago
+                lastUpdated: now.addingTimeInterval(-86400 * 7), // 7 days ago
+                description: "Service connection for tinnitus",
+                phase: 5,
+                documentsNeeded: false,
+                decisionLetterSent: false
+            ),
+            VAClaim(
+                id: "claim-003",
+                type: "compensation",
+                status: .complete,
+                submittedDate: now.addingTimeInterval(-86400 * 180), // 6 months ago
+                lastUpdated: now.addingTimeInterval(-86400 * 14), // 2 weeks ago
+                description: "Service connection for lumbar strain",
+                phase: 8,
+                documentsNeeded: false,
+                decisionLetterSent: true
+            )
+        ]
+    }
+
+    // MARK: - Disability Rating
+
+    static func disabilityRating() -> VADisabilityRating {
+        VADisabilityRating(
+            combinedRating: 70,
+            individualRatings: [
+                .init(condition: "PTSD", ratingPercentage: 50, effectiveDate: now.addingTimeInterval(-86400 * 365), staticIndicator: false),
+                .init(condition: "Lumbar strain", ratingPercentage: 20, effectiveDate: now.addingTimeInterval(-86400 * 180), staticIndicator: false),
+                .init(condition: "Tinnitus", ratingPercentage: 10, effectiveDate: now.addingTimeInterval(-86400 * 365 * 3), staticIndicator: true),
+            ]
+        )
+    }
+
+    // MARK: - Appointments
+
+    static func appointments() -> [VAAppointment] {
+        [
+            VAAppointment(
+                id: "appt-001",
+                status: .booked,
+                startDate: now.addingTimeInterval(86400 * 7), // 1 week from now
+                endDate: now.addingTimeInterval(86400 * 7 + 3600),
+                location: "VA Portland Medical Center",
+                practitioner: "Dr. Sarah Johnson",
+                appointmentType: "Mental Health - Individual",
+                reasonForVisit: "PTSD follow-up",
+                isVideoVisit: false
+            ),
+            VAAppointment(
+                id: "appt-002",
+                status: .booked,
+                startDate: now.addingTimeInterval(86400 * 14), // 2 weeks from now
+                location: nil,
+                practitioner: "Dr. Michael Chen",
+                appointmentType: "Primary Care",
+                reasonForVisit: "Annual physical",
+                isVideoVisit: true
+            ),
+            VAAppointment(
+                id: "appt-003",
+                status: .fulfilled,
+                startDate: now.addingTimeInterval(-86400 * 30), // 30 days ago
+                location: "VA Portland Medical Center",
+                practitioner: "Dr. Emily Rodriguez",
+                appointmentType: "Audiology",
+                isVideoVisit: false
+            ),
+            VAAppointment(
+                id: "appt-004",
+                status: .cancelled,
+                startDate: now.addingTimeInterval(86400 * 3), // 3 days from now
+                location: "VA Portland Medical Center",
+                appointmentType: "Orthopedics",
+                isVideoVisit: false
+            )
+        ]
+    }
+
+    // MARK: - Medications
+
+    static func medications() -> [VAMedication] {
+        [
+            VAMedication(
+                id: "med-001",
+                name: "Sertraline (Zoloft)",
+                dosage: "100 mg",
+                frequency: "Once daily",
+                prescriber: "Dr. Sarah Johnson",
+                status: .active,
+                startDate: now.addingTimeInterval(-86400 * 365),
+                refillsRemaining: 3,
+                pharmacy: "VA Portland Pharmacy",
+                instructions: "Take one tablet by mouth once daily in the morning"
+            ),
+            VAMedication(
+                id: "med-002",
+                name: "Ibuprofen",
+                dosage: "800 mg",
+                frequency: "Three times daily as needed",
+                prescriber: "Dr. Emily Rodriguez",
+                status: .active,
+                startDate: now.addingTimeInterval(-86400 * 90),
+                refillsRemaining: 1,
+                pharmacy: "VA Portland Pharmacy",
+                instructions: "Take one tablet by mouth three times daily with food as needed for pain"
+            ),
+            VAMedication(
+                id: "med-003",
+                name: "Melatonin",
+                dosage: "5 mg",
+                frequency: "Once daily at bedtime",
+                status: .active,
+                startDate: now.addingTimeInterval(-86400 * 60),
+                instructions: "Take one tablet by mouth at bedtime"
+            )
+        ]
+    }
+
+    // MARK: - Lab Results
+
+    static func labResults() -> [VALabResult] {
+        [
+            VALabResult(
+                id: "lab-001",
+                testName: "Hemoglobin A1C",
+                value: "5.6",
+                unit: "%",
+                referenceRange: "4.0 - 5.6",
+                status: .final_,
+                effectiveDate: now.addingTimeInterval(-86400 * 14),
+                isAbnormal: false,
+                category: "laboratory"
+            ),
+            VALabResult(
+                id: "lab-002",
+                testName: "Total Cholesterol",
+                value: "245",
+                unit: "mg/dL",
+                referenceRange: "125 - 200",
+                status: .final_,
+                effectiveDate: now.addingTimeInterval(-86400 * 14),
+                isAbnormal: true,
+                category: "laboratory"
+            ),
+            VALabResult(
+                id: "lab-003",
+                testName: "TSH",
+                value: "2.1",
+                unit: "mIU/L",
+                referenceRange: "0.4 - 4.0",
+                status: .final_,
+                effectiveDate: now.addingTimeInterval(-86400 * 14),
+                isAbnormal: false,
+                category: "laboratory"
+            ),
+            VALabResult(
+                id: "lab-004",
+                testName: "Creatinine",
+                value: "1.4",
+                unit: "mg/dL",
+                referenceRange: "0.7 - 1.3",
+                status: .preliminary,
+                effectiveDate: now.addingTimeInterval(-86400 * 2),
+                isAbnormal: true,
+                category: "laboratory"
+            )
+        ]
+    }
+
+    // MARK: - Conditions
+
+    static func conditions() -> [VACondition] {
+        [
+            VACondition(id: "cond-001", name: "Post-traumatic stress disorder", clinicalStatus: "active",
+                        onsetDate: now.addingTimeInterval(-86400 * 365 * 4), category: "mental-health"),
+            VACondition(id: "cond-002", name: "Chronic low back pain", clinicalStatus: "active",
+                        onsetDate: now.addingTimeInterval(-86400 * 365 * 2), category: "musculoskeletal"),
+            VACondition(id: "cond-003", name: "Bilateral tinnitus", clinicalStatus: "active",
+                        onsetDate: now.addingTimeInterval(-86400 * 365 * 8), category: "audiology"),
+            VACondition(id: "cond-004", name: "Seasonal allergic rhinitis", clinicalStatus: "resolved",
+                        onsetDate: now.addingTimeInterval(-86400 * 365 * 5),
+                        abatementDate: now.addingTimeInterval(-86400 * 30), category: "allergy")
+        ]
+    }
+
+    // MARK: - Allergies
+
+    static func allergies() -> [VAAllergy] {
+        [
+            VAAllergy(id: "allergy-001", substance: "Penicillin", reaction: "Hives, difficulty breathing",
+                      severity: "severe", status: "active", recordedDate: now.addingTimeInterval(-86400 * 365 * 10)),
+            VAAllergy(id: "allergy-002", substance: "Sulfa drugs", reaction: "Rash",
+                      severity: "moderate", status: "active", recordedDate: now.addingTimeInterval(-86400 * 365 * 5)),
+            VAAllergy(id: "allergy-003", substance: "Shellfish", reaction: "Anaphylaxis",
+                      severity: "severe", status: "active")
+        ]
+    }
+
+    // MARK: - Veteran Status
+
+    static func veteranStatus() -> VAVeteranStatus {
+        VAVeteranStatus(
+            isVeteran: true,
+            serviceHistory: [
+                .init(branchOfService: "United States Army",
+                      startDate: now.addingTimeInterval(-86400 * 365 * 12),
+                      endDate: now.addingTimeInterval(-86400 * 365 * 4),
+                      dischargeStatus: "Honorable"),
+                .init(branchOfService: "United States Army Reserve",
+                      startDate: now.addingTimeInterval(-86400 * 365 * 4),
+                      endDate: now.addingTimeInterval(-86400 * 365 * 2),
+                      dischargeStatus: "Honorable")
+            ]
+        )
+    }
+
+    // MARK: - Full Cached Data
+
+    static func fullCachedData(stale: Bool = false) -> VACachedData {
+        VACachedData(
+            lastSyncDate: stale ? now.addingTimeInterval(-86400 * 2) : now,
+            claims: activeClaims(),
+            disabilityRating: disabilityRating(),
+            appointments: appointments(),
+            medications: medications(),
+            labResults: labResults(),
+            conditions: conditions(),
+            allergies: allergies(),
+            veteranStatus: veteranStatus()
+        )
+    }
+}
+
+// MARK: - VAModels Tests
+
+@MainActor
+final class VAModelsRedTests: XCTestCase {
+
+    // MARK: - VATokens
+
+    func test_vaTokens_notExpired_whenFuture() {
+        let tokens = MockVeteranData.validTokens()
+        XCTAssertFalse(tokens.isExpired)
+    }
+
+    func test_vaTokens_expired_whenPast() {
+        let tokens = MockVeteranData.expiredTokens()
+        XCTAssertTrue(tokens.isExpired)
+    }
+
+    func test_vaTokens_expiresWithin_returnsTrue_whenCloseToExpiry() {
+        let tokens = MockVeteranData.expiringTokens(inSeconds: 120)
+        // Token expires in 120s, asking if expires within 300s → true
+        XCTAssertTrue(tokens.expiresWithin(300))
+    }
+
+    func test_vaTokens_expiresWithin_returnsFalse_whenFarFromExpiry() {
+        let tokens = MockVeteranData.validTokens() // 1 hour out
+        // Token expires in 3600s, asking if within 300s → false
+        XCTAssertFalse(tokens.expiresWithin(300))
+    }
+
+    func test_vaTokens_codableRoundtrip() throws {
+        let tokens = MockVeteranData.validTokens()
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(tokens)
+        let decoded = try JSONDecoder().decode(VATokens.self, from: data)
+        XCTAssertEqual(decoded.accessToken, tokens.accessToken)
+        XCTAssertEqual(decoded.refreshToken, tokens.refreshToken)
+        XCTAssertEqual(decoded.scope, tokens.scope)
+        XCTAssertEqual(decoded.tokenType, "Bearer")
+    }
+
+    func test_vaTokens_snakeCaseCodingKeys() throws {
+        let tokens = MockVeteranData.validTokens()
+        let data = try JSONEncoder().encode(tokens)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertNotNil(json?["access_token"])
+        XCTAssertNotNil(json?["refresh_token"])
+        XCTAssertNotNil(json?["expires_at"])
+        XCTAssertNotNil(json?["token_type"])
+        // Ensure camelCase keys are NOT present
+        XCTAssertNil(json?["accessToken"])
+        XCTAssertNil(json?["refreshToken"])
+    }
+
+    // MARK: - VAScope
+
+    func test_vaScope_allCases_has8Scopes() {
+        XCTAssertEqual(VAScope.allCases.count, 8)
+    }
+
+    func test_vaScope_displayNames_areHumanReadable() {
+        XCTAssertEqual(VAScope.claimsRead.displayName, "Claims Status")
+        XCTAssertEqual(VAScope.healthRead.displayName, "Health Records")
+        XCTAssertEqual(VAScope.appointmentsRead.displayName, "Appointments")
+        XCTAssertEqual(VAScope.medicationsRead.displayName, "Medications")
+        XCTAssertEqual(VAScope.conditionsRead.displayName, "Conditions")
+        XCTAssertEqual(VAScope.labResultsRead.displayName, "Lab Results")
+        XCTAssertEqual(VAScope.veteranStatus.displayName, "Veteran Status")
+        XCTAssertEqual(VAScope.disabilityRating.displayName, "Disability Rating")
+    }
+
+    func test_vaScope_rawValues_matchVAAPIFormat() {
+        XCTAssertEqual(VAScope.claimsRead.rawValue, "claim.read")
+        XCTAssertEqual(VAScope.healthRead.rawValue, "patient/AllergyIntolerance.read")
+        XCTAssertEqual(VAScope.appointmentsRead.rawValue, "patient/Appointment.read")
+        XCTAssertEqual(VAScope.labResultsRead.rawValue, "patient/Observation.read")
+    }
+
+    func test_vaScope_codableRoundtrip() throws {
+        for scope in VAScope.allCases {
+            let data = try JSONEncoder().encode(scope)
+            let decoded = try JSONDecoder().decode(VAScope.self, from: data)
+            XCTAssertEqual(decoded, scope)
+        }
+    }
+
+    // MARK: - VAClaim
+
+    func test_vaClaim_identifiable() {
+        let claim = MockVeteranData.activeClaims().first!
+        XCTAssertEqual(claim.id, "claim-001")
+    }
+
+    func test_vaClaim_claimStatus_knownValues() {
+        XCTAssertEqual(VAClaim.ClaimStatus.open.rawValue, "OPEN")
+        XCTAssertEqual(VAClaim.ClaimStatus.evidenceGathering.rawValue, "EVIDENCE_GATHERING")
+        XCTAssertEqual(VAClaim.ClaimStatus.preparationForDecision.rawValue, "PREPARATION_FOR_DECISION")
+        XCTAssertEqual(VAClaim.ClaimStatus.complete.rawValue, "COMPLETE")
+    }
+
+    func test_vaClaim_claimStatus_unknownValuesFallback() throws {
+        let json = """
+        "SOMETHING_NEW"
+        """
+        let decoded = try JSONDecoder().decode(VAClaim.ClaimStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded, .unknown)
+    }
+
+    func test_vaClaim_codableRoundtrip() throws {
+        let claim = MockVeteranData.activeClaims().first!
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(claim)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VAClaim.self, from: data)
+        XCTAssertEqual(decoded.id, claim.id)
+        XCTAssertEqual(decoded.type, claim.type)
+        XCTAssertEqual(decoded.description, claim.description)
+        XCTAssertEqual(decoded.documentsNeeded, true)
+        XCTAssertEqual(decoded.decisionLetterSent, false)
+    }
+
+    func test_vaClaim_documentsNeeded_defaultsFalse() {
+        let claim = VAClaim(id: "test", type: "comp", status: .open, submittedDate: nil,
+                           lastUpdated: nil, description: "Test claim")
+        XCTAssertFalse(claim.documentsNeeded)
+        XCTAssertFalse(claim.decisionLetterSent)
+    }
+
+    // MARK: - VADisabilityRating
+
+    func test_vaDisabilityRating_combinedRating() {
+        let rating = MockVeteranData.disabilityRating()
+        XCTAssertEqual(rating.combinedRating, 70)
+    }
+
+    func test_vaDisabilityRating_individualRatings_count() {
+        let rating = MockVeteranData.disabilityRating()
+        XCTAssertEqual(rating.individualRatings.count, 3)
+    }
+
+    func test_vaDisabilityRating_staticIndicator() {
+        let rating = MockVeteranData.disabilityRating()
+        let tinnitus = rating.individualRatings.first { $0.condition == "Tinnitus" }
+        XCTAssertNotNil(tinnitus)
+        XCTAssertTrue(tinnitus!.staticIndicator)
+        XCTAssertEqual(tinnitus!.ratingPercentage, 10)
+    }
+
+    func test_vaDisabilityRating_codableRoundtrip() throws {
+        let rating = MockVeteranData.disabilityRating()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(rating)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VADisabilityRating.self, from: data)
+        XCTAssertEqual(decoded.combinedRating, 70)
+        XCTAssertEqual(decoded.individualRatings.count, 3)
+    }
+
+    // MARK: - VAAppointment
+
+    func test_vaAppointment_statusEnum_knownValues() {
+        XCTAssertEqual(VAAppointment.AppointmentStatus.booked.rawValue, "booked")
+        XCTAssertEqual(VAAppointment.AppointmentStatus.fulfilled.rawValue, "fulfilled")
+        XCTAssertEqual(VAAppointment.AppointmentStatus.cancelled.rawValue, "cancelled")
+        XCTAssertEqual(VAAppointment.AppointmentStatus.noshow.rawValue, "noshow")
+    }
+
+    func test_vaAppointment_statusEnum_unknownFallback() throws {
+        let json = """
+        "waitlisted"
+        """
+        let decoded = try JSONDecoder().decode(VAAppointment.AppointmentStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded, .unknown)
+    }
+
+    func test_vaAppointment_videoVisit_flag() {
+        let appts = MockVeteranData.appointments()
+        let videoAppt = appts.first { $0.id == "appt-002" }
+        XCTAssertNotNil(videoAppt)
+        XCTAssertTrue(videoAppt!.isVideoVisit)
+
+        let inPersonAppt = appts.first { $0.id == "appt-001" }
+        XCTAssertFalse(inPersonAppt!.isVideoVisit)
+    }
+
+    func test_vaAppointment_codableRoundtrip() throws {
+        let appt = MockVeteranData.appointments().first!
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(appt)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VAAppointment.self, from: data)
+        XCTAssertEqual(decoded.id, "appt-001")
+        XCTAssertEqual(decoded.status, .booked)
+        XCTAssertEqual(decoded.location, "VA Portland Medical Center")
+    }
+
+    // MARK: - VAMedication
+
+    func test_vaMedication_statusEnum_knownValues() {
+        XCTAssertEqual(VAMedication.MedicationStatus.active.rawValue, "active")
+        XCTAssertEqual(VAMedication.MedicationStatus.onHold.rawValue, "on-hold")
+        XCTAssertEqual(VAMedication.MedicationStatus.completed.rawValue, "completed")
+    }
+
+    func test_vaMedication_statusEnum_unknownFallback() throws {
+        let json = """
+        "suspended"
+        """
+        let decoded = try JSONDecoder().decode(VAMedication.MedicationStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded, .unknown)
+    }
+
+    func test_vaMedication_fullDetails() {
+        let meds = MockVeteranData.medications()
+        let sertraline = meds.first { $0.id == "med-001" }!
+        XCTAssertEqual(sertraline.name, "Sertraline (Zoloft)")
+        XCTAssertEqual(sertraline.dosage, "100 mg")
+        XCTAssertEqual(sertraline.frequency, "Once daily")
+        XCTAssertEqual(sertraline.prescriber, "Dr. Sarah Johnson")
+        XCTAssertEqual(sertraline.status, .active)
+        XCTAssertEqual(sertraline.refillsRemaining, 3)
+        XCTAssertEqual(sertraline.pharmacy, "VA Portland Pharmacy")
+        XCTAssertNotNil(sertraline.instructions)
+    }
+
+    func test_vaMedication_defaultValues() {
+        let med = VAMedication(id: "test", name: "Test Med")
+        XCTAssertNil(med.dosage)
+        XCTAssertNil(med.frequency)
+        XCTAssertNil(med.prescriber)
+        XCTAssertEqual(med.status, .active)
+        XCTAssertNil(med.startDate)
+        XCTAssertNil(med.refillsRemaining)
+        XCTAssertNil(med.pharmacy)
+        XCTAssertNil(med.instructions)
+    }
+
+    func test_vaMedication_codableRoundtrip() throws {
+        let med = MockVeteranData.medications().first!
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(med)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VAMedication.self, from: data)
+        XCTAssertEqual(decoded.name, "Sertraline (Zoloft)")
+        XCTAssertEqual(decoded.refillsRemaining, 3)
+    }
+
+    // MARK: - VALabResult
+
+    func test_vaLabResult_statusEnum_finalCase() {
+        // "final" is a Swift keyword, so it's final_ with rawValue "final"
+        XCTAssertEqual(VALabResult.ResultStatus.final_.rawValue, "final")
+    }
+
+    func test_vaLabResult_abnormalFlag() {
+        let results = MockVeteranData.labResults()
+        let cholesterol = results.first { $0.id == "lab-002" }!
+        XCTAssertTrue(cholesterol.isAbnormal)
+        XCTAssertEqual(cholesterol.value, "245")
+        XCTAssertEqual(cholesterol.referenceRange, "125 - 200")
+
+        let a1c = results.first { $0.id == "lab-001" }!
+        XCTAssertFalse(a1c.isAbnormal)
+    }
+
+    func test_vaLabResult_preliminaryStatus() {
+        let results = MockVeteranData.labResults()
+        let creatinine = results.first { $0.id == "lab-004" }!
+        XCTAssertEqual(creatinine.status, .preliminary)
+        XCTAssertTrue(creatinine.isAbnormal)
+    }
+
+    func test_vaLabResult_codableRoundtrip() throws {
+        let result = MockVeteranData.labResults().first!
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(result)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VALabResult.self, from: data)
+        XCTAssertEqual(decoded.testName, "Hemoglobin A1C")
+        XCTAssertEqual(decoded.unit, "%")
+        XCTAssertFalse(decoded.isAbnormal)
+    }
+
+    // MARK: - VACondition
+
+    func test_vaCondition_fields() {
+        let conditions = MockVeteranData.conditions()
+        let ptsd = conditions.first { $0.id == "cond-001" }!
+        XCTAssertEqual(ptsd.name, "Post-traumatic stress disorder")
+        XCTAssertEqual(ptsd.clinicalStatus, "active")
+        XCTAssertNotNil(ptsd.onsetDate)
+        XCTAssertNil(ptsd.abatementDate)
+    }
+
+    func test_vaCondition_resolvedWithAbatement() {
+        let conditions = MockVeteranData.conditions()
+        let rhinitis = conditions.first { $0.id == "cond-004" }!
+        XCTAssertEqual(rhinitis.clinicalStatus, "resolved")
+        XCTAssertNotNil(rhinitis.abatementDate)
+    }
+
+    func test_vaCondition_codableRoundtrip() throws {
+        let condition = MockVeteranData.conditions().first!
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(condition)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VACondition.self, from: data)
+        XCTAssertEqual(decoded.name, "Post-traumatic stress disorder")
+    }
+
+    // MARK: - VAAllergy
+
+    func test_vaAllergy_fullDetails() {
+        let allergies = MockVeteranData.allergies()
+        let penicillin = allergies.first { $0.id == "allergy-001" }!
+        XCTAssertEqual(penicillin.substance, "Penicillin")
+        XCTAssertEqual(penicillin.reaction, "Hives, difficulty breathing")
+        XCTAssertEqual(penicillin.severity, "severe")
+        XCTAssertEqual(penicillin.status, "active")
+        XCTAssertNotNil(penicillin.recordedDate)
+    }
+
+    func test_vaAllergy_defaultValues() {
+        let allergy = VAAllergy(id: "test", substance: "Latex")
+        XCTAssertNil(allergy.reaction)
+        XCTAssertNil(allergy.severity)
+        XCTAssertEqual(allergy.status, "active")
+        XCTAssertNil(allergy.recordedDate)
+    }
+
+    func test_vaAllergy_codableRoundtrip() throws {
+        let allergy = MockVeteranData.allergies().first!
+        let data = try JSONEncoder().encode(allergy)
+        let decoded = try JSONDecoder().decode(VAAllergy.self, from: data)
+        XCTAssertEqual(decoded.substance, "Penicillin")
+        XCTAssertEqual(decoded.severity, "severe")
+    }
+
+    // MARK: - VAVeteranStatus
+
+    func test_vaVeteranStatus_confirmed() {
+        let status = MockVeteranData.veteranStatus()
+        XCTAssertTrue(status.isVeteran)
+    }
+
+    func test_vaVeteranStatus_serviceHistory() {
+        let status = MockVeteranData.veteranStatus()
+        XCTAssertEqual(status.serviceHistory.count, 2)
+        XCTAssertEqual(status.serviceHistory[0].branchOfService, "United States Army")
+        XCTAssertEqual(status.serviceHistory[0].dischargeStatus, "Honorable")
+        XCTAssertEqual(status.serviceHistory[1].branchOfService, "United States Army Reserve")
+    }
+
+    func test_vaVeteranStatus_nonVeteran() {
+        let status = VAVeteranStatus(isVeteran: false, serviceHistory: [])
+        XCTAssertFalse(status.isVeteran)
+        XCTAssertTrue(status.serviceHistory.isEmpty)
+    }
+
+    func test_vaVeteranStatus_codableRoundtrip() throws {
+        let status = MockVeteranData.veteranStatus()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(status)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VAVeteranStatus.self, from: data)
+        XCTAssertTrue(decoded.isVeteran)
+        XCTAssertEqual(decoded.serviceHistory.count, 2)
+    }
+}
+
+// MARK: - VACachedData Tests
+
+@MainActor
+final class VACachedDataRedTests: XCTestCase {
+
+    func test_cachedData_defaultInit_isEmpty() {
+        let data = VACachedData()
+        XCTAssertTrue(data.claims.isEmpty)
+        XCTAssertNil(data.disabilityRating)
+        XCTAssertTrue(data.appointments.isEmpty)
+        XCTAssertTrue(data.medications.isEmpty)
+        XCTAssertTrue(data.labResults.isEmpty)
+        XCTAssertTrue(data.conditions.isEmpty)
+        XCTAssertTrue(data.allergies.isEmpty)
+        XCTAssertNil(data.veteranStatus)
+    }
+
+    func test_cachedData_fullInit_hasAllData() {
+        let data = MockVeteranData.fullCachedData()
+        XCTAssertEqual(data.claims.count, 3)
+        XCTAssertNotNil(data.disabilityRating)
+        XCTAssertEqual(data.appointments.count, 4)
+        XCTAssertEqual(data.medications.count, 3)
+        XCTAssertEqual(data.labResults.count, 4)
+        XCTAssertEqual(data.conditions.count, 4)
+        XCTAssertEqual(data.allergies.count, 3)
+        XCTAssertNotNil(data.veteranStatus)
+    }
+
+    func test_cachedData_isStale_fresh() {
+        let data = VACachedData(lastSyncDate: Date())
+        XCTAssertFalse(data.isStale(olderThan: 86400))
+    }
+
+    func test_cachedData_isStale_stale() {
+        let data = VACachedData(lastSyncDate: Date().addingTimeInterval(-86400 * 2))
+        XCTAssertTrue(data.isStale(olderThan: 86400))
+    }
+
+    func test_cachedData_cacheAge_isPositive() {
+        let data = VACachedData(lastSyncDate: Date().addingTimeInterval(-3600))
+        let age = data.cacheAge
+        XCTAssertGreaterThan(age, 3500) // ~1 hour with small tolerance
+        XCTAssertLessThan(age, 3700)
+    }
+
+    func test_cachedData_codableRoundtrip_withAllFields() throws {
+        let data = MockVeteranData.fullCachedData()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let jsonData = try encoder.encode(data)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VACachedData.self, from: jsonData)
+        XCTAssertEqual(decoded.claims.count, 3)
+        XCTAssertEqual(decoded.disabilityRating?.combinedRating, 70)
+        XCTAssertEqual(decoded.appointments.count, 4)
+        XCTAssertEqual(decoded.medications.count, 3)
+        XCTAssertEqual(decoded.labResults.count, 4)
+        XCTAssertEqual(decoded.conditions.count, 4)
+        XCTAssertEqual(decoded.allergies.count, 3)
+        XCTAssertTrue(decoded.veteranStatus?.isVeteran ?? false)
+    }
+
+    func test_cachedData_codableRoundtrip_withEmptyFields() throws {
+        let data = VACachedData()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let jsonData = try encoder.encode(data)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(VACachedData.self, from: jsonData)
+        XCTAssertTrue(decoded.claims.isEmpty)
+        XCTAssertNil(decoded.disabilityRating)
+    }
+
+    func test_cachedData_mutability() {
+        var data = VACachedData()
+        data.claims = MockVeteranData.activeClaims()
+        data.lastSyncDate = Date()
+        XCTAssertEqual(data.claims.count, 3)
+    }
+}
+
+// MARK: - VAError Tests
+
+@MainActor
+final class VAErrorRedTests: XCTestCase {
+
+    func test_vaError_allCases_haveDescriptions() {
+        let errors: [VAError] = [
+            .notAuthenticated,
+            .tokenExpired,
+            .tokenRefreshFailed("test reason"),
+            .networkError("connection timeout"),
+            .apiError(statusCode: 500, message: "Internal Server Error"),
+            .fhirParsingError("missing resource field"),
+            .cacheError("disk write failed"),
+            .scopeNotAuthorized(.claimsRead),
+            .rateLimited(retryAfter: 60),
+            .userRevoked
+        ]
+
+        for error in errors {
+            let description = error.errorDescription
+            XCTAssertNotNil(description, "VAError case should have description")
+            XCTAssertFalse(description!.isEmpty, "VAError description should not be empty")
+        }
+    }
+
+    func test_vaError_notAuthenticated_mentionsSignIn() {
+        let desc = VAError.notAuthenticated.errorDescription!
+        XCTAssertTrue(desc.contains("sign in") || desc.contains("authenticated"))
+    }
+
+    func test_vaError_tokenExpired_mentionsExpiry() {
+        let desc = VAError.tokenExpired.errorDescription!
+        XCTAssertTrue(desc.contains("expired") || desc.contains("session"))
+    }
+
+    func test_vaError_rateLimited_showsRetryTime() {
+        let desc = VAError.rateLimited(retryAfter: 120).errorDescription!
+        XCTAssertTrue(desc.contains("120"))
+    }
+
+    func test_vaError_scopeNotAuthorized_showsScopeName() {
+        let desc = VAError.scopeNotAuthorized(.appointmentsRead).errorDescription!
+        XCTAssertTrue(desc.contains("Appointments"))
+    }
+
+    func test_vaError_apiError_showsStatusCode() {
+        let desc = VAError.apiError(statusCode: 403, message: "Forbidden").errorDescription!
+        XCTAssertTrue(desc.contains("403"))
+    }
+
+    func test_vaError_networkError_includesReason() {
+        let desc = VAError.networkError("DNS lookup failed").errorDescription!
+        XCTAssertTrue(desc.contains("DNS lookup failed"))
+    }
+
+    func test_vaError_tokenRefreshFailed_includesReason() {
+        let desc = VAError.tokenRefreshFailed("HTTP 401").errorDescription!
+        XCTAssertTrue(desc.contains("HTTP 401"))
+    }
+}
+
+// MARK: - VAAuthManager Tests
+
+@MainActor
+final class VAAuthManagerRedTests: XCTestCase {
+
+    func test_authManager_testInit_withValidTokens_isAuthenticated() {
+        let tokens = MockVeteranData.validTokens()
+        let manager = VAAuthManager(testTokens: tokens)
+        XCTAssertTrue(manager.isAuthenticated)
+    }
+
+    func test_authManager_testInit_withExpiredTokens_isNotAuthenticated() {
+        let tokens = MockVeteranData.expiredTokens()
+        let manager = VAAuthManager(testTokens: tokens)
+        XCTAssertFalse(manager.isAuthenticated)
+    }
+
+    func test_authManager_testInit_nil_isNotAuthenticated() {
+        let manager = VAAuthManager(testTokens: nil)
+        XCTAssertFalse(manager.isAuthenticated)
+        XCTAssertTrue(manager.authorizedScopes.isEmpty)
+    }
+
+    func test_authManager_hasScope_withAllScopes() {
+        let tokens = MockVeteranData.validTokens(scopes: VAScope.allCases)
+        let manager = VAAuthManager(testTokens: tokens)
+        for scope in VAScope.allCases {
+            XCTAssertTrue(manager.hasScope(scope), "Should have scope: \(scope.displayName)")
+        }
+    }
+
+    func test_authManager_hasScope_withLimitedScopes() {
+        let tokens = MockVeteranData.validTokens(scopes: [.claimsRead, .appointmentsRead])
+        let manager = VAAuthManager(testTokens: tokens)
+        XCTAssertTrue(manager.hasScope(.claimsRead))
+        XCTAssertTrue(manager.hasScope(.appointmentsRead))
+        XCTAssertFalse(manager.hasScope(.medicationsRead))
+        XCTAssertFalse(manager.hasScope(.labResultsRead))
+    }
+
+    func test_authManager_authorizedScopes_parsedFromTokenScopeString() {
+        let tokens = MockVeteranData.validTokens(scopes: [.claimsRead, .disabilityRating, .healthRead])
+        let manager = VAAuthManager(testTokens: tokens)
+        XCTAssertEqual(manager.authorizedScopes.count, 3)
+        XCTAssertTrue(manager.authorizedScopes.contains(.claimsRead))
+        XCTAssertTrue(manager.authorizedScopes.contains(.disabilityRating))
+        XCTAssertTrue(manager.authorizedScopes.contains(.healthRead))
+    }
+
+    func test_authManager_resetForTesting_clearsState() {
+        let tokens = MockVeteranData.validTokens()
+        let manager = VAAuthManager(testTokens: tokens)
+        XCTAssertTrue(manager.isAuthenticated)
+        manager.resetForTesting()
+        XCTAssertFalse(manager.isAuthenticated)
+        XCTAssertTrue(manager.authorizedScopes.isEmpty)
+    }
+
+    func test_authManager_isNotAuthenticating_initially() {
+        let manager = VAAuthManager(testTokens: nil)
+        XCTAssertFalse(manager.isAuthenticating)
+    }
+
+    func test_authManager_getValidToken_throwsWhenNoTokens() async {
+        let manager = VAAuthManager(testTokens: nil)
+        do {
+            _ = try await manager.getValidToken()
+            XCTFail("Should throw")
+        } catch {
+            let vaError = error as? VAError
+            XCTAssertNotNil(vaError)
+        }
+    }
+
+    func test_authManager_config_sandboxURLs() {
+        XCTAssertTrue(VAAuthManager.Config.authorizationURL.contains("sandbox"))
+        XCTAssertTrue(VAAuthManager.Config.tokenURL.contains("sandbox"))
+        XCTAssertTrue(VAAuthManager.Config.revokeURL.contains("sandbox"))
+        XCTAssertEqual(VAAuthManager.Config.redirectScheme, "serenanet")
+    }
+}
+
+// MARK: - VADataCache Tests
+
+@MainActor
+final class VADataCacheRedTests: XCTestCase {
+
+    /// Create a cache with an isolated temp directory to avoid cross-test contamination
+    private func makeIsolatedCache() -> VADataCache {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("va_cache_test_\(UUID().uuidString)", isDirectory: true)
+        let encryption = EncryptionManager(sessionKey: .init(size: .bits256))
+        return VADataCache(encryption: encryption, cacheDirectory: tempDir)
+    }
+
+    func test_cache_initiallyEmpty() async {
+        let cache = makeIsolatedCache()
+        let data = await cache.getCachedData()
+        XCTAssertNil(data)
+    }
+
+    func test_cache_updateAndRetrieve_claims() async throws {
+        let cache = makeIsolatedCache()
+        let claims = MockVeteranData.activeClaims()
+        try await cache.updateClaims(claims)
+        let cached = await cache.getCachedData()
+        XCTAssertNotNil(cached)
+        XCTAssertEqual(cached?.claims.count, 3)
+    }
+
+    func test_cache_updateAndRetrieve_medications() async throws {
+        let cache = makeIsolatedCache()
+        let meds = MockVeteranData.medications()
+        try await cache.updateMedications(meds)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.medications.count, 3)
+    }
+
+    func test_cache_updateAndRetrieve_labResults() async throws {
+        let cache = makeIsolatedCache()
+        let labs = MockVeteranData.labResults()
+        try await cache.updateLabResults(labs)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.labResults.count, 4)
+    }
+
+    func test_cache_updateAndRetrieve_disabilityRating() async throws {
+        let cache = makeIsolatedCache()
+        let rating = MockVeteranData.disabilityRating()
+        try await cache.updateDisabilityRating(rating)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.disabilityRating?.combinedRating, 70)
+    }
+
+    func test_cache_updateAndRetrieve_appointments() async throws {
+        let cache = makeIsolatedCache()
+        let appts = MockVeteranData.appointments()
+        try await cache.updateAppointments(appts)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.appointments.count, 4)
+    }
+
+    func test_cache_updateAndRetrieve_conditions() async throws {
+        let cache = makeIsolatedCache()
+        let conditions = MockVeteranData.conditions()
+        try await cache.updateConditions(conditions)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.conditions.count, 4)
+    }
+
+    func test_cache_updateAndRetrieve_allergies() async throws {
+        let cache = makeIsolatedCache()
+        let allergies = MockVeteranData.allergies()
+        try await cache.updateAllergies(allergies)
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.allergies.count, 3)
+    }
+
+    func test_cache_updateAndRetrieve_veteranStatus() async throws {
+        let cache = makeIsolatedCache()
+        let status = MockVeteranData.veteranStatus()
+        try await cache.updateVeteranStatus(status)
+        let cached = await cache.getCachedData()
+        XCTAssertNotNil(cached?.veteranStatus)
+        let isVet = cached?.veteranStatus?.isVeteran ?? false
+        XCTAssertTrue(isVet)
+    }
+
+    func test_cache_updateFullCache() async throws {
+        let cache = makeIsolatedCache()
+        let data = MockVeteranData.fullCachedData()
+        try await cache.updateCache(data)
+        let cached = await cache.getCachedData()
+        XCTAssertNotNil(cached)
+        XCTAssertEqual(cached?.claims.count, 3)
+        XCTAssertEqual(cached?.medications.count, 3)
+    }
+
+    func test_cache_clearAll_removesData() async throws {
+        let cache = makeIsolatedCache()
+        let data = MockVeteranData.fullCachedData()
+        try await cache.updateCache(data)
+        await cache.clearAll()
+        let cached = await cache.getCachedData()
+        XCTAssertNil(cached)
+    }
+
+    func test_cache_isCacheStale_freshIsNotStale() async throws {
+        let cache = makeIsolatedCache()
+        let data = VACachedData(lastSyncDate: Date())
+        try await cache.updateCache(data)
+        let isStale = await cache.isCacheStale()
+        XCTAssertFalse(isStale)
+    }
+
+    func test_cache_isCacheStale_noDataIsStale() async {
+        let cache = makeIsolatedCache()
+        let isStale = await cache.isCacheStale()
+        XCTAssertTrue(isStale)
+    }
+
+    func test_cache_isCacheStale_customThreshold() async throws {
+        let cache = makeIsolatedCache()
+        let data = VACachedData(lastSyncDate: Date().addingTimeInterval(-7200)) // 2 hours ago
+        try await cache.updateCache(data)
+        // Not stale if threshold is 24h
+        let notStale = await cache.isCacheStale(threshold: 86400)
+        XCTAssertFalse(notStale)
+        // Stale if threshold is 1h
+        let isStale = await cache.isCacheStale(threshold: 3600)
+        XCTAssertTrue(isStale)
+    }
+
+    func test_cache_defaultStaleInterval_is24Hours() {
+        XCTAssertEqual(VADataCache.defaultStaleInterval, 86400)
+    }
+
+    func test_cache_incrementalUpdates_preserveOtherData() async throws {
+        let cache = makeIsolatedCache()
+        // Store claims first
+        try await cache.updateClaims(MockVeteranData.activeClaims())
+        // Then store medications
+        try await cache.updateMedications(MockVeteranData.medications())
+        // Both should be present
+        let cached = await cache.getCachedData()
+        XCTAssertEqual(cached?.claims.count, 3)
+        XCTAssertEqual(cached?.medications.count, 3)
+    }
+}
+
+// MARK: - VAToolHandler Tests
+
+@MainActor
+final class VAToolHandlerRedTests: XCTestCase {
+
+    private var savedBiometricFlag: Bool = true
+
+    override func setUp() {
+        super.setUp()
+        // Disable biometric auth gate so VA-specific tests aren't blocked
+        // (biometric auth has its own dedicated test suite)
+        savedBiometricFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = false
+    }
+
+    override func tearDown() {
+        FeatureFlags.biometricAuthEnabled = savedBiometricFlag
+        super.tearDown()
+    }
+
+    // MARK: - Setup helpers
+
+    private func makeHandler(
+        authenticated: Bool = true,
+        scopes: [VAScope] = VAScope.allCases,
+        expired: Bool = false
+    ) -> VAToolHandler {
+        let tokens: VATokens?
+        if authenticated {
+            tokens = expired ? MockVeteranData.expiredTokens() : MockVeteranData.validTokens(scopes: scopes)
+        } else {
+            tokens = nil
+        }
+        let authManager = VAAuthManager(testTokens: tokens)
+        return VAToolHandler(authManager: authManager, apiClient: VAAPIClient(), cache: VADataCache())
+    }
+
+    // MARK: - Authentication Guard
+
+    func test_toolHandler_unauthenticated_returnsError() async {
+        let handler = makeHandler(authenticated: false)
+        let result = await handler.execute(action: "claims", params: [:])
+        XCTAssertFalse(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("sign in") || output.contains("VA account"))
+    }
+
+    func test_toolHandler_unauthenticated_allActions_returnError() async {
+        let handler = makeHandler(authenticated: false)
+        let actions = ["claims", "disability", "appointments", "medications", "labs",
+                       "conditions", "allergies", "veteran_status", "sync", "status"]
+        for action in actions {
+            let result = await handler.execute(action: action, params: [:])
+            XCTAssertFalse(result.success, "Action '\(action)' should fail when unauthenticated")
+        }
+    }
+
+    // MARK: - Tool Name
+
+    func test_toolHandler_toolName_isVA() {
+        let handler = makeHandler()
+        XCTAssertEqual(handler.toolName, "va")
+    }
+
+    // MARK: - Unknown Action
+
+    func test_toolHandler_unknownAction_returnsError() async {
+        let handler = makeHandler()
+        let result = await handler.execute(action: "nonexistent_action", params: [:])
+        XCTAssertFalse(result.success)
+        let error = result.error ?? ""
+        XCTAssertTrue(error.contains("Unknown VA action"))
+    }
+
+    // MARK: - Default Action
+
+    func test_toolHandler_nilAction_defaultsToStatus() async {
+        let handler = makeHandler()
+        let result = await handler.execute(action: nil, params: [:])
+        // Status should succeed even without cache
+        XCTAssertTrue(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("VA Connection Status"))
+    }
+
+    func test_toolHandler_actionFromParams() async {
+        let handler = makeHandler()
+        let result = await handler.execute(action: nil, params: ["action": "status"])
+        XCTAssertTrue(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("VA Connection Status"))
+    }
+
+    // MARK: - Scope Gating
+
+    func test_toolHandler_claims_requiresClaimsScope() async {
+        let handler = makeHandler(scopes: [.appointmentsRead]) // No claims scope
+        let result = await handler.execute(action: "claims", params: [:])
+        XCTAssertFalse(result.success)
+        let error = result.error ?? ""
+        XCTAssertTrue(error.contains("Scope not authorized") || error.contains("claim.read"))
+    }
+
+    func test_toolHandler_disability_requiresDisabilityScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No disability scope
+        let result = await handler.execute(action: "disability_rating", params: [:])
+        XCTAssertFalse(result.success)
+        let error = result.error ?? ""
+        XCTAssertTrue(error.contains("Scope not authorized") || error.contains("disability_rating"))
+    }
+
+    func test_toolHandler_appointments_requiresAppointmentsScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No appointments scope
+        let result = await handler.execute(action: "appointments", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    func test_toolHandler_medications_requiresMedicationsScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No medications scope
+        let result = await handler.execute(action: "medications", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    func test_toolHandler_labs_requiresLabResultsScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No lab results scope
+        let result = await handler.execute(action: "labs", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    func test_toolHandler_conditions_requiresConditionsScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No conditions scope
+        let result = await handler.execute(action: "conditions", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    func test_toolHandler_allergies_requiresHealthScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No health scope
+        let result = await handler.execute(action: "allergies", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    func test_toolHandler_veteranStatus_requiresVeteranScope() async {
+        let handler = makeHandler(scopes: [.claimsRead]) // No veteran scope
+        let result = await handler.execute(action: "veteran_status", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    // MARK: - Action Aliases
+
+    func test_toolHandler_claimAliases() async {
+        let handler = makeHandler(scopes: []) // Will fail on scope, but tests routing
+        // These should all route to the claims handler (and fail on scope)
+        for alias in ["claims", "claim_status", "claim"] {
+            let result = await handler.execute(action: alias, params: [:])
+            let error = result.error ?? ""
+            // Should NOT be "unknown action" — should be scope error
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to claims handler")
+        }
+    }
+
+    func test_toolHandler_disabilityAliases() async {
+        let handler = makeHandler(scopes: [])
+        for alias in ["disability", "disability_rating", "rating"] {
+            let result = await handler.execute(action: alias, params: [:])
+            let error = result.error ?? ""
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to disability handler")
+        }
+    }
+
+    func test_toolHandler_appointmentAliases() async {
+        let handler = makeHandler(scopes: [])
+        for alias in ["appointments", "appointment", "next_appointment"] {
+            let result = await handler.execute(action: alias, params: [:])
+            let error = result.error ?? ""
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to appointments handler")
+        }
+    }
+
+    func test_toolHandler_medicationAliases() async {
+        let handler = makeHandler(scopes: [])
+        for alias in ["medications", "medication", "meds", "medication_list"] {
+            let result = await handler.execute(action: alias, params: [:])
+            let error = result.error ?? ""
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to medications handler")
+        }
+    }
+
+    func test_toolHandler_labAliases() async {
+        let handler = makeHandler(scopes: [])
+        for alias in ["labs", "lab_results", "lab"] {
+            let result = await handler.execute(action: alias, params: [:])
+            let error = result.error ?? ""
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to labs handler")
+        }
+    }
+
+    func test_toolHandler_syncAliases() async {
+        let handler = makeHandler(scopes: VAScope.allCases)
+        for alias in ["sync", "refresh"] {
+            let result = await handler.execute(action: alias, params: [:])
+            // Sync will fail (no real API) but should not be "unknown action"
+            let error = result.error ?? ""
+            XCTAssertFalse(error.contains("Unknown VA action"), "'\(alias)' should route to sync handler")
+        }
+    }
+
+    func test_toolHandler_disconnectAliases() async {
+        // Use separate handler per alias since disconnect clears auth state
+        for alias in ["disconnect", "revoke"] {
+            let handler = makeHandler()
+            let result = await handler.execute(action: alias, params: [:])
+            XCTAssertTrue(result.success, "'\(alias)' should succeed")
+            let output = result.output ?? ""
+            XCTAssertTrue(output.contains("revoked") || output.contains("deleted"))
+        }
+    }
+
+    // MARK: - Status Action (works without API)
+
+    func test_toolHandler_status_showsAuthState() async {
+        let handler = makeHandler()
+        let result = await handler.execute(action: "status", params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("Authenticated: Yes"))
+    }
+
+    func test_toolHandler_status_showsScopes() async {
+        let handler = makeHandler(scopes: [.claimsRead, .appointmentsRead])
+        let result = await handler.execute(action: "status", params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("Claims Status") || output.contains("Appointments"))
+    }
+
+    // MARK: - Revoke/Disconnect
+
+    func test_toolHandler_revoke_clearsAuth() async {
+        let tokens = MockVeteranData.validTokens()
+        let authManager = VAAuthManager(testTokens: tokens)
+        let handler = VAToolHandler(authManager: authManager, apiClient: VAAPIClient(), cache: VADataCache())
+
+        XCTAssertTrue(authManager.isAuthenticated)
+
+        let result = await handler.execute(action: "revoke", params: [:])
+        XCTAssertTrue(result.success)
+
+        // Auth should be cleared after revoke
+        XCTAssertFalse(authManager.isAuthenticated)
+        XCTAssertTrue(authManager.authorizedScopes.isEmpty)
+    }
+
+    // MARK: - Case Insensitive Routing
+
+    func test_toolHandler_actionRouting_caseInsensitive() async {
+        let handler = makeHandler()
+        let result = await handler.execute(action: "STATUS", params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output ?? ""
+        XCTAssertTrue(output.contains("VA Connection Status"))
+    }
+}
+
+// MARK: - VAAPIClient Tests
+
+@MainActor
+final class VAAPIClientRedTests: XCTestCase {
+
+    func test_apiClient_endpoints_defaultToSandbox() {
+        XCTAssertTrue(VAAPIClient.Endpoints.benefitsBase.contains("sandbox"))
+        XCTAssertTrue(VAAPIClient.Endpoints.healthBase.contains("sandbox"))
+        XCTAssertTrue(VAAPIClient.Endpoints.veteranVerification.contains("sandbox"))
+    }
+
+    func test_apiClient_endpoints_canSwitchToProduction() {
+        // Save original
+        let originalBenefits = VAAPIClient.Endpoints.benefitsBase
+        let originalHealth = VAAPIClient.Endpoints.healthBase
+        let originalVerification = VAAPIClient.Endpoints.veteranVerification
+
+        // Switch to production
+        VAAPIClient.Endpoints.useProduction()
+        XCTAssertFalse(VAAPIClient.Endpoints.benefitsBase.contains("sandbox"))
+        XCTAssertFalse(VAAPIClient.Endpoints.healthBase.contains("sandbox"))
+        XCTAssertFalse(VAAPIClient.Endpoints.veteranVerification.contains("sandbox"))
+        XCTAssertTrue(VAAPIClient.Endpoints.benefitsBase.contains("api.va.gov"))
+
+        // Restore sandbox
+        VAAPIClient.Endpoints.benefitsBase = originalBenefits
+        VAAPIClient.Endpoints.healthBase = originalHealth
+        VAAPIClient.Endpoints.veteranVerification = originalVerification
+    }
+
+    func test_apiClient_canBeInstantiated() {
+        let client = VAAPIClient()
+        XCTAssertNotNil(client)
+    }
+}
+
+// MARK: - Integration: Full Data Lifecycle
+
+@MainActor
+final class VADataLifecycleRedTests: XCTestCase {
+
+    private var savedBiometricFlag: Bool = true
+
+    override func setUp() {
+        super.setUp()
+        savedBiometricFlag = FeatureFlags.biometricAuthEnabled
+        FeatureFlags.biometricAuthEnabled = false
+    }
+
+    override func tearDown() {
+        FeatureFlags.biometricAuthEnabled = savedBiometricFlag
+        super.tearDown()
+    }
+
+    func test_fullLifecycle_cacheUpdateAndRetrieve() async throws {
+        // Simulate: authenticate → cache data → read data → clear on revoke
+        let tokens = MockVeteranData.validTokens()
+        let authManager = VAAuthManager(testTokens: tokens)
+        let cache = VADataCache()
+
+        // 1. Verify authenticated
+        XCTAssertTrue(authManager.isAuthenticated)
+
+        // 2. Cache veteran data (simulating what handleSync does)
+        let data = MockVeteranData.fullCachedData()
+        try await cache.updateCache(data)
+
+        // 3. Verify all data is accessible
+        let cached = await cache.getCachedData()
+        XCTAssertNotNil(cached)
+        XCTAssertEqual(cached?.claims.count, 3)
+        XCTAssertEqual(cached?.medications.count, 3)
+        XCTAssertEqual(cached?.labResults.count, 4)
+        let abnormal = cached?.labResults.filter(\.isAbnormal).count ?? 0
+        XCTAssertEqual(abnormal, 2)
+
+        // 4. Verify specific veteran scenario data
+        let ptsdClaim = cached?.claims.first { $0.description.contains("PTSD") }
+        XCTAssertNotNil(ptsdClaim)
+        XCTAssertTrue(ptsdClaim!.documentsNeeded)
+
+        let sertraline = cached?.medications.first { $0.name.contains("Sertraline") }
+        XCTAssertNotNil(sertraline)
+        XCTAssertEqual(sertraline?.refillsRemaining, 3)
+
+        // 5. Simulate revoke — clear everything
+        authManager.resetForTesting()
+        await cache.clearAll()
+
+        XCTAssertFalse(authManager.isAuthenticated)
+        let afterClear = await cache.getCachedData()
+        XCTAssertNil(afterClear)
+    }
+
+    func test_scopeGating_matchesToolHandlerRouting() async {
+        // Verify every scope-gated action properly checks the right scope
+        let scopeActionPairs: [(VAScope, String)] = [
+            (.claimsRead, "claims"),
+            (.disabilityRating, "disability"),
+            (.appointmentsRead, "appointments"),
+            (.medicationsRead, "medications"),
+            (.labResultsRead, "labs"),
+            (.conditionsRead, "conditions"),
+            (.healthRead, "allergies"),
+            (.veteranStatus, "veteran_status"),
+        ]
+
+        for (requiredScope, action) in scopeActionPairs {
+            // Create handler with ALL scopes EXCEPT the required one
+            let otherScopes = VAScope.allCases.filter { $0 != requiredScope }
+            let handler = VAToolHandler(
+                authManager: VAAuthManager(testTokens: MockVeteranData.validTokens(scopes: otherScopes)),
+                apiClient: VAAPIClient(),
+                cache: VADataCache()
+            )
+            let result = await handler.execute(action: action, params: [:])
+            XCTAssertFalse(result.success, "Action '\(action)' should fail without scope '\(requiredScope.rawValue)'")
+        }
+    }
+
+    func test_mockData_realisticVeteranScenario() {
+        // Verify the mock data represents a realistic veteran profile
+        let data = MockVeteranData.fullCachedData()
+
+        // Veteran with 70% combined rating
+        XCTAssertEqual(data.disabilityRating?.combinedRating, 70)
+
+        // 3 service-connected conditions matching the rating
+        let ratedConditions = data.disabilityRating?.individualRatings.map(\.condition) ?? []
+        XCTAssertTrue(ratedConditions.contains("PTSD"))
+        XCTAssertTrue(ratedConditions.contains("Tinnitus"))
+        XCTAssertTrue(ratedConditions.contains("Lumbar strain"))
+
+        // Active claim for PTSD increase
+        let ptsdClaim = data.claims.first { $0.description.contains("PTSD") }
+        XCTAssertNotNil(ptsdClaim)
+        XCTAssertEqual(ptsdClaim?.status, .evidenceGathering)
+
+        // Medications match conditions (sertraline for PTSD, ibuprofen for back pain)
+        let medNames = data.medications.map(\.name)
+        XCTAssertTrue(medNames.contains(where: { $0.contains("Sertraline") }))
+        XCTAssertTrue(medNames.contains(where: { $0.contains("Ibuprofen") }))
+
+        // Has severe allergies
+        let severeAllergies = data.allergies.filter { $0.severity == "severe" }
+        XCTAssertEqual(severeAllergies.count, 2) // Penicillin and Shellfish
+
+        // Service history shows Army + Army Reserve
+        XCTAssertEqual(data.veteranStatus?.serviceHistory.count, 2)
+    }
+}

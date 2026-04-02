@@ -1,0 +1,391 @@
+import XCTest
+@testable import SerenaCore
+
+final class MCPClientRedTests: XCTestCase {
+
+    // MARK: - JSON-RPC Request Tests
+
+    func test_jsonRPCRequest_encodesCorrectVersion() throws {
+        let request = JSONRPCRequest(id: 1, method: "initialize")
+        XCTAssertEqual(request.jsonrpc, "2.0")
+    }
+
+    func test_jsonRPCRequest_encodesToLineWithNewline() throws {
+        let request = JSONRPCRequest(id: 1, method: "ping")
+        let data = try request.encodeToLine()
+        let text = String(data: data, encoding: .utf8)!
+        XCTAssertTrue(text.hasSuffix("\n"), "Line-delimited JSON must end with newline")
+    }
+
+    func test_jsonRPCRequest_encodesMethodAndId() throws {
+        let request = JSONRPCRequest(id: 42, method: "tools/list")
+        let data = try request.encodeToLine()
+        let text = String(data: data, encoding: .utf8)!
+        // JSONEncoder may escape slashes as \/ or leave unescaped depending on OS version
+        XCTAssertTrue(text.contains("tools") && text.contains("list"),
+                       "Should contain method field components")
+        XCTAssertTrue(text.contains("42"), "Should contain request ID")
+    }
+
+    func test_jsonRPCRequest_encodesParams() throws {
+        let request = JSONRPCRequest(id: 1, method: "tools/call", params: [
+            "name": AnyCodable("my_tool"),
+            "arguments": AnyCodable(["key": "value"])
+        ])
+        let data = try request.encodeToLine()
+        let text = String(data: data, encoding: .utf8)!
+        XCTAssertTrue(text.contains("my_tool"), "Should contain tool name in params")
+    }
+
+    func test_jsonRPCRequest_nilParamsOmitted() throws {
+        let request = JSONRPCRequest(id: 1, method: "ping")
+        let data = try JSONEncoder().encode(request)
+        let dict = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        // params should either be nil/absent or null
+        let hasNonNullParams = dict["params"] != nil && !(dict["params"] is NSNull)
+        // It's fine if params is present but null — just shouldn't contain actual data
+        if hasNonNullParams {
+            XCTFail("Nil params should not encode as non-null value")
+        }
+    }
+
+    // MARK: - JSON-RPC Notification Tests
+
+    func test_jsonRPCNotification_hasNoId() throws {
+        let notification = JSONRPCNotification(method: "notifications/initialized")
+        let data = try JSONEncoder().encode(notification)
+        let dict = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        XCTAssertNil(dict["id"], "Notifications must not have an id field")
+    }
+
+    func test_jsonRPCNotification_encodesMethod() throws {
+        let notification = JSONRPCNotification(method: "notifications/initialized")
+        let data = try notification.encodeToLine()
+        let text = String(data: data, encoding: .utf8)!
+        XCTAssertTrue(text.contains("notifications/initialized") || text.contains("notifications\\/initialized"))
+    }
+
+    // MARK: - JSON-RPC Response Tests
+
+    func test_jsonRPCResponse_successHasNoError() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "result": {"key": "value"}}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        XCTAssertTrue(response.isSuccess)
+        XCTAssertFalse(response.isError)
+        XCTAssertNil(response.error)
+    }
+
+    func test_jsonRPCResponse_errorHasNoResult() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "Method not found"}}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        XCTAssertTrue(response.isError)
+        XCTAssertFalse(response.isSuccess)
+        XCTAssertEqual(response.error?.code, -32601)
+        XCTAssertEqual(response.error?.message, "Method not found")
+    }
+
+    func test_jsonRPCResponse_decodesResultAsType() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "result": {"name": "test-server", "version": "1.0.0"}}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        let serverInfo = try response.decodeResult(as: MCPServerInfo.self)
+        XCTAssertEqual(serverInfo.name, "test-server")
+        XCTAssertEqual(serverInfo.version, "1.0.0")
+    }
+
+    func test_jsonRPCResponse_decodeResultThrowsWhenNoResult() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "Internal error"}}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        XCTAssertThrowsError(try response.decodeResult(as: MCPServerInfo.self))
+    }
+
+    // MARK: - JSON-RPC Error Tests
+
+    func test_jsonRPCError_standardCodes() {
+        XCTAssertEqual(JSONRPCError.parseError.code, -32700)
+        XCTAssertEqual(JSONRPCError.invalidRequest.code, -32600)
+        XCTAssertEqual(JSONRPCError.methodNotFound.code, -32601)
+        XCTAssertEqual(JSONRPCError.invalidParams.code, -32602)
+        XCTAssertEqual(JSONRPCError.internalError.code, -32603)
+    }
+
+    func test_jsonRPCError_localizedDescription() {
+        let error = JSONRPCError(code: -32601, message: "Method not found")
+        XCTAssertTrue(error.errorDescription!.contains("-32601"))
+        XCTAssertTrue(error.errorDescription!.contains("Method not found"))
+    }
+
+    // MARK: - MCP Types Tests
+
+    func test_mcpServerCapabilities_supportsToolsWhenPresent() throws {
+        let json = """
+        {"tools": {"listChanged": true}, "resources": null, "prompts": null}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        XCTAssertTrue(caps.supportsTools)
+        XCTAssertFalse(caps.supportsResources)
+        XCTAssertFalse(caps.supportsPrompts)
+    }
+
+    func test_mcpServerCapabilities_supportsResourcesWhenPresent() throws {
+        let json = """
+        {"tools": null, "resources": {"subscribe": true}, "prompts": null}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        XCTAssertFalse(caps.supportsTools)
+        XCTAssertTrue(caps.supportsResources)
+    }
+
+    func test_mcpServerCapabilities_supportsPromptsWhenPresent() throws {
+        let json = """
+        {"tools": null, "resources": null, "prompts": {"listChanged": false}}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        XCTAssertTrue(caps.supportsPrompts)
+    }
+
+    func test_mcpServerInfo_codable() throws {
+        let info = MCPServerInfo(name: "test-server", version: "2.0.1")
+        let data = try JSONEncoder().encode(info)
+        let decoded = try JSONDecoder().decode(MCPServerInfo.self, from: data)
+        XCTAssertEqual(decoded.name, "test-server")
+        XCTAssertEqual(decoded.version, "2.0.1")
+    }
+
+    func test_mcpInitializeResult_decodesFullResponse() throws {
+        let json = """
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": true}, "resources": null, "prompts": null},
+            "serverInfo": {"name": "notion-mcp", "version": "0.5.0"}
+        }
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPInitializeResult.self, from: json)
+        XCTAssertEqual(result.protocolVersion, "2024-11-05")
+        XCTAssertEqual(result.serverInfo.name, "notion-mcp")
+        XCTAssertTrue(result.capabilities.supportsTools)
+    }
+
+    // MARK: - MCP Tool Types Tests
+
+    func test_mcpTool_decodable() throws {
+        let json = """
+        {
+            "name": "read_file",
+            "description": "Read a file from disk",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"}
+                },
+                "required": ["path"]
+            }
+        }
+        """.data(using: .utf8)!
+        let tool = try JSONDecoder().decode(MCPTool.self, from: json)
+        XCTAssertEqual(tool.name, "read_file")
+        XCTAssertEqual(tool.description, "Read a file from disk")
+        XCTAssertEqual(tool.id, "read_file")
+        XCTAssertEqual(tool.inputSchema.type, "object")
+        XCTAssertEqual(tool.inputSchema.properties?["path"]?.type, "string")
+        XCTAssertEqual(tool.inputSchema.required, ["path"])
+    }
+
+    func test_mcpToolResult_textContent() throws {
+        let result = MCPToolResult(content: [
+            MCPContent(text: "line 1"),
+            MCPContent(text: "line 2")
+        ])
+        XCTAssertEqual(result.textContent, "line 1\nline 2")
+        XCTAssertNil(result.isError)
+    }
+
+    func test_mcpToolResult_errorFlag() throws {
+        let result = MCPToolResult(content: [MCPContent(text: "Something went wrong")], isError: true)
+        XCTAssertTrue(result.isError == true)
+        XCTAssertEqual(result.textContent, "Something went wrong")
+    }
+
+    func test_mcpToolListResult_decodesMultipleTools() throws {
+        let json = """
+        {
+            "tools": [
+                {"name": "tool_a", "description": "First tool", "inputSchema": {"type": "object"}},
+                {"name": "tool_b", "inputSchema": {"type": "object"}}
+            ]
+        }
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPToolListResult.self, from: json)
+        XCTAssertEqual(result.tools.count, 2)
+        XCTAssertEqual(result.tools[0].name, "tool_a")
+        XCTAssertNil(result.tools[1].description)
+    }
+
+    // MARK: - MCP Content Tests
+
+    func test_mcpContent_textType() {
+        let content = MCPContent(text: "Hello World")
+        XCTAssertEqual(content.type, .text)
+        XCTAssertEqual(content.text, "Hello World")
+        XCTAssertNil(content.data)
+        XCTAssertNil(content.mimeType)
+    }
+
+    func test_mcpContent_imageType() {
+        let content = MCPContent(imageData: "base64data==", mimeType: "image/png")
+        XCTAssertEqual(content.type, .image)
+        XCTAssertEqual(content.data, "base64data==")
+        XCTAssertEqual(content.mimeType, "image/png")
+        XCTAssertNil(content.text)
+    }
+
+    // MARK: - MCP Resource Tests
+
+    func test_mcpResource_decodable() throws {
+        let json = """
+        {"uri": "file:///tmp/test.txt", "name": "Test File", "description": "A test", "mimeType": "text/plain"}
+        """.data(using: .utf8)!
+        let resource = try JSONDecoder().decode(MCPResource.self, from: json)
+        XCTAssertEqual(resource.uri, "file:///tmp/test.txt")
+        XCTAssertEqual(resource.name, "Test File")
+        XCTAssertEqual(resource.id, "file:///tmp/test.txt") // id == uri
+    }
+
+    // MARK: - MCP Prompt Tests
+
+    func test_mcpPrompt_decodable() throws {
+        let json = """
+        {
+            "name": "summarize",
+            "description": "Summarize text",
+            "arguments": [
+                {"name": "text", "description": "Text to summarize", "required": true}
+            ]
+        }
+        """.data(using: .utf8)!
+        let prompt = try JSONDecoder().decode(MCPPrompt.self, from: json)
+        XCTAssertEqual(prompt.name, "summarize")
+        XCTAssertEqual(prompt.id, "summarize")
+        XCTAssertEqual(prompt.arguments?.count, 1)
+        XCTAssertEqual(prompt.arguments?[0].required, true)
+    }
+
+    // MARK: - MCP Client Info Tests
+
+    func test_mcpClientInfo_defaults() {
+        let info = MCPClientInfo()
+        XCTAssertEqual(info.name, "Serena")
+        XCTAssertFalse(info.version.isEmpty)
+    }
+
+    func test_mcpInitializeParams_defaults() {
+        let params = MCPInitializeParams()
+        XCTAssertEqual(params.protocolVersion, "2024-11-05")
+        XCTAssertEqual(params.clientInfo.name, "Serena")
+    }
+
+    // MARK: - Transport Config Tests
+
+    func test_transportConfig_defaults() {
+        let config = MCPTransportConfig.default
+        XCTAssertEqual(config.requestTimeout, 30.0)
+        XCTAssertTrue(config.autoReconnect)
+        XCTAssertEqual(config.maxReconnectAttempts, 3)
+        XCTAssertEqual(config.reconnectDelay, 1.0)
+    }
+
+    func test_transportConfig_customValues() {
+        let config = MCPTransportConfig(
+            requestTimeout: 60.0,
+            autoReconnect: false,
+            maxReconnectAttempts: 5,
+            reconnectDelay: 2.5
+        )
+        XCTAssertEqual(config.requestTimeout, 60.0)
+        XCTAssertFalse(config.autoReconnect)
+        XCTAssertEqual(config.maxReconnectAttempts, 5)
+        XCTAssertEqual(config.reconnectDelay, 2.5)
+    }
+
+    // MARK: - MCP Error Tests
+
+    func test_mcpError_allCasesHaveDescriptions() {
+        let errors: [MCPError] = [
+            .notConnected,
+            .serverNotFound("/usr/bin/fake"),
+            .transportError("pipe broken"),
+            .protocolError("bad message"),
+            .timeout,
+            .invalidResponse,
+            .unknownTool("nonexistent"),
+            .capabilityNotSupported("prompts"),
+            .processSpawnFailed("permission denied"),
+            .processTerminated(1),
+            .cancelled
+        ]
+        for error in errors {
+            XCTAssertNotNil(error.errorDescription, "MCPError.\(error) should have a description")
+            XCTAssertFalse(error.errorDescription!.isEmpty)
+        }
+    }
+
+    func test_mcpError_processTerminatedIncludesCode() {
+        let error = MCPError.processTerminated(137)
+        XCTAssertTrue(error.errorDescription!.contains("137"))
+    }
+
+    // MARK: - Health Check Result Tests
+
+    func test_healthCheckResult_healthy() {
+        let result = HealthCheckResult(isHealthy: true, latencyMs: 12.5, error: nil)
+        XCTAssertTrue(result.isHealthy)
+        XCTAssertEqual(result.latencyMs, 12.5)
+        XCTAssertNil(result.error)
+    }
+
+    func test_healthCheckResult_unhealthy() {
+        let result = HealthCheckResult(isHealthy: false, latencyMs: nil, error: "Connection refused")
+        XCTAssertFalse(result.isHealthy)
+        XCTAssertNil(result.latencyMs)
+        XCTAssertEqual(result.error, "Connection refused")
+    }
+
+    // MARK: - MCPRole Tests
+
+    func test_mcpRole_codable() throws {
+        let data = try JSONEncoder().encode(MCPRole.user)
+        let decoded = try JSONDecoder().decode(MCPRole.self, from: data)
+        XCTAssertEqual(decoded, .user)
+
+        let data2 = try JSONEncoder().encode(MCPRole.assistant)
+        let decoded2 = try JSONDecoder().decode(MCPRole.self, from: data2)
+        XCTAssertEqual(decoded2, .assistant)
+    }
+
+    // MARK: - Security: Injection in Tool Names
+
+    func test_security_toolNameWithSpecialChars() throws {
+        let json = """
+        {
+            "name": "tool_with_<script>alert(1)</script>",
+            "inputSchema": {"type": "object"}
+        }
+        """.data(using: .utf8)!
+        let tool = try JSONDecoder().decode(MCPTool.self, from: json)
+        // Tool name should decode as-is (no execution risk in data model)
+        XCTAssertTrue(tool.name.contains("<script>"))
+    }
+
+    func test_security_oversizedToolResult() {
+        let hugeText = String(repeating: "x", count: 1_000_000)
+        let result = MCPToolResult(content: [MCPContent(text: hugeText)])
+        XCTAssertEqual(result.textContent.count, 1_000_000)
+    }
+}

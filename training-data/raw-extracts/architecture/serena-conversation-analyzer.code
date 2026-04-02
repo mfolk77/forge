@@ -1,0 +1,351 @@
+import Foundation
+import OSLog
+
+/// Analyzes conversation history to detect recurring patterns for knowledge extraction
+/// Part of the Adaptive Knowledge Engine (AKE) - System 1: Personal Learning
+actor ConversationAnalyzer {
+
+    // MARK: - Dependencies
+
+    private let dataStore: DataStore
+    private let llmEngine: MixtralEngine
+    private let heuristicDetector = HeuristicPatternDetector()
+    private let logger = Logger(subsystem: "ai.folktech.serena", category: "ConversationAnalyzer")
+
+    // MARK: - Configuration
+
+    /// Minimum number of mentions required for a valid pattern
+    private let minimumMentionThreshold: Int = 3
+
+    /// Default analysis window (30 days)
+    private let defaultAnalysisWindow: TimeInterval = 30 * 24 * 60 * 60
+
+    // MARK: - Initialization
+
+    init(dataStore: DataStore, llmEngine: MixtralEngine) {
+        self.dataStore = dataStore
+        self.llmEngine = llmEngine
+    }
+
+    // MARK: - Public API
+
+    /// Analyze conversations from the last 30 days
+    /// - Returns: Array of PatternCandidate objects representing detected patterns
+    func analyzePatterns() async -> [PatternCandidate] {
+        let thirtyDaysAgo = Date().addingTimeInterval(-defaultAnalysisWindow)
+        return await analyzePatterns(since: thirtyDaysAgo)
+    }
+
+    /// Analyze conversations since a specific date
+    /// - Parameter date: Start date for analysis
+    /// - Returns: Array of PatternCandidate objects representing detected patterns
+    func analyzePatterns(since date: Date) async -> [PatternCandidate] {
+        logger.info("Starting pattern analysis since \(date.formatted())")
+
+        do {
+            // Step 1: Query messages from database
+            let messages = try await queryMessages(since: date)
+
+            guard !messages.isEmpty else {
+                logger.info("No messages found for analysis")
+                return []
+            }
+
+            logger.info("Analyzing \(messages.count) messages")
+
+            // Step 2: Use LLM to detect patterns
+            let patterns = await detectPatternsWithLLM(messages)
+
+            // Step 3: Filter by threshold (3+ mentions)
+            let validPatterns = patterns.filter { $0.frequency >= minimumMentionThreshold }
+
+            logger.info("Found \(validPatterns.count) valid patterns (>= \(self.minimumMentionThreshold) mentions)")
+
+            return validPatterns
+
+        } catch {
+            logger.error("Pattern analysis failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Analyze a specific set of messages (for targeted analysis)
+    /// - Parameter messages: Array of Message objects to analyze
+    /// - Returns: Array of PatternCandidate objects
+    func analyzeMessages(_ messages: [Message]) async -> [PatternCandidate] {
+        guard !messages.isEmpty else {
+            logger.info("No messages provided for analysis")
+            return []
+        }
+
+        logger.info("Analyzing \(messages.count) provided messages")
+
+        let patterns = await detectPatternsWithLLM(messages)
+        let validPatterns = patterns.filter { $0.frequency >= minimumMentionThreshold }
+
+        logger.info("Found \(validPatterns.count) valid patterns from provided messages")
+
+        return validPatterns
+    }
+
+    /// Analyze messages for direct teaching — bypasses the 3-mention frequency threshold.
+    /// Use when user explicitly provides content to learn (not passive pattern detection).
+    func analyzeForDirectTeaching(_ messages: [Message]) async -> [PatternCandidate] {
+        guard !messages.isEmpty else {
+            logger.info("No messages provided for direct teaching")
+            return []
+        }
+
+        logger.info("Direct teaching: Analyzing \(messages.count) messages (no frequency threshold)")
+
+        // Run LLM pattern detection without frequency filter
+        let patterns = await detectPatternsWithLLM(messages)
+
+        logger.info("Direct teaching: Found \(patterns.count) patterns (all accepted)")
+        return patterns
+    }
+
+    // MARK: - Private Methods
+
+    /// Query messages from the DataStore since a specific date
+    private func queryMessages(since date: Date) async throws -> [Message] {
+        logger.debug("Querying messages since \(date.formatted())")
+
+        // Load all conversations from DataStore
+        // DataStore handles decryption automatically
+        let conversations = try await dataStore.loadConversations()
+
+        // Flatten all messages and filter by date
+        let allMessages = conversations.flatMap { $0.messages }
+        let recentMessages = allMessages.filter { $0.timestamp >= date }
+
+        // Sort by timestamp for chronological analysis
+        let sortedMessages = recentMessages.sorted { $0.timestamp < $1.timestamp }
+
+        logger.debug("Found \(sortedMessages.count) messages since \(date.formatted())")
+
+        return sortedMessages
+    }
+
+    /// Detect patterns using hybrid approach:
+    /// 1. Primary: HeuristicPatternDetector (no LLM, instant, zero concurrency issues)
+    /// 2. Deferred: LLM analysis when MLX is idle (future enhancement)
+    private func detectPatternsWithLLM(_ messages: [Message]) async -> [PatternCandidate] {
+        // Only analyze user messages (not assistant responses)
+        let userMessages = messages.filter { $0.role == .user }
+
+        guard !userMessages.isEmpty else {
+            logger.info("No user messages to analyze")
+            return []
+        }
+
+        // PRIMARY PATH: Heuristic detection (no LLM, no concurrency issues)
+        let messageTuples = userMessages.suffix(500).map { msg in
+            (id: msg.id.uuidString, content: msg.content, timestamp: msg.timestamp)
+        }
+
+        let heuristicPatterns = await heuristicDetector.analyzeBatch(messageTuples)
+        logger.info("Heuristic detector found \(heuristicPatterns.count) patterns")
+
+        // DEFERRED PATH: Queue for LLM analysis when idle (System 1b)
+        // Only attempt if heuristic found nothing AND engine is free
+        if heuristicPatterns.isEmpty {
+            let engineReady = await llmEngine.isReady
+            let isEngineBusy = await MainActor.run { llmEngine.isInferring }
+
+            if engineReady && !isEngineBusy {
+                logger.info("Heuristic found nothing — attempting deferred LLM analysis")
+                let llmPatterns = await runDeferredLLMAnalysis(userMessages)
+                return llmPatterns
+            } else {
+                logger.debug("MLX busy — skipping deferred LLM analysis")
+            }
+        }
+
+        return heuristicPatterns
+    }
+
+    /// Deferred LLM analysis — only runs when MLX is idle.
+    /// This is System 1b: deeper analysis that supplements the heuristic path.
+    private func runDeferredLLMAnalysis(_ userMessages: [Message]) async -> [PatternCandidate] {
+        let messagesToAnalyze = Array(userMessages.suffix(500))
+        let conversationText = messagesToAnalyze
+            .map { "[\($0.timestamp.formatted(date: .abbreviated, time: .shortened))]: \($0.content)" }
+            .joined(separator: "\n")
+
+        #if !DEBUG
+        // PRODUCTION: Disable LLM-based pattern detection to prevent MLX concurrency conflicts
+        // The learning pipeline was blocking user tool calls because MLX can only handle one request at a time.
+        // The guards above (isReady + isInferring) handle concurrency in DEBUG builds.
+        logger.info("⏭️ Skipping LLM pattern detection (disabled in Release)")
+        return []
+        #endif
+
+
+        let prompt = buildPatternDetectionPrompt(conversationText: conversationText)
+
+        do {
+            logger.debug("Calling LLM for deferred pattern detection...")
+            let response = try await llmEngine.generateResponse(for: prompt, context: [])
+            logger.debug("LLM response received (\(response.count) chars)")
+            return parsePatternJSON(response, messages: messagesToAnalyze)
+        } catch {
+            logger.info("Deferred LLM analysis skipped: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Build the prompt for pattern detection
+    private func buildPatternDetectionPrompt(conversationText: String) -> String {
+        return """
+        You are analyzing user messages to identify recurring topics and patterns.
+
+        TASK: Find topics that appear 3 or more times in these messages.
+
+        For each recurring topic, provide:
+        - topic: Brief description (e.g., "Christina work schedule", "medication reminders", "project deadlines")
+        - keywords: 3-5 relevant keywords that identify this topic
+        - frequency: Estimated number of times this topic appears
+        - confidence: 0.0-1.0 (how certain you are this is a real recurring pattern)
+
+        Focus on:
+        - People mentioned repeatedly (family, coworkers, friends)
+        - Recurring activities or schedules
+        - Health/medical topics
+        - Work/business topics
+        - Personal interests or hobbies
+        - Locations mentioned multiple times
+
+        Return ONLY a valid JSON array. No markdown, no explanation, just JSON:
+        [
+          {
+            "topic": "string",
+            "keywords": ["string", "string", "string"],
+            "frequency": number,
+            "confidence": number
+          }
+        ]
+
+        If no recurring patterns are found, return: []
+
+        USER MESSAGES:
+        \(conversationText)
+        """
+    }
+
+    /// Parse LLM JSON response into PatternCandidate array
+    private func parsePatternJSON(_ json: String, messages: [Message]) -> [PatternCandidate] {
+        // Clean JSON response (remove markdown code blocks if present)
+        let cleanJSON = cleanJSONResponse(json)
+
+        guard !cleanJSON.isEmpty else {
+            logger.warning("Empty JSON response from LLM")
+            return []
+        }
+
+        guard let data = cleanJSON.data(using: .utf8) else {
+            logger.error("Failed to convert JSON string to data")
+            return []
+        }
+
+        // Define structure for JSON parsing
+        struct PatternJSON: Codable {
+            let topic: String
+            let keywords: [String]
+            let frequency: Int
+            let confidence: Double
+        }
+
+        do {
+            let decoded = try JSONDecoder().decode([PatternJSON].self, from: data)
+
+            logger.debug("Successfully parsed \(decoded.count) patterns from JSON")
+
+            // Convert to PatternCandidate with message IDs
+            return decoded.compactMap { pattern -> PatternCandidate? in
+                // Validate pattern data
+                guard !pattern.topic.isEmpty,
+                      !pattern.keywords.isEmpty,
+                      pattern.frequency > 0,
+                      pattern.confidence >= 0 && pattern.confidence <= 1 else {
+                    logger.warning("Skipping invalid pattern: \(pattern.topic)")
+                    return nil
+                }
+
+                // Find messages containing these keywords
+                let relatedMessageIDs = findRelatedMessages(
+                    keywords: pattern.keywords,
+                    in: messages
+                )
+
+                return PatternCandidate(
+                    topic: pattern.topic,
+                    keywords: pattern.keywords,
+                    frequency: pattern.frequency,
+                    lastMentioned: Date(),
+                    messageIDs: relatedMessageIDs,
+                    confidence: pattern.confidence
+                )
+            }
+
+        } catch {
+            logger.error("Failed to parse pattern JSON: \(error.localizedDescription)")
+            logger.debug("Raw JSON: \(cleanJSON.prefix(500))...")
+            return []
+        }
+    }
+
+    /// Clean JSON response from LLM (remove markdown formatting, etc.)
+    private func cleanJSONResponse(_ response: String) -> String {
+        var cleaned = response
+
+        // Remove markdown code blocks
+        cleaned = cleaned.replacingOccurrences(of: "```json", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "```JSON", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "```", with: "")
+
+        // Trim whitespace
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Try to extract JSON array if there's surrounding text
+        if let startIndex = cleaned.firstIndex(of: "["),
+           let endIndex = cleaned.lastIndex(of: "]") {
+            cleaned = String(cleaned[startIndex...endIndex])
+        }
+
+        return cleaned
+    }
+
+    /// Find messages that contain any of the given keywords
+    private func findRelatedMessages(keywords: [String], in messages: [Message]) -> [String] {
+        let lowercaseKeywords = keywords.map { $0.lowercased() }
+
+        return messages
+            .filter { message in
+                let lowercaseContent = message.content.lowercased()
+                return lowercaseKeywords.contains { keyword in
+                    lowercaseContent.contains(keyword)
+                }
+            }
+            .map { $0.id.uuidString }
+    }
+}
+
+// MARK: - Error Types
+
+public enum ConversationAnalyzerError: LocalizedError {
+    case noMessagesFound
+    case llmGenerationFailed(String)
+    case jsonParsingFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .noMessagesFound:
+            return "No messages found for analysis"
+        case .llmGenerationFailed(let reason):
+            return "LLM generation failed: \(reason)"
+        case .jsonParsingFailed(let reason):
+            return "JSON parsing failed: \(reason)"
+        }
+    }
+}

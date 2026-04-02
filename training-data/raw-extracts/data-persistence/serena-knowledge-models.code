@@ -1,0 +1,730 @@
+import Foundation
+
+// MARK: - Pattern Detection Models
+
+/// Represents a detected pattern in user conversations
+public struct PatternCandidate: Codable, Identifiable, Sendable {
+    public let id: UUID
+    public let topic: String                  // "Christina work schedule"
+    public let keywords: [String]             // ["christina", "work", "schedule"]
+    public let frequency: Int                 // Number of mentions
+    public let lastMentioned: Date
+    public let messageIDs: [String]           // UUIDs of related messages
+    public let confidence: Double             // 0.0-1.0
+
+    public init(
+        id: UUID = UUID(),
+        topic: String,
+        keywords: [String],
+        frequency: Int,
+        lastMentioned: Date,
+        messageIDs: [String],
+        confidence: Double
+    ) {
+        self.id = id
+        self.topic = topic
+        self.keywords = keywords
+        self.frequency = frequency
+        self.lastMentioned = lastMentioned
+        self.messageIDs = messageIDs
+        self.confidence = confidence
+    }
+}
+
+// MARK: - Knowledge Entry Models
+
+/// Represents extracted structured knowledge
+public struct KnowledgeEntry: Codable, Identifiable, Sendable {
+    public let id: UUID
+    public let entity: String                      // "Christina Folk"
+    public let entityType: String                  // "person"
+    public let category: KnowledgeCategory         // .people
+    public let categoryConfidence: Double          // 0.0-1.0
+    public let attributes: [String: String]        // ["occupation": "ER nurse"]
+    public let relationships: [String: String]     // ["spouse": "Mike"]
+    public let sourceMessages: [String]            // Message UUIDs
+    public let confidence: Double                  // 0.0-1.0
+    public let createdAt: Date
+    public let needsReview: Bool                   // True if confidence 0.5-0.69
+
+    public init(
+        id: UUID = UUID(),
+        entity: String,
+        entityType: String,
+        category: KnowledgeCategory,
+        categoryConfidence: Double,
+        attributes: [String: String],
+        relationships: [String: String],
+        sourceMessages: [String],
+        confidence: Double,
+        createdAt: Date = Date(),
+        needsReview: Bool = false
+    ) {
+        self.id = id
+        self.entity = entity
+        self.entityType = entityType
+        self.category = category
+        self.categoryConfidence = categoryConfidence
+        self.attributes = attributes
+        self.relationships = relationships
+        self.sourceMessages = sourceMessages
+        self.confidence = confidence
+        self.createdAt = createdAt
+        self.needsReview = needsReview
+    }
+}
+
+// MARK: - Knowledge Categories
+
+/// Knowledge categories for organizing learned information
+public enum KnowledgeCategory: String, Codable, CaseIterable, Sendable {
+    case people
+    case business
+    case personal
+    case patterns
+
+    public var displayName: String {
+        rawValue.capitalized
+    }
+
+    public var subdirectory: String {
+        rawValue
+    }
+
+    public var icon: String {
+        switch self {
+        case .people: return "person.2"
+        case .business: return "briefcase"
+        case .personal: return "heart"
+        case .patterns: return "brain"
+        }
+    }
+}
+
+// MARK: - Knowledge Container
+
+/// Container for all learned knowledge
+public struct LearnedKnowledge: Codable, Sendable {
+    public var entries: [KnowledgeEntry]
+
+    public init(entries: [KnowledgeEntry] = []) {
+        self.entries = entries
+    }
+
+    public func entriesByCategory(_ category: KnowledgeCategory) -> [KnowledgeEntry] {
+        entries.filter { $0.category == category }
+    }
+
+    public func needsReview() -> [KnowledgeEntry] {
+        entries.filter { $0.needsReview }
+    }
+
+    public func search(_ query: String) -> [KnowledgeEntry] {
+        let lowercaseQuery = query.lowercased()
+        return entries.filter { entry in
+            entry.entity.lowercased().contains(lowercaseQuery) ||
+            entry.entityType.lowercased().contains(lowercaseQuery) ||
+            entry.attributes.values.contains { $0.lowercased().contains(lowercaseQuery) } ||
+            entry.relationships.values.contains { $0.lowercased().contains(lowercaseQuery) }
+        }
+    }
+
+    public var totalCount: Int {
+        entries.count
+    }
+
+    public var reviewCount: Int {
+        needsReview().count
+    }
+}
+
+// MARK: - Learned Knowledge RTAI Pattern (for integration)
+
+/// Pattern structure for RTAI registration of learned knowledge
+/// Note: This is separate from the existing RTAIPattern in MitosisToRTAIConverter
+/// to avoid conflicts and provide AKE-specific fields
+public struct LearnedKnowledgePattern: Codable, Identifiable, Sendable {
+    public let id: String
+    public let knowledgeEntryID: UUID
+    public let triggers: [String]
+    public let ftaiFilePath: String
+    public let confidence: Double
+    public let priority: Int
+    public let category: KnowledgeCategory
+    public let createdAt: Date
+
+    public init(
+        id: String = UUID().uuidString,
+        knowledgeEntryID: UUID,
+        triggers: [String],
+        ftaiFilePath: String,
+        confidence: Double,
+        priority: Int = 3,  // Default priority for learned knowledge (below medical=10, system=5)
+        category: KnowledgeCategory,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.knowledgeEntryID = knowledgeEntryID
+        self.triggers = triggers
+        self.ftaiFilePath = ftaiFilePath
+        self.confidence = confidence
+        self.priority = priority
+        self.category = category
+        self.createdAt = createdAt
+    }
+}
+
+// MARK: - Learning Statistics
+
+/// Statistics about the learning system
+public struct LearningStatistics: Sendable {
+    public let totalEntries: Int
+    public let entriesByCategory: [KnowledgeCategory: Int]
+    public let needsReviewCount: Int
+    public let lastLearningRun: Date?
+    public let messagesAnalyzed: Int
+
+    public init(
+        totalEntries: Int,
+        entriesByCategory: [KnowledgeCategory: Int],
+        needsReviewCount: Int,
+        lastLearningRun: Date?,
+        messagesAnalyzed: Int
+    ) {
+        self.totalEntries = totalEntries
+        self.entriesByCategory = entriesByCategory
+        self.needsReviewCount = needsReviewCount
+        self.lastLearningRun = lastLearningRun
+        self.messagesAnalyzed = messagesAnalyzed
+    }
+}
+
+// MARK: - Confidence Thresholds
+
+/// Configuration for confidence-based decisions
+public struct ConfidenceThresholds: Sendable {
+    /// Below this: discard
+    public static let minimum: Double = 0.5
+
+    /// Below this but above minimum: needs review
+    public static let review: Double = 0.7
+
+    /// Above this: auto-create
+    public static let autoCreate: Double = 0.7
+
+    public static func shouldDiscard(_ confidence: Double) -> Bool {
+        confidence < minimum
+    }
+
+    public static func needsReview(_ confidence: Double) -> Bool {
+        confidence >= minimum && confidence < review
+    }
+
+    public static func canAutoCreate(_ confidence: Double) -> Bool {
+        confidence >= autoCreate
+    }
+}
+
+// MARK: - System 2: Domain Expansion Models
+
+/// Detected knowledge gap from low-confidence queries
+public struct KnowledgeGap: Identifiable, Codable, Sendable {
+    public let id: UUID
+    public let topic: String
+    public let frequency: Int  // How many times mentioned
+    public let avgConfidence: Double  // Average LLM confidence
+    public let lastMentioned: Date
+    public let messageIDs: [String]
+
+    public init(
+        id: UUID = UUID(),
+        topic: String,
+        frequency: Int,
+        avgConfidence: Double,
+        lastMentioned: Date = Date(),
+        messageIDs: [String]
+    ) {
+        self.id = id
+        self.topic = topic
+        self.frequency = frequency
+        self.avgConfidence = avgConfidence
+        self.lastMentioned = lastMentioned
+        self.messageIDs = messageIDs
+    }
+}
+
+/// Web search result
+public struct SearchResult: Identifiable, Codable, Sendable {
+    public let id: UUID
+    public let title: String
+    public let url: URL
+    public let snippet: String
+    public let domain: String
+    public let timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        url: URL,
+        snippet: String,
+        domain: String,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.url = url
+        self.snippet = snippet
+        self.domain = domain
+        self.timestamp = timestamp
+    }
+}
+
+/// Source credibility assessment
+public struct CredibilityScore: Codable, Sendable {
+    public let score: Double  // 0.0-1.0
+    public let domain: String
+    public let reasoning: String
+    public let category: String  // "scientific", "medical", "news", etc.
+
+    public init(
+        score: Double,
+        domain: String,
+        reasoning: String,
+        category: String
+    ) {
+        self.score = score
+        self.domain = domain
+        self.reasoning = reasoning
+        self.category = category
+    }
+}
+
+/// Synthesized domain knowledge from research
+public struct DomainKnowledge: Identifiable, Codable, Sendable {
+    public let id: UUID
+    public let entity: String
+    public let entityType: String
+    public let summary: String
+    public let keyFacts: [String]
+    public let sources: [SearchResult]
+    public let credibilityScore: Double
+    public let confidence: Double
+    public let category: String  // For storage path
+    public let createdAt: Date
+    public let needsReview: Bool
+
+    public init(
+        id: UUID = UUID(),
+        entity: String,
+        entityType: String,
+        summary: String,
+        keyFacts: [String],
+        sources: [SearchResult],
+        credibilityScore: Double,
+        confidence: Double,
+        category: String,
+        createdAt: Date = Date(),
+        needsReview: Bool
+    ) {
+        self.id = id
+        self.entity = entity
+        self.entityType = entityType
+        self.summary = summary
+        self.keyFacts = keyFacts
+        self.sources = sources
+        self.credibilityScore = credibilityScore
+        self.confidence = confidence
+        self.category = category
+        self.createdAt = createdAt
+        self.needsReview = needsReview
+    }
+}
+
+/// Research job for batch processing
+public struct ResearchJob: Identifiable, Codable, Sendable {
+    public let id: UUID
+    public let gap: KnowledgeGap
+    public let priority: Int  // Higher = more urgent
+    public let status: ResearchStatus
+    public let createdAt: Date
+    public let completedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        gap: KnowledgeGap,
+        priority: Int,
+        status: ResearchStatus = .pending,
+        createdAt: Date = Date(),
+        completedAt: Date? = nil
+    ) {
+        self.id = id
+        self.gap = gap
+        self.priority = priority
+        self.status = status
+        self.createdAt = createdAt
+        self.completedAt = completedAt
+    }
+}
+
+/// Status of a research job
+public enum ResearchStatus: String, Codable, Sendable {
+    case pending
+    case inProgress
+    case completed
+    case failed
+}
+
+/// Domain expansion statistics
+public struct DomainExpansionStatistics: Sendable {
+    public let gapsDetected: Int
+    public let gapsResearched: Int
+    public let knowledgeCreated: Int
+    public let averageCredibility: Double
+    public let lastExpansionRun: Date?
+    public let pendingJobs: Int
+
+    public init(
+        gapsDetected: Int,
+        gapsResearched: Int,
+        knowledgeCreated: Int,
+        averageCredibility: Double,
+        lastExpansionRun: Date?,
+        pendingJobs: Int
+    ) {
+        self.gapsDetected = gapsDetected
+        self.gapsResearched = gapsResearched
+        self.knowledgeCreated = knowledgeCreated
+        self.averageCredibility = averageCredibility
+        self.lastExpansionRun = lastExpansionRun
+        self.pendingJobs = pendingJobs
+    }
+}
+
+/// Credibility thresholds for different source types
+public struct CredibilityThresholds: Sendable {
+    /// Minimum credibility to use a source
+    public static let minimum: Double = 0.5
+
+    /// High credibility threshold (scientific journals, government sites)
+    public static let high: Double = 0.8
+
+    /// Domains that are pre-approved as highly credible
+    public static let trustedDomains: Set<String> = [
+        "gov", "edu", "org",
+        "nature.com", "science.org", "pubmed.ncbi.nlm.nih.gov",
+        "who.int", "cdc.gov", "nih.gov",
+        "wikipedia.org", "britannica.com",
+        "reuters.com", "apnews.com"
+    ]
+
+    /// Domains that should be treated with lower credibility
+    public static let lowCredibilityDomains: Set<String> = [
+        "reddit.com", "quora.com", "yahoo.com",
+        "facebook.com", "twitter.com", "tiktok.com"
+    ]
+
+    public static func isTrusted(_ domain: String) -> Bool {
+        let lowercaseDomain = domain.lowercased()
+        return trustedDomains.contains { lowercaseDomain.hasSuffix($0) || lowercaseDomain == $0 }
+    }
+
+    public static func isLowCredibility(_ domain: String) -> Bool {
+        let lowercaseDomain = domain.lowercased()
+        return lowCredibilityDomains.contains { lowercaseDomain.contains($0) }
+    }
+}
+
+// MARK: - System 3: Style Adaptation Models
+
+/// Training dataset extracted from user conversations
+public struct TrainingDataset: Codable, Sendable {
+    public let messages: [TrainingExample]
+    public let metadata: DatasetMetadata
+
+    public init(messages: [TrainingExample], metadata: DatasetMetadata) {
+        self.messages = messages
+        self.metadata = metadata
+    }
+}
+
+/// Single training example (user message + context)
+public struct TrainingExample: Codable, Sendable {
+    public let text: String
+    public let context: String?  // Previous conversation context
+    public let timestamp: Date
+
+    public init(text: String, context: String? = nil, timestamp: Date = Date()) {
+        self.text = text
+        self.context = context
+        self.timestamp = timestamp
+    }
+}
+
+/// Metadata about training dataset
+public struct DatasetMetadata: Codable, Sendable {
+    public let totalMessages: Int
+    public let dateRangeStart: Date
+    public let dateRangeEnd: Date
+    public let avgMessageLength: Int
+    public let vocabularySize: Int
+
+    public init(
+        totalMessages: Int,
+        dateRangeStart: Date,
+        dateRangeEnd: Date,
+        avgMessageLength: Int,
+        vocabularySize: Int
+    ) {
+        self.totalMessages = totalMessages
+        self.dateRangeStart = dateRangeStart
+        self.dateRangeEnd = dateRangeEnd
+        self.avgMessageLength = avgMessageLength
+        self.vocabularySize = vocabularySize
+    }
+
+    /// Convenience computed property for date range tuple
+    public var dateRange: (start: Date, end: Date) {
+        return (dateRangeStart, dateRangeEnd)
+    }
+}
+
+/// LoRA training configuration
+public struct LoRAConfig: Codable, Sendable {
+    public let rank: Int
+    public let alpha: Int
+    public let targetModules: [String]
+    public let epochs: Int
+    public let batchSize: Int
+    public let learningRate: Double
+
+    public init(
+        rank: Int,
+        alpha: Int,
+        targetModules: [String],
+        epochs: Int,
+        batchSize: Int,
+        learningRate: Double
+    ) {
+        self.rank = rank
+        self.alpha = alpha
+        self.targetModules = targetModules
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.learningRate = learningRate
+    }
+
+    public static let `default` = LoRAConfig(
+        rank: 8,
+        alpha: 16,
+        targetModules: ["q_proj", "v_proj"],
+        epochs: 3,
+        batchSize: 4,
+        learningRate: 0.0001
+    )
+}
+
+/// Trained LoRA adapter metadata
+public struct LoRAAdapter: Codable, Identifiable, Sendable {
+    public let id: UUID
+    public let version: Int
+    public let filePath: URL
+    public let createdAt: Date
+    public let trainingStats: TrainingStats
+
+    public init(
+        id: UUID = UUID(),
+        version: Int,
+        filePath: URL,
+        createdAt: Date = Date(),
+        trainingStats: TrainingStats
+    ) {
+        self.id = id
+        self.version = version
+        self.filePath = filePath
+        self.createdAt = createdAt
+        self.trainingStats = trainingStats
+    }
+}
+
+/// Statistics from training run
+public struct TrainingStats: Codable, Sendable {
+    public let messagesUsed: Int
+    public let trainingTime: TimeInterval
+    public let finalLoss: Double
+    public let validationAccuracy: Double
+
+    public init(
+        messagesUsed: Int,
+        trainingTime: TimeInterval,
+        finalLoss: Double,
+        validationAccuracy: Double
+    ) {
+        self.messagesUsed = messagesUsed
+        self.trainingTime = trainingTime
+        self.finalLoss = finalLoss
+        self.validationAccuracy = validationAccuracy
+    }
+}
+
+/// Current training status
+public enum TrainingStatus: Codable, Sendable {
+    case needMoreData(have: Int, need: Int)
+    case ready
+    case training(progress: Double)
+    case complete(adapter: LoRAAdapter)
+    case failed(error: String)
+}
+
+/// Style comparison between adapters
+public struct StyleComparison: Codable, Sendable {
+    public let examples: [PromptComparison]
+
+    public init(examples: [PromptComparison]) {
+        self.examples = examples
+    }
+}
+
+/// Comparison of responses from baseline vs adapted model
+public struct PromptComparison: Codable, Sendable {
+    public let prompt: String
+    public let baseline: String
+    public let adapted: String
+
+    public init(prompt: String, baseline: String, adapted: String) {
+        self.prompt = prompt
+        self.baseline = baseline
+        self.adapted = adapted
+    }
+}
+
+/// Training errors
+public enum TrainingError: Error, Sendable {
+    case insufficientData(have: Int, need: Int)
+    case trainingFailed(reason: String)
+    case adapterNotFound(version: Int)
+    case invalidDataset
+    case pythonBridgeError(String)
+    case fileSystemError(String)
+}
+
+/// Style adaptation thresholds and configuration
+public struct StyleAdaptationConfig: Sendable {
+    /// Minimum messages required before training (uses debug threshold if enabled)
+    public static var minimumMessages: Int {
+        return DebugSettings.effectiveMessageThreshold
+    }
+
+    /// Maximum adapter versions to keep
+    public static let maxAdapterVersions: Int = 3
+
+    /// Target training day (Sunday = 1). DEBUG: any day.
+    public static var trainingDayOfWeek: Int {
+        #if DEBUG
+        return Calendar.current.component(.weekday, from: Date())  // Always "today" in debug
+        #else
+        return 1  // Sunday
+        #endif
+    }
+
+    /// Training window start hour (24h format). DEBUG: current hour (always in window).
+    public static var trainingStartHour: Int {
+        #if DEBUG
+        return Calendar.current.component(.hour, from: Date())  // Always "now" in debug
+        #else
+        return 2  // 2 AM
+        #endif
+    }
+
+    /// Training window end hour (24h format). DEBUG: current hour + 2.
+    public static var trainingEndHour: Int {
+        #if DEBUG
+        return min(24, Calendar.current.component(.hour, from: Date()) + 2)  // 2-hour window from now
+        #else
+        return 4  // 4 AM
+        #endif
+    }
+
+    /// Days of data to use for training (rolling window)
+    public static let trainingDataDays: Int = 90
+
+    /// Days to wait between training runs
+    public static let daysBetweenTraining: Int = 7  // Weekly
+
+    /// Check if currently within training window
+    public static func isWithinTrainingWindow() -> Bool {
+        // Skip check in debug mode
+        if DebugSettings.shouldSkipTrainingWindow() {
+            return true
+        }
+
+        // Normal Sunday 2-4 AM check
+        let now = Date()
+        let calendar = Calendar.current
+        let components = calendar.dateComponents([.weekday, .hour], from: now)
+
+        guard let weekday = components.weekday,
+              let hour = components.hour else {
+            return false
+        }
+
+        return weekday == trainingDayOfWeek &&
+               hour >= trainingStartHour &&
+               hour < trainingEndHour
+    }
+
+    /// Check if enough time has passed since last training
+    public static func hasEnoughTimePassed(since lastTraining: Date?) -> Bool {
+        // Skip check in debug mode
+        if DebugSettings.shouldSkipFrequencyLimit() {
+            return true
+        }
+
+        guard let last = lastTraining else {
+            return true  // Never trained before
+        }
+
+        let now = Date()
+        let daysSince = Calendar.current.dateComponents([.day], from: last, to: now).day ?? 0
+        return daysSince >= daysBetweenTraining
+    }
+}
+
+// MARK: - Style Adaptation Statistics
+
+/// Statistics about style adaptation training
+public struct StyleAdaptationStatistics: Codable, Sendable {
+    public let totalAdapters: Int
+    public let latestVersion: Int
+    public let lastTrainingDate: Date
+    public let messagesUsed: Int
+    public let trainingTime: TimeInterval
+    public let averageLoss: Double
+
+    public init(
+        totalAdapters: Int,
+        latestVersion: Int,
+        lastTrainingDate: Date,
+        messagesUsed: Int,
+        trainingTime: TimeInterval,
+        averageLoss: Double
+    ) {
+        self.totalAdapters = totalAdapters
+        self.latestVersion = latestVersion
+        self.lastTrainingDate = lastTrainingDate
+        self.messagesUsed = messagesUsed
+        self.trainingTime = trainingTime
+        self.averageLoss = averageLoss
+    }
+
+    public var description: String {
+        """
+        Style Adaptation Statistics:
+        - Total adapters: \(totalAdapters)
+        - Latest version: v\(latestVersion)
+        - Last training: \(lastTrainingDate.formatted())
+        - Messages used: \(messagesUsed)
+        - Training time: \(Int(trainingTime))s
+        - Average loss: \(String(format: "%.4f", averageLoss))
+        """
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "file-traversal-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/FileTraversalRedTests.swift",
+  "line_count": 202,
+  "why": "../, /etc/passwd, ~/.ssh, keychain blocking",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

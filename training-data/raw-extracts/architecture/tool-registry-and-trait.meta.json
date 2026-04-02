@@ -1,0 +1,14 @@
+{
+  "name": "tool-registry-and-trait",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/tools/registry.rs",
+  "line_count": 609,
+  "why": "Tool trait with Box<dyn Future>, CancelToken via watch::Sender, ToolProgress enum",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

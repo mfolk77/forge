@@ -1,0 +1,13 @@
+{
+  "name": "tool-validator",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/tools/validator.rs",
+  "line_count": 657,
+  "why": "Dangerous pattern detection, language detection, code validation",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

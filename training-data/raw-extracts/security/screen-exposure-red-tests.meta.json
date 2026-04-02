@@ -1,0 +1,13 @@
+{
+  "name": "screen-exposure-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/ScreenExposureRedTests.swift",
+  "line_count": 174,
+  "why": "Screen capture of sensitive content",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

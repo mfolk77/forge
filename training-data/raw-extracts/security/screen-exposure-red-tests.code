@@ -1,0 +1,174 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Sensitive data exposure through ScreenToolHandler output.
+/// These tests verify that PII (passwords, credit cards, SSNs, API keys)
+/// is redacted from screen-read content before it reaches the LLM,
+/// and that debug logs don't leak sensitive data.
+///
+/// Target: Sources/SerenaCore/Services/ToolHandlers/ScreenToolHandler.swift
+///         Sources/SerenaCore/Services/ToolHandlers/ToolHelpers.swift (SensitiveDataFilter)
+@MainActor
+final class ScreenExposureRedTests: XCTestCase {
+
+    // MARK: - SensitiveDataFilter Unit Tests
+
+    /// Credit card numbers must be redacted
+    func test_sensitiveFilter_creditCard_redacted() {
+        let input = "Order confirmed. Card: 4111 1111 1111 1111. Thank you!"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("4111 1111 1111 1111"),
+                       "Credit card number must be redacted")
+        XCTAssertTrue(filtered.contains("[REDACTED"),
+                      "Should contain redaction marker")
+        // Non-sensitive parts should survive
+        XCTAssertTrue(filtered.contains("Order confirmed"),
+                      "Non-sensitive text should be preserved")
+    }
+
+    /// Credit card without spaces must also be caught
+    func test_sensitiveFilter_creditCardNoSpaces_redacted() {
+        let input = "Card number: 4111111111111111 exp 12/26"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("4111111111111111"),
+                       "Compact credit card number must be redacted")
+    }
+
+    /// Credit card with dashes must also be caught
+    func test_sensitiveFilter_creditCardDashes_redacted() {
+        let input = "Visa: 4111-1111-1111-1111"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("4111-1111-1111-1111"),
+                       "Dashed credit card number must be redacted")
+    }
+
+    /// SSN patterns must be redacted
+    func test_sensitiveFilter_ssn_redacted() {
+        let input = "SSN: 123-45-6789. Date of birth: 1990-01-01"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("123-45-6789"),
+                       "SSN must be redacted")
+        // Date of birth should NOT be redacted (different pattern)
+        XCTAssertTrue(filtered.contains("1990-01-01"),
+                      "Date of birth should not be redacted as SSN")
+    }
+
+    /// Password field content must be redacted
+    func test_sensitiveFilter_passwordField_redacted() {
+        let input = "Username: john@example.com\nPassword: MyS3cretP@ss!\nRemember me: checked"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("MyS3cretP@ss!"),
+                       "Password value must be redacted")
+        // Username should survive
+        XCTAssertTrue(filtered.contains("john@example.com"),
+                      "Username should not be redacted")
+    }
+
+    /// API key patterns must be redacted
+    func test_sensitiveFilter_apiKey_redacted() {
+        let input = "OPENAI_API_KEY=sk-proj-abc123def456ghi789\nMODEL=gpt-4"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("sk-proj-abc123def456ghi789"),
+                       "API key must be redacted")
+        // Non-secret env var should survive
+        XCTAssertTrue(filtered.contains("MODEL=gpt-4") || filtered.contains("MODEL"),
+                      "Non-secret config should be preserved")
+    }
+
+    /// AWS secret key patterns must be redacted
+    func test_sensitiveFilter_awsSecretKey_redacted() {
+        let input = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("wJalrXUtnFEMI"),
+                       "AWS secret key must be redacted")
+    }
+
+    /// Bearer tokens must be redacted
+    func test_sensitiveFilter_bearerToken_redacted() {
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+                       "Bearer/JWT token must be redacted")
+    }
+
+    /// Private key blocks must be redacted
+    func test_sensitiveFilter_privateKey_redacted() {
+        let input = """
+        Config file:
+        -----BEGIN RSA PRIVATE KEY-----
+        MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF5MhKX2P
+        -----END RSA PRIVATE KEY-----
+        Host: example.com
+        """
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn"),
+                       "Private key content must be redacted")
+        XCTAssertTrue(filtered.contains("Host: example.com"),
+                      "Non-sensitive content should be preserved")
+    }
+
+    /// Normal text without sensitive data should pass through unchanged
+    func test_sensitiveFilter_normalText_unchanged() {
+        let input = "Meeting notes: Discussed Q4 roadmap. Action items: Update docs by Friday."
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertEqual(filtered, input,
+                       "Normal text should pass through unchanged")
+    }
+
+    /// Empty string should pass through
+    func test_sensitiveFilter_emptyString_unchanged() {
+        let filtered = SensitiveDataFilter.redact("")
+        XCTAssertEqual(filtered, "", "Empty string should remain empty")
+    }
+
+    /// Multiple sensitive items in one string should all be redacted
+    func test_sensitiveFilter_multipleSensitiveItems_allRedacted() {
+        let input = "Card: 4111 1111 1111 1111, SSN: 123-45-6789, Password: secret123"
+        let filtered = SensitiveDataFilter.redact(input)
+
+        XCTAssertFalse(filtered.contains("4111 1111 1111 1111"), "CC must be redacted")
+        XCTAssertFalse(filtered.contains("123-45-6789"), "SSN must be redacted")
+        XCTAssertFalse(filtered.contains("secret123"), "Password must be redacted")
+    }
+
+    // MARK: - Debug Log Tests
+
+    /// Debug log file should not be written in test/release context
+    func test_screen_debugLog_notWrittenByDefault() {
+        let logPath = NSHomeDirectory() + "/Documents/serena_screen_debug.log"
+
+        // Delete if exists from a previous run
+        try? FileManager.default.removeItem(atPath: logPath)
+
+        // The ScreenToolHandler writes a debug log on every execute() call.
+        // In a production/release build, this should not happen.
+        // For now, we verify the file path is predictable and document the risk.
+        // The fix will be to gate this behind a debug flag.
+
+        // Verify we know where the log goes (for the fix)
+        XCTAssertEqual(logPath, NSHomeDirectory() + "/Documents/serena_screen_debug.log",
+                       "Debug log path should be documented")
+    }
+
+    // MARK: - Output Truncation Tests
+
+    /// Screen content output must be truncated to prevent context overflow
+    func test_sensitiveFilter_veryLongContent_truncated() {
+        let longContent = String(repeating: "This is normal meeting notes content. ", count: 5000)
+        let filtered = SensitiveDataFilter.redact(longContent)
+
+        // Even non-sensitive content should be capped to prevent LLM context overflow
+        XCTAssertLessThanOrEqual(filtered.count, 5000,
+                                  "Screen content should be truncated to reasonable length")
+    }
+}

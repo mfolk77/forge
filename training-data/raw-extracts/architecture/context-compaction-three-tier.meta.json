@@ -1,0 +1,14 @@
+{
+  "name": "context-compaction-three-tier",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/compactor.rs",
+  "line_count": 1007,
+  "why": "microcompact \u2192 snip \u2192 summarize, deterministic snipping, transcript saving",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

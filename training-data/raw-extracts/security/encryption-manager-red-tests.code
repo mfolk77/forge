@@ -1,0 +1,244 @@
+@testable import SerenaCore
+import XCTest
+import CryptoKit
+
+final class EncryptionManagerRedTests: XCTestCase {
+
+    private var sut: EncryptionManager!
+
+    override func setUp() {
+        super.setUp()
+        // Use session key initializer to avoid Keychain access in tests
+        let sessionKey = SymmetricKey(size: .bits256)
+        sut = EncryptionManager(sessionKey: sessionKey)
+    }
+
+    override func tearDown() {
+        sut = nil
+        super.tearDown()
+    }
+
+    // MARK: - String Encryption/Decryption Roundtrip
+
+    func test_encryptDecryptString_roundtrip() throws {
+        let original = "Hello, Serena!"
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptString(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    func test_encryptDecryptString_emptyString() throws {
+        let original = ""
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptString(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    func test_encryptDecryptString_unicodeContent() throws {
+        let original = "Emoji test: \u{1F600}\u{1F4BB} Chinese: \u{4F60}\u{597D} Arabic: \u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptString(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    func test_encryptDecryptString_longString() throws {
+        let original = String(repeating: "A", count: 10_000)
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptString(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    // MARK: - Data Encryption/Decryption Roundtrip
+
+    func test_encryptDecryptData_roundtrip() throws {
+        let original = Data([0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD])
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptData(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    func test_encryptDecryptData_emptyData() throws {
+        let original = Data()
+        let encrypted = try sut.encrypt(original)
+        let decrypted = try sut.decryptData(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    // MARK: - Encryption Produces Different Ciphertexts (Nonce Uniqueness)
+
+    func test_encrypt_producesUniqueCiphertexts() throws {
+        let original = "same plaintext"
+        let encrypted1 = try sut.encrypt(original)
+        let encrypted2 = try sut.encrypt(original)
+        // AES-GCM uses random nonce, so same plaintext should produce different ciphertexts
+        XCTAssertNotEqual(encrypted1, encrypted2, "Two encryptions of same plaintext should differ (unique nonce)")
+    }
+
+    // MARK: - Decryption with Wrong Key Fails
+
+    func test_decryptWithWrongKey_throws() throws {
+        let original = "secret data"
+        let encrypted = try sut.encrypt(original)
+
+        // Create a different EncryptionManager with a different key
+        let differentKey = SymmetricKey(size: .bits256)
+        let otherManager = EncryptionManager(sessionKey: differentKey)
+
+        XCTAssertThrowsError(try otherManager.decryptString(encrypted)) { error in
+            guard let encError = error as? EncryptionError else {
+                XCTFail("Expected EncryptionError, got \(error)")
+                return
+            }
+            if case .decryptionFailed = encError {
+                // Expected
+            } else {
+                XCTFail("Expected decryptionFailed, got \(encError)")
+            }
+        }
+    }
+
+    // MARK: - Tampered Ciphertext Fails Decryption
+
+    func test_tamperedCiphertext_throwsDecryptionError() throws {
+        let original = "integrity check"
+        var encrypted = try sut.encrypt(original)
+
+        // Tamper with the ciphertext (flip a byte)
+        guard encrypted.count > 20 else {
+            XCTFail("Encrypted data too short to tamper")
+            return
+        }
+        encrypted[encrypted.count - 5] ^= 0xFF
+
+        XCTAssertThrowsError(try sut.decryptString(encrypted)) { error in
+            guard let encError = error as? EncryptionError else {
+                XCTFail("Expected EncryptionError, got \(error)")
+                return
+            }
+            if case .decryptionFailed = encError {
+                // Expected - AES-GCM detects tampering
+            } else {
+                XCTFail("Expected decryptionFailed for tampered data, got \(encError)")
+            }
+        }
+    }
+
+    // MARK: - Truncated Ciphertext Fails
+
+    func test_truncatedCiphertext_throwsDecryptionError() throws {
+        let original = "truncation test"
+        let encrypted = try sut.encrypt(original)
+
+        // Truncate to just a few bytes (too short for AES-GCM)
+        let truncated = encrypted.prefix(5)
+
+        XCTAssertThrowsError(try sut.decryptData(Data(truncated))) { error in
+            guard error is EncryptionError else {
+                XCTFail("Expected EncryptionError, got \(error)")
+                return
+            }
+        }
+    }
+
+    // MARK: - Secure Wipe
+
+    func test_secureWipe_data() {
+        var data = Data("sensitive info".utf8)
+        XCTAssertFalse(data.isEmpty, "Data should be non-empty before wipe")
+
+        sut.secureWipe(&data)
+        XCTAssertTrue(data.isEmpty, "Data should be empty after secure wipe")
+    }
+
+    func test_secureWipe_string() {
+        var string = "my secret password"
+        XCTAssertFalse(string.isEmpty, "String should be non-empty before wipe")
+
+        sut.secureWipe(&string)
+        XCTAssertEqual(string, "", "String should be empty after secure wipe")
+    }
+
+    // MARK: - Clear Sensitive Memory
+
+    func test_clearSensitiveMemory_doesNotCrash() {
+        // Should not throw or crash
+        sut.clearSensitiveMemory()
+        // If we get here, it succeeded
+    }
+
+    // MARK: - EncryptionError Descriptions
+
+    func test_encryptionError_descriptions() {
+        let errors: [EncryptionError] = [
+            .encryptionFailed(NSError(domain: "test", code: -1)),
+            .decryptionFailed(NSError(domain: "test", code: -2)),
+            .keychainError(errSecAuthFailed),
+            .invalidKeychainData,
+            .invalidStringEncoding,
+        ]
+
+        for error in errors {
+            XCTAssertNotNil(error.errorDescription, "All EncryptionError cases should have descriptions")
+            XCTAssertFalse(error.errorDescription!.isEmpty)
+        }
+    }
+
+    func test_encryptionError_keychainErrorContainsStatus() {
+        let error = EncryptionError.keychainError(-25293)
+        XCTAssertTrue(error.errorDescription!.contains("-25293"), "Keychain error should contain the status code")
+    }
+
+    // MARK: - Encrypted Data Size
+
+    func test_encryptedData_largerThanPlaintext() throws {
+        let original = "short"
+        let encrypted = try sut.encrypt(original)
+        // AES-GCM adds nonce (12 bytes) + tag (16 bytes) = 28 bytes overhead minimum
+        XCTAssertGreaterThan(encrypted.count, original.utf8.count, "Encrypted data should be larger than plaintext due to nonce + auth tag")
+    }
+
+    // MARK: - Multiple Sequential Operations
+
+    func test_multipleSequentialEncryptDecrypt() throws {
+        // Encrypt/decrypt many different strings to verify key consistency
+        for i in 0..<50 {
+            let original = "Message number \(i) with data: \(UUID().uuidString)"
+            let encrypted = try sut.encrypt(original)
+            let decrypted = try sut.decryptString(encrypted)
+            XCTAssertEqual(decrypted, original, "Roundtrip failed for message \(i)")
+        }
+    }
+
+    // MARK: - Session Key Initializer
+
+    func test_sessionKeyInitializer_works() throws {
+        // Verify the session key initializer produces a working manager
+        let key = SymmetricKey(size: .bits256)
+        let manager = EncryptionManager(sessionKey: key)
+
+        let original = "test session key"
+        let encrypted = try manager.encrypt(original)
+        let decrypted = try manager.decryptString(encrypted)
+        XCTAssertEqual(decrypted, original)
+    }
+
+    func test_twoSessionManagers_samePlaintext_differentCiphertext() throws {
+        let key1 = SymmetricKey(size: .bits256)
+        let key2 = SymmetricKey(size: .bits256)
+        let mgr1 = EncryptionManager(sessionKey: key1)
+        let mgr2 = EncryptionManager(sessionKey: key2)
+
+        let plaintext = "cross-key test"
+        let enc1 = try mgr1.encrypt(plaintext)
+        let enc2 = try mgr2.encrypt(plaintext)
+
+        // Different keys should produce different ciphertexts
+        XCTAssertNotEqual(enc1, enc2)
+
+        // Each should only decrypt with its own key
+        XCTAssertEqual(try mgr1.decryptString(enc1), plaintext)
+        XCTAssertEqual(try mgr2.decryptString(enc2), plaintext)
+        XCTAssertThrowsError(try mgr1.decryptString(enc2))
+        XCTAssertThrowsError(try mgr2.decryptString(enc1))
+    }
+}

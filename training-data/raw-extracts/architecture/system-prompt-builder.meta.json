@@ -1,0 +1,13 @@
+{
+  "name": "system-prompt-builder",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/prompt.rs",
+  "line_count": 755,
+  "why": "Modular system prompt: identity \u2192 tools \u2192 rules \u2192 memory \u2192 formatting",
+  "distill_as": [
+    "instruction",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

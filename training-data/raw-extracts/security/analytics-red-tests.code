@@ -1,0 +1,343 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Analytics system — event encoding/decoding, AnyCodable type handling,
+/// DashboardSnapshot metric calculations, critical events identification,
+/// and crash detection logic.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/AnalyticsManager.swift
+@MainActor
+final class AnalyticsManagerRedTests: XCTestCase {
+
+    // MARK: - Group 1: AnalyticsAnyCodable Encoding/Decoding
+
+    /// AnyCodable must roundtrip Bool values correctly
+    func test_anyCodable_bool_roundtrips() throws {
+        let original = AnalyticsAnyCodable(true)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        XCTAssertEqual(decoded.value as? Bool, true)
+    }
+
+    /// AnyCodable must roundtrip Int values correctly
+    func test_anyCodable_int_roundtrips() throws {
+        let original = AnalyticsAnyCodable(42)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        XCTAssertEqual(decoded.value as? Int, 42)
+    }
+
+    /// AnyCodable must roundtrip Double values correctly
+    func test_anyCodable_double_roundtrips() throws {
+        let original = AnalyticsAnyCodable(3.14)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        let decodedDouble = try XCTUnwrap(decoded.value as? Double)
+        XCTAssertEqual(decodedDouble, 3.14, accuracy: 0.001)
+    }
+
+    /// AnyCodable must roundtrip String values correctly
+    func test_anyCodable_string_roundtrips() throws {
+        let original = AnalyticsAnyCodable("hello")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        XCTAssertEqual(decoded.value as? String, "hello")
+    }
+
+    /// AnyCodable must encode nil/null values without crashing
+    func test_anyCodable_null_encodes() throws {
+        let original = AnalyticsAnyCodable(NSNull())
+        let data = try JSONEncoder().encode(original)
+        let json = String(data: data, encoding: .utf8)!
+        XCTAssertEqual(json, "null")
+    }
+
+    /// AnyCodable array roundtrip
+    func test_anyCodable_array_roundtrips() throws {
+        let original = AnalyticsAnyCodable([1, 2, 3])
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        let array = decoded.value as? [Any]
+        XCTAssertNotNil(array)
+        XCTAssertEqual(array?.count, 3)
+    }
+
+    /// AnyCodable dictionary roundtrip
+    func test_anyCodable_dict_roundtrips() throws {
+        let original = AnalyticsAnyCodable(["key": "value"])
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnalyticsAnyCodable.self, from: data)
+        let dict = decoded.value as? [String: Any]
+        XCTAssertNotNil(dict)
+        XCTAssertEqual(dict?["key"] as? String, "value")
+    }
+
+    // MARK: - Group 2: AnalyticsEvent Encoding/Decoding
+
+    /// AnalyticsEvent must roundtrip through JSON correctly
+    func test_analyticsEvent_roundtrips() throws {
+        let event = AnalyticsEvent(
+            event: "test_event",
+            timestamp: "2026-02-28T12:00:00Z",
+            properties: ["source": "unit_test", "count": 5],
+            appVersion: "1.9.0",
+            installId: "test-uuid-1234",
+            installDate: "2026-01-01T00:00:00Z"
+        )
+
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(AnalyticsEvent.self, from: data)
+
+        XCTAssertEqual(decoded.event, "test_event")
+        XCTAssertEqual(decoded.timestamp, "2026-02-28T12:00:00Z")
+        XCTAssertEqual(decoded.appVersion, "1.9.0")
+        XCTAssertEqual(decoded.installId, "test-uuid-1234")
+        XCTAssertEqual(decoded.installDate, "2026-01-01T00:00:00Z")
+        XCTAssertFalse(decoded.synced)
+    }
+
+    /// AnalyticsEvent properties must preserve heterogeneous types
+    func test_analyticsEvent_preservesPropertyTypes() throws {
+        let event = AnalyticsEvent(
+            event: "mixed_props",
+            timestamp: "2026-02-28T12:00:00Z",
+            properties: [
+                "string_val": "hello",
+                "int_val": 42,
+                "bool_val": true,
+                "double_val": 3.14
+            ],
+            appVersion: "1.9.0",
+            installId: "test-uuid"
+        )
+
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(AnalyticsEvent.self, from: data)
+
+        XCTAssertEqual(decoded.properties["string_val"]?.value as? String, "hello")
+        XCTAssertEqual(decoded.properties["int_val"]?.value as? Int, 42)
+        XCTAssertEqual(decoded.properties["bool_val"]?.value as? Bool, true)
+    }
+
+    /// AnalyticsEvent synced defaults to false
+    func test_analyticsEvent_syncedDefaultsFalse() {
+        let event = AnalyticsEvent(
+            event: "test",
+            timestamp: "2026-02-28T12:00:00Z",
+            properties: [:],
+            appVersion: "1.9.0",
+            installId: "test"
+        )
+        XCTAssertFalse(event.synced)
+    }
+
+    /// AnalyticsEvent CodingKeys map correctly (snake_case)
+    func test_analyticsEvent_codingKeys_snakeCase() throws {
+        let event = AnalyticsEvent(
+            event: "test",
+            timestamp: "2026-02-28T12:00:00Z",
+            properties: [:],
+            appVersion: "1.9.0",
+            installId: "test-id",
+            installDate: "2026-01-01"
+        )
+
+        let data = try JSONEncoder().encode(event)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        // Verify snake_case keys
+        XCTAssertNotNil(json?["app_version"], "Should use snake_case 'app_version'")
+        XCTAssertNotNil(json?["install_id"], "Should use snake_case 'install_id'")
+        XCTAssertNotNil(json?["install_date"], "Should use snake_case 'install_date'")
+        // Verify camelCase is NOT used
+        XCTAssertNil(json?["appVersion"], "Should NOT use camelCase 'appVersion'")
+        XCTAssertNil(json?["installId"], "Should NOT use camelCase 'installId'")
+    }
+
+    // MARK: - Group 3: Critical Events Classification
+
+    /// All funnel-critical events must be in the critical set
+    func test_criticalEvents_containsFunnelEvents() {
+        // We can't access the private criticalEvents set directly,
+        // but we can verify the expected behavior via AnalyticsManager.shared
+        // Since it's a singleton, verify it exists and is enabled by default
+        let manager = AnalyticsManager.shared
+        XCTAssertNotNil(manager)
+    }
+
+    /// Critical event names that MUST match between Swift and server
+    func test_criticalEventNames_matchServerExpectations() {
+        // These event names must be exact matches with the analytics server's funnel queries
+        // If these change in Swift, the server queries break
+        let requiredEventNames = [
+            "app_launched",
+            "setup_started",
+            "setup_completed",
+            "subscription_started",
+            "subscription_cancelled",
+            "subscription_renewed",
+            "subscription_expired",
+            "paywall_shown",
+            "paywall_converted",
+            "paywall_dismissed",
+            "crash_detected"
+        ]
+
+        // Verify these are valid strings (compile-time check essentially)
+        for name in requiredEventNames {
+            XCTAssertFalse(name.isEmpty, "Event name should not be empty")
+            XCTAssertFalse(name.contains(" "), "Event names should use underscores, not spaces: \(name)")
+            XCTAssertEqual(name, name.lowercased(), "Event names should be lowercase: \(name)")
+        }
+    }
+
+    // MARK: - Group 4: DashboardSnapshot
+
+    /// DashboardSnapshot toDictionary produces expected keys
+    func test_dashboardSnapshot_toDictionary_hasAllKeys() {
+        let snapshot = DashboardSnapshot(
+            date: Date(),
+            mrr: 100.0,
+            totalInstalls: 50,
+            activeTrials: 5,
+            trialConversionRate: 0.4,
+            churnRate: 0.1,
+            dau: 10,
+            wau: 30,
+            avgSessionDuration: 300.0,
+            toolUsageBreakdown: ["weather": 5, "timer": 3],
+            paywallConversionRate: 0.25,
+            avgLLMResponseTime: 1500.0,
+            avgRTAIResponseTime: 5.0,
+            tcaEngagementRate: 0.6,
+            topPaywallTrigger: "proactive_ai",
+            crashCount: 2
+        )
+
+        let dict = snapshot.toDictionary()
+
+        XCTAssertEqual(dict["mrr"] as? Double, 100.0)
+        XCTAssertEqual(dict["total_installs"] as? Int, 50)
+        XCTAssertEqual(dict["active_trials"] as? Int, 5)
+        XCTAssertEqual(dict["trial_conversion_rate"] as? Double, 0.4)
+        XCTAssertEqual(dict["churn_rate"] as? Double, 0.1)
+        XCTAssertEqual(dict["dau"] as? Int, 10)
+        XCTAssertEqual(dict["wau"] as? Int, 30)
+        XCTAssertEqual(dict["avg_session_duration"] as? Double, 300.0)
+        XCTAssertEqual(dict["paywall_conversion_rate"] as? Double, 0.25)
+        XCTAssertEqual(dict["avg_llm_response_time_ms"] as? Double, 1500.0)
+        XCTAssertEqual(dict["avg_rtai_response_time_ms"] as? Double, 5.0)
+        XCTAssertEqual(dict["tca_engagement_rate"] as? Double, 0.6)
+        XCTAssertEqual(dict["top_paywall_trigger"] as? String, "proactive_ai")
+        XCTAssertEqual(dict["crash_count"] as? Int, 2)
+    }
+
+    /// DashboardSnapshot with zero values doesn't crash or produce NaN
+    func test_dashboardSnapshot_zeroValues_noNaN() {
+        let snapshot = DashboardSnapshot(
+            date: Date(),
+            mrr: 0,
+            totalInstalls: 0,
+            activeTrials: 0,
+            trialConversionRate: 0,
+            churnRate: 0,
+            dau: 0,
+            wau: 0,
+            avgSessionDuration: 0,
+            toolUsageBreakdown: [:],
+            paywallConversionRate: 0,
+            avgLLMResponseTime: 0,
+            avgRTAIResponseTime: 0,
+            tcaEngagementRate: 0,
+            topPaywallTrigger: "none",
+            crashCount: 0
+        )
+
+        let dict = snapshot.toDictionary()
+        // Ensure no NaN or infinity values
+        for (key, value) in dict {
+            if let doubleVal = value as? Double {
+                XCTAssertFalse(doubleVal.isNaN, "\(key) should not be NaN")
+                XCTAssertFalse(doubleVal.isInfinite, "\(key) should not be infinite")
+            }
+        }
+    }
+
+    /// DashboardSnapshot date is included in dictionary as ISO8601
+    func test_dashboardSnapshot_dateIsISO8601() {
+        let date = Date()
+        let snapshot = DashboardSnapshot(
+            date: date,
+            mrr: 0, totalInstalls: 0, activeTrials: 0,
+            trialConversionRate: 0, churnRate: 0, dau: 0, wau: 0,
+            avgSessionDuration: 0, toolUsageBreakdown: [:],
+            paywallConversionRate: 0, avgLLMResponseTime: 0,
+            avgRTAIResponseTime: 0, tcaEngagementRate: 0,
+            topPaywallTrigger: "none", crashCount: 0
+        )
+
+        let dict = snapshot.toDictionary()
+        let dateStr = dict["date"] as? String
+        XCTAssertNotNil(dateStr, "Date should be present in dictionary")
+        XCTAssertTrue(dateStr?.contains("T") ?? false, "Date should be ISO8601 format")
+    }
+
+    /// DashboardSnapshot tool usage breakdown preserves all tools
+    func test_dashboardSnapshot_toolUsagePreserved() {
+        let tools = ["weather": 10, "timer": 5, "calendar": 8, "music": 3]
+        let snapshot = DashboardSnapshot(
+            date: Date(),
+            mrr: 0, totalInstalls: 0, activeTrials: 0,
+            trialConversionRate: 0, churnRate: 0, dau: 0, wau: 0,
+            avgSessionDuration: 0, toolUsageBreakdown: tools,
+            paywallConversionRate: 0, avgLLMResponseTime: 0,
+            avgRTAIResponseTime: 0, tcaEngagementRate: 0,
+            topPaywallTrigger: "none", crashCount: 0
+        )
+
+        let dict = snapshot.toDictionary()
+        let breakdown = dict["tool_usage_breakdown"] as? [String: Int]
+        XCTAssertNotNil(breakdown)
+        XCTAssertEqual(breakdown?.count, 4)
+        XCTAssertEqual(breakdown?["weather"], 10)
+        XCTAssertEqual(breakdown?["music"], 3)
+    }
+
+    // MARK: - Group 5: Analytics Manager Singleton Behavior
+
+    /// AnalyticsManager.shared should be disabled-safe (no crash when disabled)
+    func test_analyticsManager_trackingWhenDisabled_noCrash() {
+        let manager = AnalyticsManager.shared
+        let wasEnabled = manager.isEnabled
+
+        manager.isEnabled = false
+        // These should all be no-ops, not crashes
+        manager.track("test_disabled_event")
+        manager.track("test_disabled_value", value: "hello")
+        manager.track("test_disabled_numeric", value: 42.0)
+        manager.trackConversationStarted()
+        manager.trackMessageSent()
+        manager.trackToolCall(tool: "test", success: true)
+
+        // Restore
+        manager.isEnabled = wasEnabled
+    }
+
+    /// Crash detection uses clean_exit flag in UserDefaults
+    func test_crashDetection_cleanExitFlagKey() {
+        // markCleanExit should set the flag to true
+        let manager = AnalyticsManager.shared
+        manager.markCleanExit()
+
+        let cleanExit = UserDefaults.standard.bool(forKey: "serena_clean_exit")
+        XCTAssertTrue(cleanExit, "markCleanExit should set serena_clean_exit to true")
+    }
+
+    /// Install ID should persist across accesses
+    func test_installId_persists() {
+        let id1 = UserDefaults.standard.string(forKey: "serena_install_id")
+        XCTAssertNotNil(id1, "Install ID should be persisted after AnalyticsManager init")
+        XCTAssertFalse(id1?.isEmpty ?? true, "Install ID should not be empty")
+    }
+}

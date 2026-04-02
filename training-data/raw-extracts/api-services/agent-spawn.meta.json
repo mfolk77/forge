@@ -1,0 +1,13 @@
+{
+  "name": "agent-spawn",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/tools/agent_spawn.rs",
+  "line_count": 285,
+  "why": "Subagent spawning with restricted tool sets, message filtering",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

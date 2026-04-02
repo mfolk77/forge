@@ -1,0 +1,13 @@
+{
+  "name": "thinking-block-stripper-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/ThinkingBlockStripperRedTests.swift",
+  "line_count": 119,
+  "why": "LLM thinking block leak prevention",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

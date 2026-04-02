@@ -1,0 +1,13 @@
+{
+  "name": "memory-exposure-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/MemoryExposureRedTests.swift",
+  "line_count": 111,
+  "why": "Memory-resident sensitive data",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

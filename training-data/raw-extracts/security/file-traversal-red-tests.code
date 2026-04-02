@@ -1,0 +1,202 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Path traversal and unauthorized file access in FileToolHandler.
+/// These tests verify that PathValidator blocks access to sensitive paths
+/// while allowing operations in user-content directories.
+///
+/// Target: Sources/SerenaCore/Services/ToolHandlers/ToolHelpers.swift (PathValidator)
+///         Sources/SerenaCore/Services/ToolHandlers/FileToolHandler.swift
+@MainActor
+final class FileTraversalRedTests: XCTestCase {
+
+    // MARK: - PathValidator Unit Tests
+
+    /// Parent directory traversal (../) must be blocked
+    func test_pathValidator_parentTraversal_blocked() {
+        let result = PathValidator.validate("../../../etc/passwd")
+        XCTAssertFalse(result.isAllowed, "Parent traversal should be blocked")
+        XCTAssertNotNil(result.reason, "Should explain why path was blocked")
+    }
+
+    /// Absolute system paths must be blocked
+    func test_pathValidator_absoluteSystemPath_blocked() {
+        let result = PathValidator.validate("/etc/passwd")
+        XCTAssertFalse(result.isAllowed, "System paths should be blocked")
+    }
+
+    /// SSH keys must be blocked
+    func test_pathValidator_sshKeys_blocked() {
+        let result = PathValidator.validate("~/.ssh/id_rsa")
+        XCTAssertFalse(result.isAllowed, ".ssh directory should be blocked")
+    }
+
+    /// Keychain database must be blocked
+    func test_pathValidator_keychainDb_blocked() {
+        let result = PathValidator.validate("~/Library/Keychains/login.keychain-db")
+        XCTAssertFalse(result.isAllowed, "Keychain files should be blocked")
+    }
+
+    /// Browser cookies must be blocked
+    func test_pathValidator_browserCookies_blocked() {
+        let result = PathValidator.validate("~/Library/Cookies/Cookies.binarycookies")
+        XCTAssertFalse(result.isAllowed, "Cookie files should be blocked")
+    }
+
+    /// System binary paths must be blocked
+    func test_pathValidator_systemBinary_blocked() {
+        let result = PathValidator.validate("/usr/local/bin/python3")
+        XCTAssertFalse(result.isAllowed, "System binary paths should be blocked")
+    }
+
+    /// Home directory root should be blocked for destructive operations
+    func test_pathValidator_homeDirectory_blockedForDelete() {
+        let home = NSHomeDirectory()
+        let result = PathValidator.validate(home, operation: .delete)
+        XCTAssertFalse(result.isAllowed, "Cannot delete home directory")
+    }
+
+    /// /tmp should be blocked (exfiltration target)
+    func test_pathValidator_tmpDirectory_blocked() {
+        let result = PathValidator.validate("/tmp/exfil.txt")
+        XCTAssertFalse(result.isAllowed, "/tmp should be blocked")
+    }
+
+    /// Null bytes in path must be rejected
+    func test_pathValidator_nullByte_rejected() {
+        let result = PathValidator.validate("test.txt\0/etc/passwd")
+        XCTAssertFalse(result.isAllowed, "Null bytes in paths must be rejected")
+    }
+
+    /// Unicode fullwidth traversal characters must be caught
+    func test_pathValidator_unicodeTraversal_rejected() {
+        // Fullwidth period (U+FF0E) and slash (U+FF0F) can bypass naive checks
+        let result = PathValidator.validate("\u{FF0E}\u{FF0E}/\u{FF0E}\u{FF0E}/etc/passwd")
+        XCTAssertFalse(result.isAllowed, "Unicode traversal characters must be caught")
+    }
+
+    /// Empty path must be rejected
+    func test_pathValidator_emptyPath_rejected() {
+        let result = PathValidator.validate("")
+        XCTAssertFalse(result.isAllowed, "Empty path must be rejected")
+    }
+
+    /// Allowed user directories should pass
+    func test_pathValidator_documentsPath_allowed() {
+        let result = PathValidator.validate("~/Documents/notes.txt")
+        XCTAssertTrue(result.isAllowed, "~/Documents should be allowed")
+    }
+
+    func test_pathValidator_desktopPath_allowed() {
+        let result = PathValidator.validate("~/Desktop/file.txt")
+        XCTAssertTrue(result.isAllowed, "~/Desktop should be allowed")
+    }
+
+    func test_pathValidator_downloadsPath_allowed() {
+        let result = PathValidator.validate("~/Downloads/report.pdf")
+        XCTAssertTrue(result.isAllowed, "~/Downloads should be allowed")
+    }
+
+    /// /var and /System must be blocked
+    func test_pathValidator_varPath_blocked() {
+        let result = PathValidator.validate("/var/log/system.log")
+        XCTAssertFalse(result.isAllowed, "/var should be blocked")
+    }
+
+    func test_pathValidator_systemPath_blocked() {
+        let result = PathValidator.validate("/System/Library/something")
+        XCTAssertFalse(result.isAllowed, "/System should be blocked")
+    }
+
+    // MARK: - FileToolHandler Integration Tests
+
+    /// Read with traversal path should fail
+    func test_file_readPath_parentTraversal_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "read",
+            params: ["path": "../../../etc/passwd"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Read absolute system path should fail
+    func test_file_readPath_absoluteSystemPath_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "read",
+            params: ["path": "/etc/passwd"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Delete system file should fail
+    func test_file_deletePath_systemFile_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "delete",
+            params: ["path": "/usr/local/bin/python3"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Create file in system directory should fail
+    func test_file_createPath_systemDirectory_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "create",
+            params: ["path": "/usr/local/bin/malware", "content": "bad"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// List directory outside home should fail
+    func test_file_listDirectory_outsideHome_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "list",
+            params: ["directory": "/etc"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Read SSH keys should fail
+    func test_file_readPath_sshKeys_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "read",
+            params: ["path": "~/.ssh/id_rsa"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Empty path should return error, not crash
+    func test_file_readPath_emptyPath_handled() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "read",
+            params: ["path": ""]
+        )
+        XCTAssertFalse(result.success, "Empty path should fail gracefully")
+    }
+
+    /// Move to /tmp (exfiltration) should be blocked
+    func test_file_movePath_outsideAllowed_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "move",
+            params: ["path": "~/Documents/test.txt", "destination": "/tmp/exfil.txt"]
+        )
+        assertPathBlocked(result)
+    }
+
+    /// Copy sensitive file to allowed dir should block source
+    func test_file_copyPath_sensitiveSource_blocked() async {
+        let handler = FileToolHandler()
+        let result = await handler.execute(
+            action: "copy",
+            params: ["source": "~/.ssh/id_rsa", "destination": "~/Desktop/stolen_key.txt"]
+        )
+        assertPathBlocked(result)
+    }
+}

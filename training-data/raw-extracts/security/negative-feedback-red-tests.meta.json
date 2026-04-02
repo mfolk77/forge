@@ -1,0 +1,1 @@
+{"name": "negative-feedback-red-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/NegativeFeedbackRedTests.swift", "line_count": 303, "why": "Serena red tests: NegativeFeedbackRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

@@ -1,0 +1,1014 @@
+import XCTest
+@testable import SerenaCore
+
+/// Comprehensive red tests for MCP system files not covered by MCPClientRedTests.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/MCP/JSONRPCTypes.swift
+/// - Sources/SerenaCore/Services/MCP/MCPTypes.swift
+/// - Sources/SerenaCore/Services/MCP/AnyCodable.swift
+/// - Sources/SerenaCore/Services/MCP/MCPTransport.swift
+/// - Sources/SerenaCore/Services/MCP/MCPToolBridge.swift
+/// - Sources/SerenaCore/Services/MCP/MCPClientManager.swift
+@MainActor
+final class MCPSystemRedTests: XCTestCase {
+
+    // MARK: - AnyCodable: Encoding/Decoding Roundtrips
+
+    func test_anyCodable_stringRoundtrip() throws {
+        let original = AnyCodable("hello")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.stringValue, "hello")
+    }
+
+    func test_anyCodable_intRoundtrip() throws {
+        let original = AnyCodable(42)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.intValue, 42)
+    }
+
+    func test_anyCodable_doubleRoundtrip() throws {
+        let original = AnyCodable(3.14)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        let value = decoded.doubleValue
+        XCTAssertNotNil(value)
+        XCTAssertEqual(value!, 3.14, accuracy: 0.001)
+    }
+
+    func test_anyCodable_boolRoundtrip() throws {
+        let original = AnyCodable(true)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.boolValue, true)
+    }
+
+    func test_anyCodable_nullRoundtrip() throws {
+        let original = AnyCodable(NSNull())
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        let isNull = decoded.isNull
+        XCTAssertTrue(isNull)
+    }
+
+    func test_anyCodable_arrayRoundtrip() throws {
+        let original = AnyCodable([1, 2, 3])
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        let arr = decoded.arrayValue
+        XCTAssertNotNil(arr)
+        XCTAssertEqual(arr?.count, 3)
+    }
+
+    func test_anyCodable_dictionaryRoundtrip() throws {
+        let original = AnyCodable(["key": "value"])
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        let dict = decoded.dictionaryValue
+        XCTAssertNotNil(dict)
+        XCTAssertEqual(dict?["key"] as? String, "value")
+    }
+
+    func test_anyCodable_nestedDictionaryRoundtrip() throws {
+        let original = AnyCodable(["outer": ["inner": 99]])
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        let dict = decoded.dictionaryValue
+        let inner = dict?["outer"] as? [String: Any]
+        XCTAssertNotNil(inner)
+        XCTAssertEqual(inner?["inner"] as? Int, 99)
+    }
+
+    // MARK: - AnyCodable: ExpressibleBy Literals
+
+    func test_anyCodable_nilLiteral() {
+        let value: AnyCodable = nil
+        let isNull = value.isNull
+        XCTAssertTrue(isNull)
+    }
+
+    func test_anyCodable_boolLiteral() {
+        let value: AnyCodable = true
+        XCTAssertEqual(value.boolValue, true)
+    }
+
+    func test_anyCodable_intLiteral() {
+        let value: AnyCodable = 42
+        XCTAssertEqual(value.intValue, 42)
+    }
+
+    func test_anyCodable_floatLiteral() {
+        let value: AnyCodable = 2.718
+        let dv = value.doubleValue
+        XCTAssertNotNil(dv)
+        XCTAssertEqual(dv!, 2.718, accuracy: 0.001)
+    }
+
+    func test_anyCodable_stringLiteral() {
+        let value: AnyCodable = "test"
+        XCTAssertEqual(value.stringValue, "test")
+    }
+
+    func test_anyCodable_arrayLiteral() {
+        let value: AnyCodable = [1, "two", 3.0]
+        let arr = value.arrayValue
+        XCTAssertNotNil(arr)
+        XCTAssertEqual(arr?.count, 3)
+    }
+
+    func test_anyCodable_dictionaryLiteral() {
+        let value: AnyCodable = ["a": 1, "b": "two"]
+        let dict = value.dictionaryValue
+        XCTAssertNotNil(dict)
+        XCTAssertEqual(dict?["a"] as? Int, 1)
+        XCTAssertEqual(dict?["b"] as? String, "two")
+    }
+
+    // MARK: - AnyCodable: Equatable
+
+    func test_anyCodable_equalStrings() {
+        let a: AnyCodable = "hello"
+        let b: AnyCodable = "hello"
+        XCTAssertEqual(a, b)
+    }
+
+    func test_anyCodable_unequalStrings() {
+        let a: AnyCodable = "hello"
+        let b: AnyCodable = "world"
+        XCTAssertNotEqual(a, b)
+    }
+
+    func test_anyCodable_equalInts() {
+        let a: AnyCodable = 7
+        let b: AnyCodable = 7
+        XCTAssertEqual(a, b)
+    }
+
+    func test_anyCodable_equalBools() {
+        let a: AnyCodable = false
+        let b: AnyCodable = false
+        XCTAssertEqual(a, b)
+    }
+
+    func test_anyCodable_equalDoubles() {
+        let a: AnyCodable = 1.5
+        let b: AnyCodable = 1.5
+        XCTAssertEqual(a, b)
+    }
+
+    func test_anyCodable_equalNulls() {
+        let a: AnyCodable = nil
+        let b: AnyCodable = nil
+        XCTAssertEqual(a, b)
+    }
+
+    func test_anyCodable_differentTypesNotEqual() {
+        let a: AnyCodable = 42
+        let b: AnyCodable = "42"
+        XCTAssertNotEqual(a, b)
+    }
+
+    // MARK: - AnyCodable: CustomStringConvertible
+
+    func test_anyCodable_descriptionNull() {
+        let value: AnyCodable = nil
+        XCTAssertEqual(value.description, "null")
+    }
+
+    func test_anyCodable_descriptionBool() {
+        let t: AnyCodable = true
+        let f: AnyCodable = false
+        XCTAssertEqual(t.description, "true")
+        XCTAssertEqual(f.description, "false")
+    }
+
+    func test_anyCodable_descriptionInt() {
+        let value: AnyCodable = 123
+        XCTAssertEqual(value.description, "123")
+    }
+
+    func test_anyCodable_descriptionString() {
+        let value: AnyCodable = "hi"
+        XCTAssertEqual(value.description, "\"hi\"")
+    }
+
+    func test_anyCodable_descriptionArray() {
+        let value = AnyCodable([1, 2])
+        XCTAssertEqual(value.description, "[2 items]")
+    }
+
+    func test_anyCodable_descriptionDict() {
+        let value = AnyCodable(["a": 1])
+        XCTAssertEqual(value.description, "{1 keys}")
+    }
+
+    // MARK: - AnyCodable: Hashable
+
+    func test_anyCodable_hashableConsistency() {
+        let a: AnyCodable = "test"
+        let b: AnyCodable = "test"
+        XCTAssertEqual(a.hashValue, b.hashValue)
+    }
+
+    func test_anyCodable_usableInSet() {
+        var set: Set<AnyCodable> = []
+        set.insert(AnyCodable("a"))
+        set.insert(AnyCodable("a"))
+        set.insert(AnyCodable("b"))
+        XCTAssertEqual(set.count, 2)
+    }
+
+    // MARK: - AnyCodable: Accessor Returns nil for Wrong Type
+
+    func test_anyCodable_stringAccessorReturnsNilForInt() {
+        let value: AnyCodable = 42
+        XCTAssertNil(value.stringValue)
+    }
+
+    func test_anyCodable_intAccessorReturnsNilForString() {
+        let value: AnyCodable = "hello"
+        XCTAssertNil(value.intValue)
+    }
+
+    func test_anyCodable_boolAccessorReturnsNilForString() {
+        let value: AnyCodable = "true"
+        XCTAssertNil(value.boolValue)
+    }
+
+    func test_anyCodable_arrayAccessorReturnsNilForString() {
+        let value: AnyCodable = "not an array"
+        XCTAssertNil(value.arrayValue)
+    }
+
+    func test_anyCodable_dictAccessorReturnsNilForInt() {
+        let value: AnyCodable = 5
+        XCTAssertNil(value.dictionaryValue)
+    }
+
+    // MARK: - JSONRPCTypes: Request with [String: Any] params init
+
+    func test_jsonRPCRequest_anyParamsInit() throws {
+        let params: [String: Any] = ["name": "test_tool", "count": 3]
+        let request = JSONRPCRequest(id: 10, method: "tools/call", params: params)
+        XCTAssertEqual(request.id, 10)
+        XCTAssertEqual(request.method, "tools/call")
+        XCTAssertNotNil(request.params)
+        XCTAssertEqual(request.params?["name"]?.stringValue, "test_tool")
+    }
+
+    func test_jsonRPCRequest_nilAnyParams() {
+        let request = JSONRPCRequest(id: 1, method: "ping", params: nil as [String: Any]?)
+        XCTAssertNil(request.params)
+    }
+
+    // MARK: - JSONRPCTypes: Notification with [String: Any] params init
+
+    func test_jsonRPCNotification_anyParamsInit() {
+        let params: [String: Any] = ["key": "value"]
+        let notification = JSONRPCNotification(method: "test/notify", params: params)
+        XCTAssertEqual(notification.jsonrpc, "2.0")
+        XCTAssertEqual(notification.method, "test/notify")
+        XCTAssertEqual(notification.params?["key"]?.stringValue, "value")
+    }
+
+    func test_jsonRPCNotification_nilAnyParams() {
+        let notification = JSONRPCNotification(method: "test", params: nil as [String: Any]?)
+        XCTAssertNil(notification.params)
+    }
+
+    func test_jsonRPCNotification_encodeToLine() throws {
+        let notification = JSONRPCNotification(method: "initialized")
+        let data = try notification.encodeToLine()
+        let text = String(data: data, encoding: .utf8)!
+        XCTAssertTrue(text.hasSuffix("\n"))
+        XCTAssertTrue(text.contains("initialized"))
+    }
+
+    // MARK: - JSONRPCTypes: Codable Roundtrip
+
+    func test_jsonRPCRequest_codableRoundtrip() throws {
+        let request = JSONRPCRequest(id: 99, method: "resources/read", params: [
+            "uri": AnyCodable("file:///test.txt")
+        ])
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(JSONRPCRequest.self, from: data)
+        XCTAssertEqual(decoded.id, 99)
+        XCTAssertEqual(decoded.method, "resources/read")
+        XCTAssertEqual(decoded.jsonrpc, "2.0")
+        XCTAssertEqual(decoded.params?["uri"]?.stringValue, "file:///test.txt")
+    }
+
+    func test_jsonRPCNotification_codableRoundtrip() throws {
+        let notification = JSONRPCNotification(method: "notifications/tools/list_changed")
+        let data = try JSONEncoder().encode(notification)
+        let decoded = try JSONDecoder().decode(JSONRPCNotification.self, from: data)
+        XCTAssertEqual(decoded.method, "notifications/tools/list_changed")
+        XCTAssertEqual(decoded.jsonrpc, "2.0")
+    }
+
+    // MARK: - JSONRPCTypes: Response decoding edge cases
+
+    func test_jsonRPCResponse_nullResult() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "result": null}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        // "result": null decodes as Optional<AnyCodable>.none
+        let isError = response.isError
+        XCTAssertFalse(isError, "No error field, so isError should be false")
+        // result is nil from null JSON, so isSuccess = false (isSuccess = error == nil && result != nil)
+        let isSuccess = response.isSuccess
+        XCTAssertFalse(isSuccess, "null result means result is nil")
+    }
+
+    func test_jsonRPCResponse_errorWithData() throws {
+        let json = """
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "Custom error", "data": {"detail": "extra info"}}}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        let isError = response.isError
+        XCTAssertTrue(isError)
+        XCTAssertEqual(response.error?.code, -32000)
+        XCTAssertEqual(response.error?.message, "Custom error")
+        XCTAssertNotNil(response.error?.data)
+    }
+
+    func test_jsonRPCResponse_noIdAllowed() throws {
+        // Responses to notifications may lack an id
+        let json = """
+        {"jsonrpc": "2.0", "result": "ok"}
+        """.data(using: .utf8)!
+        let response = try JSONDecoder().decode(JSONRPCResponse.self, from: json)
+        XCTAssertNil(response.id)
+    }
+
+    // MARK: - JSONRPCDecodingError
+
+    func test_jsonRPCDecodingError_noResult_description() {
+        let error = JSONRPCDecodingError.noResult
+        let desc = error.errorDescription
+        XCTAssertNotNil(desc)
+        XCTAssertTrue(desc!.contains("no result"))
+    }
+
+    func test_jsonRPCDecodingError_invalidResultType_description() {
+        let error = JSONRPCDecodingError.invalidResultType
+        let desc = error.errorDescription
+        XCTAssertNotNil(desc)
+        XCTAssertTrue(desc!.contains("type"))
+    }
+
+    func test_jsonRPCDecodingError_decodingFailed_description() {
+        let underlying = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad data"])
+        let error = JSONRPCDecodingError.decodingFailed(underlying)
+        let desc = error.errorDescription
+        XCTAssertNotNil(desc)
+        XCTAssertTrue(desc!.contains("decode") || desc!.contains("Decode"))
+    }
+
+    // MARK: - JSONRPCError: Codable roundtrip
+
+    func test_jsonRPCError_codableRoundtrip() throws {
+        let error = JSONRPCError(code: -32601, message: "Method not found", data: AnyCodable("extra"))
+        let data = try JSONEncoder().encode(error)
+        let decoded = try JSONDecoder().decode(JSONRPCError.self, from: data)
+        XCTAssertEqual(decoded.code, -32601)
+        XCTAssertEqual(decoded.message, "Method not found")
+        XCTAssertEqual(decoded.data?.stringValue, "extra")
+    }
+
+    func test_jsonRPCError_nilData() throws {
+        let error = JSONRPCError(code: -32700, message: "Parse error")
+        let data = try JSONEncoder().encode(error)
+        let decoded = try JSONDecoder().decode(JSONRPCError.self, from: data)
+        XCTAssertEqual(decoded.code, -32700)
+        XCTAssertNil(decoded.data)
+    }
+
+    // MARK: - MCPTypes: MCPContent Codable
+
+    func test_mcpContent_textCodableRoundtrip() throws {
+        let content = MCPContent(text: "Hello MCP")
+        let data = try JSONEncoder().encode(content)
+        let decoded = try JSONDecoder().decode(MCPContent.self, from: data)
+        XCTAssertEqual(decoded.type, .text)
+        XCTAssertEqual(decoded.text, "Hello MCP")
+        XCTAssertNil(decoded.data)
+    }
+
+    func test_mcpContent_imageCodableRoundtrip() throws {
+        let content = MCPContent(imageData: "aGVsbG8=", mimeType: "image/jpeg")
+        let data = try JSONEncoder().encode(content)
+        let decoded = try JSONDecoder().decode(MCPContent.self, from: data)
+        XCTAssertEqual(decoded.type, .image)
+        XCTAssertEqual(decoded.data, "aGVsbG8=")
+        XCTAssertEqual(decoded.mimeType, "image/jpeg")
+    }
+
+    func test_mcpContentType_rawValues() {
+        XCTAssertEqual(MCPContent.MCPContentType.text.rawValue, "text")
+        XCTAssertEqual(MCPContent.MCPContentType.image.rawValue, "image")
+        XCTAssertEqual(MCPContent.MCPContentType.resource.rawValue, "resource")
+    }
+
+    // MARK: - MCPTypes: MCPToolResult
+
+    func test_mcpToolResult_emptyContent() {
+        let result = MCPToolResult(content: [])
+        XCTAssertEqual(result.textContent, "")
+        XCTAssertNil(result.isError)
+    }
+
+    func test_mcpToolResult_mixedContent() {
+        let result = MCPToolResult(content: [
+            MCPContent(text: "first"),
+            MCPContent(imageData: "img", mimeType: "image/png"),
+            MCPContent(text: "third")
+        ])
+        // textContent should skip image (no text field)
+        XCTAssertEqual(result.textContent, "first\nthird")
+    }
+
+    func test_mcpToolResult_codableRoundtrip() throws {
+        let result = MCPToolResult(content: [MCPContent(text: "output")], isError: false)
+        let data = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(MCPToolResult.self, from: data)
+        XCTAssertEqual(decoded.textContent, "output")
+        XCTAssertEqual(decoded.isError, false)
+    }
+
+    // MARK: - MCPTypes: MCPPropertySchema
+
+    func test_mcpPropertySchema_basicInit() {
+        let schema = MCPPropertySchema(type: "string", description: "A file path")
+        XCTAssertEqual(schema.type, "string")
+        XCTAssertEqual(schema.description, "A file path")
+        XCTAssertNil(schema.enum)
+        XCTAssertNil(schema.items)
+        XCTAssertNil(schema.properties)
+    }
+
+    func test_mcpPropertySchema_enumValues() {
+        let schema = MCPPropertySchema(type: "string", enum: ["json", "yaml", "xml"])
+        XCTAssertEqual(schema.enum, ["json", "yaml", "xml"])
+    }
+
+    func test_mcpPropertySchema_nestedItems() {
+        let itemSchema = MCPPropertySchema(type: "string")
+        let arraySchema = MCPPropertySchema(type: "array", items: itemSchema)
+        XCTAssertEqual(arraySchema.type, "array")
+        XCTAssertEqual(arraySchema.items?.type, "string")
+    }
+
+    func test_mcpPropertySchema_nestedProperties() {
+        let inner = MCPPropertySchema(type: "integer")
+        let outer = MCPPropertySchema(type: "object", properties: ["count": inner])
+        XCTAssertEqual(outer.properties?["count"]?.type, "integer")
+    }
+
+    func test_mcpPropertySchema_codableRoundtrip() throws {
+        let schema = MCPPropertySchema(type: "string", description: "test", enum: ["a", "b"])
+        let data = try JSONEncoder().encode(schema)
+        let decoded = try JSONDecoder().decode(MCPPropertySchema.self, from: data)
+        XCTAssertEqual(decoded.type, "string")
+        XCTAssertEqual(decoded.description, "test")
+        XCTAssertEqual(decoded.enum, ["a", "b"])
+    }
+
+    // MARK: - MCPTypes: MCPToolInputSchema
+
+    func test_mcpToolInputSchema_codableRoundtrip() throws {
+        let json = """
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["query"]
+        }
+        """.data(using: .utf8)!
+        let schema = try JSONDecoder().decode(MCPToolInputSchema.self, from: json)
+        XCTAssertEqual(schema.type, "object")
+        XCTAssertEqual(schema.properties?.count, 2)
+        XCTAssertEqual(schema.properties?["query"]?.type, "string")
+        XCTAssertEqual(schema.required, ["query"])
+    }
+
+    // MARK: - MCPTypes: MCPEmbeddedResource
+
+    func test_mcpEmbeddedResource_codable() throws {
+        let json = """
+        {"uri": "file:///test.txt", "text": "contents", "mimeType": "text/plain"}
+        """.data(using: .utf8)!
+        let resource = try JSONDecoder().decode(MCPEmbeddedResource.self, from: json)
+        XCTAssertEqual(resource.uri, "file:///test.txt")
+        XCTAssertEqual(resource.text, "contents")
+        XCTAssertNil(resource.blob)
+        XCTAssertEqual(resource.mimeType, "text/plain")
+    }
+
+    // MARK: - MCPTypes: MCPResourceContent
+
+    func test_mcpResourceContent_textContent() throws {
+        let json = """
+        {"uri": "file:///readme.md", "mimeType": "text/markdown", "text": "# Hello"}
+        """.data(using: .utf8)!
+        let content = try JSONDecoder().decode(MCPResourceContent.self, from: json)
+        XCTAssertEqual(content.uri, "file:///readme.md")
+        XCTAssertEqual(content.text, "# Hello")
+        XCTAssertNil(content.blob)
+    }
+
+    func test_mcpResourceReadResult_codable() throws {
+        let json = """
+        {"contents": [{"uri": "file:///a.txt", "text": "data"}]}
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPResourceReadResult.self, from: json)
+        XCTAssertEqual(result.contents.count, 1)
+        XCTAssertEqual(result.contents[0].uri, "file:///a.txt")
+    }
+
+    // MARK: - MCPTypes: MCPResourceListResult
+
+    func test_mcpResourceListResult_codable() throws {
+        let json = """
+        {
+            "resources": [
+                {"uri": "file:///a.txt", "name": "A"},
+                {"uri": "file:///b.txt", "name": "B", "description": "File B", "mimeType": "text/plain"}
+            ]
+        }
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPResourceListResult.self, from: json)
+        XCTAssertEqual(result.resources.count, 2)
+        XCTAssertEqual(result.resources[0].id, "file:///a.txt")
+        XCTAssertNil(result.nextCursor)
+    }
+
+    func test_mcpResourceListResult_withCursor() throws {
+        let json = """
+        {"resources": [], "nextCursor": "abc123"}
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPResourceListResult.self, from: json)
+        XCTAssertEqual(result.nextCursor, "abc123")
+    }
+
+    // MARK: - MCPTypes: MCPPrompt / MCPPromptArgument
+
+    func test_mcpPromptArgument_codable() throws {
+        let json = """
+        {"name": "topic", "description": "The topic", "required": false}
+        """.data(using: .utf8)!
+        let arg = try JSONDecoder().decode(MCPPromptArgument.self, from: json)
+        XCTAssertEqual(arg.name, "topic")
+        XCTAssertEqual(arg.required, false)
+    }
+
+    func test_mcpPromptListResult_codable() throws {
+        let json = """
+        {"prompts": [{"name": "greet", "description": "Greet user"}]}
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPPromptListResult.self, from: json)
+        XCTAssertEqual(result.prompts.count, 1)
+        XCTAssertEqual(result.prompts[0].name, "greet")
+    }
+
+    func test_mcpPromptMessage_codable() throws {
+        let json = """
+        {"role": "user", "content": {"type": "text", "text": "Hello"}}
+        """.data(using: .utf8)!
+        let msg = try JSONDecoder().decode(MCPPromptMessage.self, from: json)
+        XCTAssertEqual(msg.role, .user)
+        XCTAssertEqual(msg.content.text, "Hello")
+    }
+
+    func test_mcpPromptResult_codable() throws {
+        let json = """
+        {
+            "description": "A greeting prompt",
+            "messages": [
+                {"role": "assistant", "content": {"type": "text", "text": "Hi there!"}}
+            ]
+        }
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPPromptResult.self, from: json)
+        XCTAssertEqual(result.description, "A greeting prompt")
+        XCTAssertEqual(result.messages.count, 1)
+        XCTAssertEqual(result.messages[0].role, .assistant)
+    }
+
+    // MARK: - MCPTypes: MCPRole
+
+    func test_mcpRole_rawValues() {
+        XCTAssertEqual(MCPRole.user.rawValue, "user")
+        XCTAssertEqual(MCPRole.assistant.rawValue, "assistant")
+    }
+
+    // MARK: - MCPTypes: MCPClientInfo
+
+    func test_mcpClientInfo_customValues() {
+        let info = MCPClientInfo(name: "TestApp", version: "0.1.0")
+        XCTAssertEqual(info.name, "TestApp")
+        XCTAssertEqual(info.version, "0.1.0")
+    }
+
+    func test_mcpClientInfo_codableRoundtrip() throws {
+        let info = MCPClientInfo()
+        let data = try JSONEncoder().encode(info)
+        let decoded = try JSONDecoder().decode(MCPClientInfo.self, from: data)
+        XCTAssertEqual(decoded.name, "Serena")
+    }
+
+    // MARK: - MCPTypes: MCPClientCapabilities
+
+    func test_mcpClientCapabilities_default() {
+        let caps = MCPClientCapabilities.default
+        XCTAssertNil(caps.roots)
+        XCTAssertNil(caps.sampling)
+        XCTAssertNil(caps.experimental)
+    }
+
+    func test_mcpClientCapabilities_withRoots() {
+        let caps = MCPClientCapabilities(
+            roots: MCPClientCapabilities.RootsCapability(listChanged: true)
+        )
+        XCTAssertNotNil(caps.roots)
+        XCTAssertEqual(caps.roots?.listChanged, true)
+        XCTAssertNil(caps.sampling)
+    }
+
+    func test_mcpClientCapabilities_codableRoundtrip() throws {
+        let caps = MCPClientCapabilities(
+            roots: MCPClientCapabilities.RootsCapability(listChanged: false),
+            sampling: MCPClientCapabilities.SamplingCapability()
+        )
+        let data = try JSONEncoder().encode(caps)
+        let decoded = try JSONDecoder().decode(MCPClientCapabilities.self, from: data)
+        XCTAssertEqual(decoded.roots?.listChanged, false)
+        XCTAssertNotNil(decoded.sampling)
+    }
+
+    // MARK: - MCPTypes: MCPInitializeParams
+
+    func test_mcpInitializeParams_codableRoundtrip() throws {
+        let params = MCPInitializeParams()
+        let data = try JSONEncoder().encode(params)
+        let decoded = try JSONDecoder().decode(MCPInitializeParams.self, from: data)
+        XCTAssertEqual(decoded.protocolVersion, "2024-11-05")
+        XCTAssertEqual(decoded.clientInfo.name, "Serena")
+    }
+
+    func test_mcpInitializeParams_customProtocolVersion() {
+        let params = MCPInitializeParams(protocolVersion: "2025-01-01")
+        XCTAssertEqual(params.protocolVersion, "2025-01-01")
+    }
+
+    // MARK: - MCPTypes: MCPServerCapabilities edge cases
+
+    func test_mcpServerCapabilities_allNil() throws {
+        let json = """
+        {}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        let supportsTools = caps.supportsTools
+        let supportsResources = caps.supportsResources
+        let supportsPrompts = caps.supportsPrompts
+        XCTAssertFalse(supportsTools)
+        XCTAssertFalse(supportsResources)
+        XCTAssertFalse(supportsPrompts)
+    }
+
+    func test_mcpServerCapabilities_withLogging() throws {
+        let json = """
+        {"logging": {}}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        XCTAssertNotNil(caps.logging)
+    }
+
+    func test_mcpServerCapabilities_withExperimental() throws {
+        let json = """
+        {"experimental": {"feature_x": true}}
+        """.data(using: .utf8)!
+        let caps = try JSONDecoder().decode(MCPServerCapabilities.self, from: json)
+        XCTAssertNotNil(caps.experimental)
+        XCTAssertEqual(caps.experimental?["feature_x"]?.boolValue, true)
+    }
+
+    // MARK: - MCPTypes: MCPToolListResult with cursor
+
+    func test_mcpToolListResult_withCursor() throws {
+        let json = """
+        {
+            "tools": [{"name": "t1", "inputSchema": {"type": "object"}}],
+            "nextCursor": "page2"
+        }
+        """.data(using: .utf8)!
+        let result = try JSONDecoder().decode(MCPToolListResult.self, from: json)
+        XCTAssertEqual(result.tools.count, 1)
+        XCTAssertEqual(result.nextCursor, "page2")
+    }
+
+    // MARK: - MCPTransport: MCPError descriptions contain context
+
+    func test_mcpError_serverNotFoundContainsPath() {
+        let error = MCPError.serverNotFound("/usr/local/bin/mcp-server")
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("/usr/local/bin/mcp-server"))
+    }
+
+    func test_mcpError_transportErrorContainsMessage() {
+        let error = MCPError.transportError("pipe broken")
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("pipe broken"))
+    }
+
+    func test_mcpError_unknownToolContainsName() {
+        let error = MCPError.unknownTool("fancy_tool")
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("fancy_tool"))
+    }
+
+    func test_mcpError_capabilityNotSupportedContainsCapability() {
+        let error = MCPError.capabilityNotSupported("resources")
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("resources"))
+    }
+
+    func test_mcpError_processSpawnFailedContainsReason() {
+        let error = MCPError.processSpawnFailed("not found on PATH")
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("not found on PATH"))
+    }
+
+    func test_mcpError_jsonErrorContainsUnderlying() {
+        let underlying = NSError(domain: "json", code: 0, userInfo: [NSLocalizedDescriptionKey: "bad json"])
+        let error = MCPError.jsonError(underlying)
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("bad json"))
+    }
+
+    // MARK: - MCPTransport: MCPTransportConfig
+
+    func test_mcpTransportConfig_zeroTimeout() {
+        let config = MCPTransportConfig(requestTimeout: 0)
+        XCTAssertEqual(config.requestTimeout, 0)
+    }
+
+    func test_mcpTransportConfig_noReconnect() {
+        let config = MCPTransportConfig(autoReconnect: false, maxReconnectAttempts: 0)
+        XCTAssertFalse(config.autoReconnect)
+        XCTAssertEqual(config.maxReconnectAttempts, 0)
+    }
+
+    // MARK: - MCPTransport: MCPTransportState
+
+    func test_mcpTransportState_errorCase() {
+        let state = MCPTransportState.error(.timeout)
+        if case .error(let err) = state {
+            let desc = err.errorDescription
+            XCTAssertNotNil(desc)
+        } else {
+            XCTFail("Expected error state")
+        }
+    }
+
+    func test_mcpTransportState_allCases() {
+        // Verify all cases can be constructed without crash
+        let states: [MCPTransportState] = [
+            .disconnected,
+            .connecting,
+            .connected,
+            .disconnecting,
+            .error(.cancelled)
+        ]
+        XCTAssertEqual(states.count, 5)
+    }
+
+    // MARK: - MCPServerConfig
+
+    func test_mcpServerConfig_init() {
+        let config = MCPServerConfig(
+            name: "test-server",
+            command: "/usr/local/bin/npx",
+            args: ["-y", "@mcp/server-test"],
+            env: ["API_KEY": "secret123"]
+        )
+        XCTAssertEqual(config.name, "test-server")
+        XCTAssertEqual(config.command, "/usr/local/bin/npx")
+        XCTAssertEqual(config.args, ["-y", "@mcp/server-test"])
+        XCTAssertEqual(config.env["API_KEY"], "secret123")
+    }
+
+    func test_mcpServerConfig_defaultEnv() {
+        let config = MCPServerConfig(name: "s", command: "/bin/echo", args: [])
+        XCTAssertTrue(config.env.isEmpty)
+    }
+
+    // MARK: - MCPClientManager: Registration
+
+    func test_mcpClientManager_registerServer() async {
+        let manager = MCPClientManager.shared
+        let config = MCPServerConfig(name: "test-reg", command: "/bin/echo", args: [])
+        await manager.registerServer(config)
+        let servers = await manager.registeredServers
+        XCTAssertTrue(servers.contains("test-reg"))
+        // Cleanup
+        try? await manager.unregisterServer(name: "test-reg")
+    }
+
+    func test_mcpClientManager_unregisterServer() async throws {
+        let manager = MCPClientManager.shared
+        let config = MCPServerConfig(name: "test-unreg", command: "/bin/echo", args: [])
+        await manager.registerServer(config)
+        try await manager.unregisterServer(name: "test-unreg")
+        let servers = await manager.registeredServers
+        XCTAssertFalse(servers.contains("test-unreg"))
+    }
+
+    func test_mcpClientManager_connectedServersInitiallyEmpty() async {
+        let connected = await MCPClientManager.shared.connectedServers
+        // We haven't connected any servers so the test-reg ones shouldn't be connected
+        // This just verifies the property is accessible
+        XCTAssertNotNil(connected)
+    }
+
+    func test_mcpClientManager_clientForUnknownServerReturnsNil() async {
+        let client = await MCPClientManager.shared.client(for: "nonexistent-server-xyz")
+        XCTAssertNil(client)
+    }
+
+    func test_mcpClientManager_serverForToolReturnsNilWhenNotMapped() async {
+        let server = await MCPClientManager.shared.serverForTool(name: "unmapped_tool_xyz")
+        XCTAssertNil(server)
+    }
+
+    func test_mcpClientManager_connectThrowsForUnregistered() async {
+        do {
+            try await MCPClientManager.shared.connect(serverName: "never-registered-server")
+            XCTFail("Expected MCPError.serverNotFound")
+        } catch let error as MCPError {
+            if case .serverNotFound(let name) = error {
+                XCTAssertEqual(name, "never-registered-server")
+            } else {
+                XCTFail("Expected serverNotFound, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected MCPError, got \(error)")
+        }
+    }
+
+    func test_mcpClientManager_callToolThrowsForUnknownTool() async {
+        do {
+            _ = try await MCPClientManager.shared.callTool(name: "totally_fake_tool")
+            XCTFail("Expected MCPError.unknownTool")
+        } catch let error as MCPError {
+            if case .unknownTool(let name) = error {
+                XCTAssertEqual(name, "totally_fake_tool")
+            } else {
+                XCTFail("Expected unknownTool, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected MCPError, got \(error)")
+        }
+    }
+
+    func test_mcpClientManager_callToolOnServerThrowsForUnconnected() async {
+        do {
+            _ = try await MCPClientManager.shared.callTool(
+                serverName: "not-connected-server",
+                toolName: "some_tool"
+            )
+            XCTFail("Expected MCPError.serverNotFound")
+        } catch let error as MCPError {
+            if case .serverNotFound = error {
+                // Expected
+            } else {
+                XCTFail("Expected serverNotFound, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected MCPError, got \(error)")
+        }
+    }
+
+    // MARK: - MCPToolBridge: Singleton and Initial State
+
+    func test_mcpToolBridge_singletonExists() {
+        let bridge = MCPToolBridge.shared
+        XCTAssertNotNil(bridge)
+    }
+
+    func test_mcpToolBridge_initiallyNoRegisteredTools() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        let names = bridge.registeredToolNames
+        XCTAssertTrue(names.isEmpty)
+    }
+
+    func test_mcpToolBridge_isMCPTool_prefixCheck() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        // Even with no tools registered, prefix check returns true
+        let isPrefixed = bridge.isMCPTool("mcp_something")
+        XCTAssertTrue(isPrefixed)
+    }
+
+    func test_mcpToolBridge_isMCPTool_unknownReturnsFalse() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        let result = bridge.isMCPTool("regular_tool")
+        XCTAssertFalse(result)
+    }
+
+    func test_mcpToolBridge_toolInfoReturnsNilForUnknown() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        let info = bridge.toolInfo(for: "nonexistent_tool")
+        XCTAssertNil(info)
+    }
+
+    func test_mcpToolBridge_getMCPToolDescriptionsEmpty() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        let descs = bridge.getMCPToolDescriptions()
+        XCTAssertTrue(descs.isEmpty)
+    }
+
+    func test_mcpToolBridge_getFormattedToolListHeader() {
+        let bridge = MCPToolBridge.shared
+        bridge.unregisterAllTools()
+        let formatted = bridge.getFormattedToolList()
+        XCTAssertTrue(formatted.contains("MCP Tools:"))
+    }
+
+    // MARK: - MCPToolHandler: No tool name
+
+    func test_mcpToolHandler_executeWithNilAction() async {
+        let handler = MCPToolHandler()
+        let result = await handler.execute(action: nil, params: [:])
+        let success = result.success
+        XCTAssertFalse(success)
+        XCTAssertNotNil(result.error)
+        XCTAssertTrue(result.error!.contains("No MCP tool name"))
+    }
+
+    // MARK: - MCPTypes: MCPTool identity
+
+    func test_mcpTool_identityIsName() throws {
+        let json = """
+        {"name": "search", "description": "Search docs", "inputSchema": {"type": "object"}}
+        """.data(using: .utf8)!
+        let tool = try JSONDecoder().decode(MCPTool.self, from: json)
+        XCTAssertEqual(tool.id, tool.name)
+    }
+
+    // MARK: - MCPTypes: MCPResource identity
+
+    func test_mcpResource_identityIsUri() throws {
+        let json = """
+        {"uri": "notion://page/123", "name": "My Page"}
+        """.data(using: .utf8)!
+        let resource = try JSONDecoder().decode(MCPResource.self, from: json)
+        XCTAssertEqual(resource.id, resource.uri)
+    }
+
+    // MARK: - MCPTypes: MCPPrompt identity
+
+    func test_mcpPrompt_identityIsName() throws {
+        let json = """
+        {"name": "debug", "description": "Debug prompt"}
+        """.data(using: .utf8)!
+        let prompt = try JSONDecoder().decode(MCPPrompt.self, from: json)
+        XCTAssertEqual(prompt.id, prompt.name)
+    }
+
+    // MARK: - AnyCodable: Edge case - empty string
+
+    func test_anyCodable_emptyString() throws {
+        let value = AnyCodable("")
+        let data = try JSONEncoder().encode(value)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.stringValue, "")
+    }
+
+    // MARK: - AnyCodable: Edge case - negative numbers
+
+    func test_anyCodable_negativeInt() throws {
+        let value = AnyCodable(-99)
+        let data = try JSONEncoder().encode(value)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.intValue, -99)
+    }
+
+    // MARK: - AnyCodable: Edge case - zero
+
+    func test_anyCodable_zero() throws {
+        let value = AnyCodable(0)
+        let data = try JSONEncoder().encode(value)
+        let decoded = try JSONDecoder().decode(AnyCodable.self, from: data)
+        XCTAssertEqual(decoded.intValue, 0)
+    }
+}

@@ -1,0 +1,108 @@
+import Foundation
+import OSLog
+
+/// Gates every screen action before execution.
+/// V1: Strict mode only — confirms every action.
+struct ScreenSafety {
+
+    private let logger = Logger(subsystem: "ai.folktech.serena", category: "ScreenSafety")
+
+    let level: SafetyLevel
+    private(set) var auditLog: [AuditEntry] = []
+    private let maxAuditEntries: Int
+
+    init(level: SafetyLevel = .strict, maxAuditEntries: Int = 500) {
+        self.level = level
+        self.maxAuditEntries = maxAuditEntries
+    }
+
+    // MARK: - Decision
+
+    /// Determine whether an action should be allowed, confirmed, or denied
+    func shouldAllow(action: ScreenAction, context: ScreenSafetyContext) -> SafetyDecision {
+        // Always deny: typing into password/secure fields
+        if case .typeText(_, let target) = action {
+            if case .role(let role, _) = target, role == "AXSecureTextField" {
+                return .deny(reason: "Cannot type into secure/password fields without explicit user consent")
+            }
+        }
+
+        // Strict mode: confirm everything
+        switch level {
+        case .strict:
+            return .confirm(reason: describeAction(action, in: context))
+
+        case .trustedApps:
+            // Future: check if app is in whitelist
+            return .confirm(reason: describeAction(action, in: context))
+
+        case .autonomous:
+            return .allow
+        }
+    }
+
+    /// Check if screen text contains sensitive content (payment, banking, etc.)
+    func containsSensitiveContent(screenText: [String]) -> Bool {
+        let sensitivePatterns = [
+            "card number", "cvv", "cvc", "credit card", "debit card",
+            "billing address", "payment", "bank account", "routing number",
+            "social security", "ssn", "tax id"
+        ]
+        let lowered = screenText.map { $0.lowercased() }
+        let allText = lowered.joined(separator: " ")
+        return sensitivePatterns.contains { allText.contains($0) }
+    }
+
+    // MARK: - Audit
+
+    mutating func recordAction(_ action: ScreenAction, decision: SafetyDecision, success: Bool) {
+        let entry = AuditEntry(
+            timestamp: Date(),
+            action: action,
+            decision: decision,
+            success: success
+        )
+        auditLog.append(entry)
+        if auditLog.count > maxAuditEntries {
+            auditLog.removeFirst(auditLog.count - maxAuditEntries)
+        }
+    }
+
+    // MARK: - Description
+
+    private func describeAction(_ action: ScreenAction, in context: ScreenSafetyContext) -> String {
+        let target: String
+        switch action {
+        case .click(let t):
+            target = "click '\(t.normalizedLabel ?? "element")'"
+        case .typeText(let text, let t):
+            let preview = text.prefix(20)
+            target = "type '\(preview)' into '\(t.normalizedLabel ?? "field")'"
+        case .scroll(let dir, let amount):
+            target = "scroll \(dir.rawValue) \(amount) times"
+        case .keyboardShortcut(let key, let mods):
+            let modStr = mods.map(\.rawValue).joined(separator: "+")
+            target = "press \(modStr)+\(key.rawValue)"
+        case .drag(let from, let to):
+            target = "drag from (\(Int(from.x)),\(Int(from.y))) to (\(Int(to.x)),\(Int(to.y)))"
+        case .selectMenuItem(let path):
+            target = "select menu: \(path.joined(separator: " → "))"
+        }
+        return "Serena wants to \(target) in \(context.appName)"
+    }
+}
+
+// MARK: - Supporting Types
+
+struct ScreenSafetyContext {
+    let appName: String
+    let appBundleID: String
+    var windowTitle: String?
+}
+
+struct AuditEntry {
+    let timestamp: Date
+    let action: ScreenAction
+    let decision: SafetyDecision
+    let success: Bool
+}

@@ -1,0 +1,238 @@
+import XCTest
+@testable import SerenaCore
+
+final class WebSearchRedTests: XCTestCase {
+
+    // MARK: - SearchResult Tests
+
+    func test_searchResult_codableRoundTrip() throws {
+        let id = UUID()
+        let timestamp = Date()
+        let original = SearchResult(
+            id: id,
+            title: "Test Article",
+            url: URL(string: "https://example.com/article")!,
+            snippet: "This is a test snippet for the article.",
+            domain: "example.com",
+            timestamp: timestamp
+        )
+
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(original)
+
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(SearchResult.self, from: data)
+
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.title, "Test Article")
+        XCTAssertEqual(decoded.url, URL(string: "https://example.com/article")!)
+        XCTAssertEqual(decoded.snippet, "This is a test snippet for the article.")
+        XCTAssertEqual(decoded.domain, "example.com")
+        XCTAssertEqual(decoded.timestamp.timeIntervalSinceReferenceDate,
+                       timestamp.timeIntervalSinceReferenceDate, accuracy: 0.001)
+    }
+
+    func test_searchResult_uniqueIDs() {
+        let result1 = SearchResult(
+            title: "First",
+            url: URL(string: "https://example.com/1")!,
+            snippet: "First snippet",
+            domain: "example.com"
+        )
+        let result2 = SearchResult(
+            title: "Second",
+            url: URL(string: "https://example.com/2")!,
+            snippet: "Second snippet",
+            domain: "example.com"
+        )
+
+        XCTAssertNotEqual(result1.id, result2.id)
+    }
+
+    // MARK: - CredibilityScore Tests
+
+    func test_credibilityScore_codableRoundTrip() throws {
+        let original = CredibilityScore(
+            score: 0.85,
+            domain: "nature.com",
+            reasoning: "Peer-reviewed scientific journal",
+            category: "scientific"
+        )
+
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(original)
+
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(CredibilityScore.self, from: data)
+
+        XCTAssertEqual(decoded.score, 0.85, accuracy: 0.001)
+        XCTAssertEqual(decoded.domain, "nature.com")
+        XCTAssertEqual(decoded.reasoning, "Peer-reviewed scientific journal")
+        XCTAssertEqual(decoded.category, "scientific")
+    }
+
+    // MARK: - CredibilityThresholds Tests
+
+    func test_credibilityThresholds_trustedGovDomain() {
+        XCTAssertTrue(CredibilityThresholds.isTrusted("cdc.gov"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("nih.gov"))
+    }
+
+    func test_credibilityThresholds_trustedKnownDomains() {
+        XCTAssertTrue(CredibilityThresholds.isTrusted("wikipedia.org"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("nature.com"))
+    }
+
+    func test_credibilityThresholds_untrustedRandomDomain() {
+        XCTAssertFalse(CredibilityThresholds.isTrusted("randomsite.com"))
+    }
+
+    func test_credibilityThresholds_lowCredibilityDomains() {
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("reddit.com"))
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("quora.com"))
+    }
+
+    func test_credibilityThresholds_trustedNotLowCredibility() {
+        XCTAssertFalse(CredibilityThresholds.isLowCredibility("wikipedia.org"))
+    }
+
+    // MARK: - WebResearcher Credibility Tests
+
+    func test_webResearcher_credibilityGovDomain() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "NIH Research",
+            url: URL(string: "https://nih.gov/research")!,
+            snippet: "Government health research",
+            domain: "nih.gov"
+        )
+
+        let credibility = await researcher.assessCredibility(of: result)
+
+        XCTAssertGreaterThanOrEqual(credibility.score, 0.9)
+        // .gov suffix check comes before the nih.gov-specific medical check
+        XCTAssertEqual(credibility.category, "government")
+    }
+
+    func test_webResearcher_credibilityScientificDomain() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "Nature Article",
+            url: URL(string: "https://nature.com/articles/123")!,
+            snippet: "Scientific research paper",
+            domain: "nature.com"
+        )
+
+        let credibility = await researcher.assessCredibility(of: result)
+
+        XCTAssertGreaterThanOrEqual(credibility.score, 0.9)
+        XCTAssertEqual(credibility.category, "scientific")
+    }
+
+    func test_webResearcher_credibilityLowDomain() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "Reddit Post",
+            url: URL(string: "https://reddit.com/r/test")!,
+            snippet: "User generated content",
+            domain: "reddit.com"
+        )
+
+        let credibility = await researcher.assessCredibility(of: result)
+
+        XCTAssertLessThanOrEqual(credibility.score, 0.4)
+        XCTAssertEqual(credibility.category, "social")
+    }
+
+    func test_webResearcher_credibilityGenericDomain() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "Example Page",
+            url: URL(string: "https://example.com")!,
+            snippet: "A generic website",
+            domain: "example.com"
+        )
+
+        let credibility = await researcher.assessCredibility(of: result)
+
+        XCTAssertEqual(credibility.score, 0.6, accuracy: 0.05)
+        XCTAssertEqual(credibility.category, "general")
+    }
+
+    func test_webResearcher_credibilityOrgBoost() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "Nonprofit Info",
+            url: URL(string: "https://nonprofit.org")!,
+            snippet: "Nonprofit organization",
+            domain: "nonprofit.org"
+        )
+
+        let credibility = await researcher.assessCredibility(of: result)
+
+        // trustedDomains contains bare "org", so "nonprofit.org".hasSuffix("org") is true
+        // This means ALL .org domains hit the trusted path with score 0.9
+        XCTAssertGreaterThanOrEqual(credibility.score, 0.85)
+    }
+
+    func test_webResearcher_credibilityCacheConsistency() async {
+        let researcher = WebResearcher()
+        let result = SearchResult(
+            title: "Cache Test",
+            url: URL(string: "https://nature.com/test")!,
+            snippet: "Testing cache",
+            domain: "nature.com"
+        )
+
+        let first = await researcher.assessCredibility(of: result)
+        let second = await researcher.assessCredibility(of: result)
+
+        XCTAssertEqual(first.score, second.score, accuracy: 0.001)
+        XCTAssertEqual(first.category, second.category)
+        XCTAssertEqual(first.domain, second.domain)
+    }
+
+    // MARK: - WebSearchToolHandler Tests
+
+    @MainActor
+    func test_webSearchToolHandler_toolName() {
+        let handler = WebSearchToolHandler()
+        XCTAssertEqual(handler.toolName, "web_search")
+    }
+
+    @MainActor
+    func test_webSearchToolHandler_openSearchResultEmpty() async {
+        let handler = WebSearchToolHandler()
+        let result = await handler.openSearchResult(index: 1)
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.error?.contains("No search results") ?? false)
+    }
+
+    @MainActor
+    func test_webSearchToolHandler_initialStateEmpty() {
+        let handler = WebSearchToolHandler()
+        XCTAssertTrue(handler.lastSearchResults.isEmpty)
+    }
+
+    // MARK: - SearchError and Feature Flag Tests
+
+    func test_searchError_allCasesHaveDescriptions() {
+        let allCases: [SearchError] = [
+            .invalidQuery, .networkError, .parseError,
+            .missingAPIKey, .invalidAPIKey, .rateLimited
+        ]
+        for error in allCases {
+            XCTAssertNotNil(error.errorDescription, "Missing description for \(error)")
+        }
+    }
+
+    func test_searchError_specificDescriptions() {
+        XCTAssertTrue(SearchError.missingAPIKey.errorDescription!.contains("API key"))
+        XCTAssertTrue(SearchError.rateLimited.errorDescription!.contains("Rate limit"))
+    }
+
+    func test_featureFlag_webSearchExists() {
+        let flag: Bool = FeatureFlags.webSearchEnabled
+        XCTAssertTrue(flag || !flag)
+    }
+}

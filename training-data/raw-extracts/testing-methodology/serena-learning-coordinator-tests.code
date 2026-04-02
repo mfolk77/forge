@@ -1,0 +1,510 @@
+import XCTest
+@testable import SerenaCore
+
+final class LearningCoordinatorRedTests: XCTestCase {
+
+    // MARK: - PatternCandidate Tests
+
+    func test_patternCandidate_codableRoundTrip() throws {
+        let id = UUID()
+        let date = Date()
+        let original = PatternCandidate(
+            id: id,
+            topic: "Christina schedule",
+            keywords: ["christina", "schedule", "work"],
+            frequency: 5,
+            lastMentioned: date,
+            messageIDs: ["msg-1", "msg-2"],
+            confidence: 0.85
+        )
+
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(PatternCandidate.self, from: data)
+
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.topic, "Christina schedule")
+        XCTAssertEqual(decoded.keywords, ["christina", "schedule", "work"])
+        XCTAssertEqual(decoded.frequency, 5)
+        XCTAssertEqual(decoded.confidence, 0.85)
+        XCTAssertEqual(decoded.messageIDs.count, 2)
+    }
+
+    func test_patternCandidate_uniqueIDs() {
+        let p1 = PatternCandidate(topic: "A", keywords: [], frequency: 1, lastMentioned: Date(), messageIDs: [], confidence: 0.5)
+        let p2 = PatternCandidate(topic: "B", keywords: [], frequency: 1, lastMentioned: Date(), messageIDs: [], confidence: 0.5)
+        XCTAssertNotEqual(p1.id, p2.id)
+    }
+
+    // MARK: - KnowledgeEntry Tests
+
+    func test_knowledgeEntry_codableRoundTrip() throws {
+        let id = UUID()
+        let date = Date()
+        let original = KnowledgeEntry(
+            id: id,
+            entity: "Christina Folk",
+            entityType: "person",
+            category: .people,
+            categoryConfidence: 0.95,
+            attributes: ["occupation": "ER nurse", "employer": "Hospital"],
+            relationships: ["spouse": "Mike"],
+            sourceMessages: ["msg-1"],
+            confidence: 0.9,
+            createdAt: date,
+            needsReview: false
+        )
+
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(KnowledgeEntry.self, from: data)
+
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.entity, "Christina Folk")
+        XCTAssertEqual(decoded.entityType, "person")
+        XCTAssertEqual(decoded.category, .people)
+        XCTAssertEqual(decoded.attributes["occupation"], "ER nurse")
+        XCTAssertEqual(decoded.relationships["spouse"], "Mike")
+        XCTAssertEqual(decoded.confidence, 0.9)
+        XCTAssertFalse(decoded.needsReview)
+    }
+
+    func test_knowledgeEntry_needsReviewDefaults() {
+        let entry = KnowledgeEntry(
+            entity: "Test",
+            entityType: "thing",
+            category: .personal,
+            categoryConfidence: 0.8,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.7
+        )
+        XCTAssertFalse(entry.needsReview, "needsReview should default to false")
+    }
+
+    // MARK: - KnowledgeCategory Tests
+
+    func test_knowledgeCategory_allCases() {
+        let cases = KnowledgeCategory.allCases
+        XCTAssertEqual(cases.count, 4)
+        XCTAssertTrue(cases.contains(.people))
+        XCTAssertTrue(cases.contains(.business))
+        XCTAssertTrue(cases.contains(.personal))
+        XCTAssertTrue(cases.contains(.patterns))
+    }
+
+    func test_knowledgeCategory_displayName() {
+        XCTAssertEqual(KnowledgeCategory.people.displayName, "People")
+        XCTAssertEqual(KnowledgeCategory.business.displayName, "Business")
+        XCTAssertEqual(KnowledgeCategory.personal.displayName, "Personal")
+        XCTAssertEqual(KnowledgeCategory.patterns.displayName, "Patterns")
+    }
+
+    func test_knowledgeCategory_subdirectory() {
+        XCTAssertEqual(KnowledgeCategory.people.subdirectory, "people")
+        XCTAssertEqual(KnowledgeCategory.business.subdirectory, "business")
+    }
+
+    func test_knowledgeCategory_icon() {
+        XCTAssertEqual(KnowledgeCategory.people.icon, "person.2")
+        XCTAssertEqual(KnowledgeCategory.business.icon, "briefcase")
+        XCTAssertEqual(KnowledgeCategory.personal.icon, "heart")
+        XCTAssertEqual(KnowledgeCategory.patterns.icon, "brain")
+    }
+
+    func test_knowledgeCategory_codable() throws {
+        for category in KnowledgeCategory.allCases {
+            let data = try JSONEncoder().encode(category)
+            let decoded = try JSONDecoder().decode(KnowledgeCategory.self, from: data)
+            XCTAssertEqual(decoded, category)
+        }
+    }
+
+    // MARK: - LearnedKnowledge Tests
+
+    func test_learnedKnowledge_entriesByCategory() {
+        let entries = [
+            makeEntry(entity: "Alice", category: .people),
+            makeEntry(entity: "Bob", category: .people),
+            makeEntry(entity: "Project X", category: .business),
+            makeEntry(entity: "Hobby", category: .personal),
+        ]
+        let knowledge = LearnedKnowledge(entries: entries)
+
+        XCTAssertEqual(knowledge.entriesByCategory(.people).count, 2)
+        XCTAssertEqual(knowledge.entriesByCategory(.business).count, 1)
+        XCTAssertEqual(knowledge.entriesByCategory(.personal).count, 1)
+        XCTAssertEqual(knowledge.entriesByCategory(.patterns).count, 0)
+    }
+
+    func test_learnedKnowledge_needsReview() {
+        let entries = [
+            makeEntry(entity: "Confident", needsReview: false),
+            makeEntry(entity: "Unsure", needsReview: true),
+            makeEntry(entity: "Also Unsure", needsReview: true),
+        ]
+        let knowledge = LearnedKnowledge(entries: entries)
+
+        XCTAssertEqual(knowledge.needsReview().count, 2)
+        XCTAssertEqual(knowledge.reviewCount, 2)
+    }
+
+    func test_learnedKnowledge_search() {
+        let entries = [
+            makeEntry(entity: "Christina Folk", attributes: ["occupation": "ER nurse"]),
+            makeEntry(entity: "Mike Folk", relationships: ["spouse": "Christina"]),
+            makeEntry(entity: "FolkTech AI", category: .business),
+        ]
+        let knowledge = LearnedKnowledge(entries: entries)
+
+        // Search by entity name
+        XCTAssertEqual(knowledge.search("Christina").count, 2) // Christina Folk + Mike (relationship)
+        // Search by attribute value
+        XCTAssertEqual(knowledge.search("nurse").count, 1)
+        // Search case insensitive
+        XCTAssertEqual(knowledge.search("folktech").count, 1)
+        // No match
+        XCTAssertEqual(knowledge.search("nonexistent").count, 0)
+    }
+
+    func test_learnedKnowledge_totalCount() {
+        let knowledge = LearnedKnowledge(entries: [
+            makeEntry(entity: "A"),
+            makeEntry(entity: "B"),
+        ])
+        XCTAssertEqual(knowledge.totalCount, 2)
+    }
+
+    func test_learnedKnowledge_emptyDefault() {
+        let knowledge = LearnedKnowledge()
+        XCTAssertEqual(knowledge.totalCount, 0)
+        XCTAssertEqual(knowledge.reviewCount, 0)
+    }
+
+    // MARK: - ConfidenceThresholds Tests
+
+    func test_confidenceThresholds_shouldDiscard() {
+        XCTAssertTrue(ConfidenceThresholds.shouldDiscard(0.49))
+        XCTAssertTrue(ConfidenceThresholds.shouldDiscard(0.0))
+        XCTAssertFalse(ConfidenceThresholds.shouldDiscard(0.5))
+        XCTAssertFalse(ConfidenceThresholds.shouldDiscard(0.9))
+    }
+
+    func test_confidenceThresholds_needsReview() {
+        XCTAssertFalse(ConfidenceThresholds.needsReview(0.49)) // below minimum
+        XCTAssertTrue(ConfidenceThresholds.needsReview(0.5))   // at minimum
+        XCTAssertTrue(ConfidenceThresholds.needsReview(0.69))  // just below review
+        XCTAssertFalse(ConfidenceThresholds.needsReview(0.7))  // at review threshold
+        XCTAssertFalse(ConfidenceThresholds.needsReview(0.9))  // above review
+    }
+
+    func test_confidenceThresholds_canAutoCreate() {
+        XCTAssertFalse(ConfidenceThresholds.canAutoCreate(0.69))
+        XCTAssertTrue(ConfidenceThresholds.canAutoCreate(0.7))
+        XCTAssertTrue(ConfidenceThresholds.canAutoCreate(1.0))
+    }
+
+    func test_confidenceThresholds_mutuallyExclusive() {
+        // Every confidence value should fall into exactly one bucket
+        let testValues = stride(from: 0.0, through: 1.0, by: 0.1)
+        for value in testValues {
+            let discard = ConfidenceThresholds.shouldDiscard(value)
+            let review = ConfidenceThresholds.needsReview(value)
+            let auto = ConfidenceThresholds.canAutoCreate(value)
+
+            let trueCount = [discard, review, auto].filter { $0 }.count
+            XCTAssertEqual(trueCount, 1,
+                           "Confidence \(value) should fall into exactly one bucket, got \(trueCount)")
+        }
+    }
+
+    // MARK: - CredibilityThresholds Tests
+
+    func test_credibilityThresholds_trustedDomains() {
+        XCTAssertTrue(CredibilityThresholds.isTrusted("cdc.gov"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("harvard.edu"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("en.wikipedia.org"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("nature.com"))
+        XCTAssertTrue(CredibilityThresholds.isTrusted("pubmed.ncbi.nlm.nih.gov"))
+    }
+
+    func test_credibilityThresholds_lowCredibilityDomains() {
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("reddit.com"))
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("www.quora.com"))
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("facebook.com"))
+    }
+
+    func test_credibilityThresholds_unknownDomains() {
+        XCTAssertFalse(CredibilityThresholds.isTrusted("randomsite.xyz"))
+        XCTAssertFalse(CredibilityThresholds.isLowCredibility("randomsite.xyz"))
+    }
+
+    func test_credibilityThresholds_caseInsensitive() {
+        XCTAssertTrue(CredibilityThresholds.isTrusted("CDC.GOV"))
+        XCTAssertTrue(CredibilityThresholds.isLowCredibility("REDDIT.COM"))
+    }
+
+    // MARK: - KnowledgeGap Tests
+
+    func test_knowledgeGap_codable() throws {
+        let gap = KnowledgeGap(
+            topic: "quantum computing",
+            frequency: 3,
+            avgConfidence: 0.35,
+            messageIDs: ["m1", "m2", "m3"]
+        )
+        let data = try JSONEncoder().encode(gap)
+        let decoded = try JSONDecoder().decode(KnowledgeGap.self, from: data)
+
+        XCTAssertEqual(decoded.topic, "quantum computing")
+        XCTAssertEqual(decoded.frequency, 3)
+        XCTAssertEqual(decoded.avgConfidence, 0.35)
+        XCTAssertEqual(decoded.messageIDs.count, 3)
+    }
+
+    // MARK: - ResearchJob Tests
+
+    func test_researchJob_defaultStatus() {
+        let gap = KnowledgeGap(topic: "test", frequency: 1, avgConfidence: 0.3, messageIDs: [])
+        let job = ResearchJob(gap: gap, priority: 5)
+        XCTAssertEqual(job.status, .pending)
+        XCTAssertNil(job.completedAt)
+    }
+
+    func test_researchStatus_codable() throws {
+        for status in [ResearchStatus.pending, .inProgress, .completed, .failed] {
+            let data = try JSONEncoder().encode(status)
+            let decoded = try JSONDecoder().decode(ResearchStatus.self, from: data)
+            XCTAssertEqual(decoded, status)
+        }
+    }
+
+    // MARK: - LearningStatistics Tests
+
+    func test_learningStatistics_creation() {
+        let stats = LearningStatistics(
+            totalEntries: 42,
+            entriesByCategory: [.people: 20, .business: 15, .personal: 7],
+            needsReviewCount: 3,
+            lastLearningRun: Date(),
+            messagesAnalyzed: 500
+        )
+        XCTAssertEqual(stats.totalEntries, 42)
+        XCTAssertEqual(stats.entriesByCategory[.people], 20)
+        XCTAssertEqual(stats.needsReviewCount, 3)
+        XCTAssertEqual(stats.messagesAnalyzed, 500)
+        XCTAssertNotNil(stats.lastLearningRun)
+    }
+
+    func test_learningStatistics_nilLastRun() {
+        let stats = LearningStatistics(
+            totalEntries: 0,
+            entriesByCategory: [:],
+            needsReviewCount: 0,
+            lastLearningRun: nil,
+            messagesAnalyzed: 0
+        )
+        XCTAssertNil(stats.lastLearningRun)
+    }
+
+    // MARK: - DomainExpansionStatistics Tests
+
+    func test_domainExpansionStatistics() {
+        let stats = DomainExpansionStatistics(
+            gapsDetected: 10,
+            gapsResearched: 7,
+            knowledgeCreated: 5,
+            averageCredibility: 0.82,
+            lastExpansionRun: Date(),
+            pendingJobs: 3
+        )
+        XCTAssertEqual(stats.gapsDetected, 10)
+        XCTAssertEqual(stats.gapsResearched, 7)
+        XCTAssertEqual(stats.pendingJobs, 3)
+    }
+
+    // MARK: - LearnedKnowledgePattern Tests
+
+    func test_learnedKnowledgePattern_codable() throws {
+        let entryID = UUID()
+        let pattern = LearnedKnowledgePattern(
+            knowledgeEntryID: entryID,
+            triggers: ["@christina_folk", "@person"],
+            ftaiFilePath: "/path/to/christina_folk.ftai",
+            confidence: 0.9,
+            category: .people
+        )
+
+        let data = try JSONEncoder().encode(pattern)
+        let decoded = try JSONDecoder().decode(LearnedKnowledgePattern.self, from: data)
+
+        XCTAssertEqual(decoded.knowledgeEntryID, entryID)
+        XCTAssertEqual(decoded.triggers, ["@christina_folk", "@person"])
+        XCTAssertEqual(decoded.confidence, 0.9)
+        XCTAssertEqual(decoded.priority, 3) // default
+        XCTAssertEqual(decoded.category, .people)
+    }
+
+    // MARK: - LoRA Config Tests
+
+    func test_loraConfig_defaults() {
+        let config = LoRAConfig.default
+        XCTAssertEqual(config.rank, 8)
+        XCTAssertEqual(config.alpha, 16)
+        XCTAssertEqual(config.targetModules, ["q_proj", "v_proj"])
+        XCTAssertEqual(config.epochs, 3)
+        XCTAssertEqual(config.batchSize, 4)
+        XCTAssertEqual(config.learningRate, 0.0001)
+    }
+
+    func test_loraConfig_codable() throws {
+        let original = LoRAConfig.default
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(LoRAConfig.self, from: data)
+        XCTAssertEqual(decoded.rank, original.rank)
+        XCTAssertEqual(decoded.alpha, original.alpha)
+        XCTAssertEqual(decoded.learningRate, original.learningRate)
+    }
+
+    // MARK: - CredibilityScore Tests
+
+    func test_credibilityScore_codable() throws {
+        let original = CredibilityScore(
+            score: 0.92,
+            domain: "nature.com",
+            reasoning: "Peer-reviewed scientific journal",
+            category: "scientific"
+        )
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(CredibilityScore.self, from: data)
+        XCTAssertEqual(decoded.score, 0.92)
+        XCTAssertEqual(decoded.domain, "nature.com")
+        XCTAssertEqual(decoded.category, "scientific")
+    }
+
+    // MARK: - DomainKnowledge Tests
+
+    func test_domainKnowledge_codable() throws {
+        let source = SearchResult(
+            title: "Quantum Computing Overview",
+            url: URL(string: "https://nature.com/quantum")!,
+            snippet: "Intro to quantum...",
+            domain: "nature.com"
+        )
+        let dk = DomainKnowledge(
+            entity: "Quantum Computing",
+            entityType: "technology",
+            summary: "Quantum computing uses qubits...",
+            keyFacts: ["Uses qubits", "Faster for certain problems"],
+            sources: [source],
+            credibilityScore: 0.9,
+            confidence: 0.85,
+            category: "technology",
+            needsReview: false
+        )
+        let data = try JSONEncoder().encode(dk)
+        let decoded = try JSONDecoder().decode(DomainKnowledge.self, from: data)
+        XCTAssertEqual(decoded.entity, "Quantum Computing")
+        XCTAssertEqual(decoded.keyFacts.count, 2)
+        XCTAssertEqual(decoded.sources.count, 1)
+    }
+
+    // MARK: - AnticipatoryEngine Data Types Tests
+
+    func test_temporalContext_creation() {
+        let temporal = TemporalContext(
+            timeOfDay: .morning,
+            dayOfWeek: 2, // Monday
+            hour: 9,
+            isWeekend: false,
+            isFirstSessionToday: true
+        )
+        XCTAssertEqual(temporal.hour, 9)
+        XCTAssertFalse(temporal.isWeekend)
+        XCTAssertTrue(temporal.isFirstSessionToday)
+    }
+
+    func test_anticipatorySuggestion_types() {
+        let meetingPrep = AnticipatorySuggestion(
+            type: .meetingPrep,
+            title: "Meeting in 15 min",
+            detail: "Prepare for standup",
+            action: "prepare_for_meeting",
+            relevantEvent: nil,
+            confidence: 0.85
+        )
+        XCTAssertEqual(meetingPrep.confidence, 0.85)
+
+        let morningContext = AnticipatorySuggestion(
+            type: .morningContext,
+            title: "Good morning",
+            detail: "Ready for your day",
+            action: "morning_briefing",
+            relevantEvent: nil,
+            confidence: 0.9
+        )
+        if case .morningContext = morningContext.type {} else { XCTFail("Expected .morningContext") }
+    }
+
+    // MARK: - Security Tests
+
+    func test_security_knowledgeEntryWithMaliciousContent() throws {
+        let entry = KnowledgeEntry(
+            entity: "'; DROP TABLE knowledge; --",
+            entityType: "<script>alert('xss')</script>",
+            category: .personal,
+            categoryConfidence: 0.9,
+            attributes: ["key": "value'; DELETE FROM *; --"],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+
+        // Should encode/decode without executing
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(KnowledgeEntry.self, from: data)
+        XCTAssertEqual(decoded.entity, "'; DROP TABLE knowledge; --")
+    }
+
+    func test_security_oversizedKnowledgeEntry() throws {
+        let hugeAttributes = Dictionary(uniqueKeysWithValues:
+            (0..<1000).map { ("key_\($0)", String(repeating: "v", count: 1000)) }
+        )
+        let entry = KnowledgeEntry(
+            entity: "Big Entity",
+            entityType: "test",
+            category: .personal,
+            categoryConfidence: 0.9,
+            attributes: hugeAttributes,
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+        // Should handle without crash
+        let data = try JSONEncoder().encode(entry)
+        XCTAssertTrue(data.count > 100_000)
+    }
+
+    // MARK: - Helpers
+
+    private func makeEntry(
+        entity: String = "Test",
+        entityType: String = "thing",
+        category: KnowledgeCategory = .personal,
+        attributes: [String: String] = [:],
+        relationships: [String: String] = [:],
+        confidence: Double = 0.8,
+        needsReview: Bool = false
+    ) -> KnowledgeEntry {
+        KnowledgeEntry(
+            entity: entity,
+            entityType: entityType,
+            category: category,
+            categoryConfidence: 0.9,
+            attributes: attributes,
+            relationships: relationships,
+            sourceMessages: [],
+            confidence: confidence,
+            needsReview: needsReview
+        )
+    }
+}

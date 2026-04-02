@@ -1,0 +1,12 @@
+{
+  "name": "format-adapter",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/adapter.rs",
+  "line_count": 664,
+  "why": "Format conversion between LLM provider message formats",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

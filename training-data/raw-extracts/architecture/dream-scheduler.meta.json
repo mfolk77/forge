@@ -1,0 +1,12 @@
+{
+  "name": "dream-scheduler",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/dream/scheduler.rs",
+  "line_count": 338,
+  "why": "Cron-like task scheduling",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

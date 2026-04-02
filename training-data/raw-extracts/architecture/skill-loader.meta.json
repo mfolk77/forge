@@ -1,0 +1,12 @@
+{
+  "name": "skill-loader",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/skill_loader.rs",
+  "line_count": 206,
+  "why": "Lazy loading from .md with YAML frontmatter",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

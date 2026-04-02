@@ -1,0 +1,260 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red tests for MitosisManager + GrowthController — P0 security tests
+///
+/// Attack vectors tested:
+/// - Path traversal in cluster storage
+/// - Symlink attacks
+/// - Oversized cluster data
+/// - Concurrent access safety (actor)
+/// - Growth rate manipulation
+/// - Negative time / overflow in GrowthController
+final class MitosisManagerRedTests: XCTestCase {
+
+    // MARK: - GrowthController Tests
+
+    func test_growthController_dayZero_aggressiveRate() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: 0)
+        XCTAssertEqual(rate, 0.8, accuracy: 0.01,
+            "Day 0 growth rate should be 0.8 (aggressive)")
+    }
+
+    func test_growthController_dayThirty_moderateRate() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: 30)
+        XCTAssertEqual(rate, 0.5, accuracy: 0.01,
+            "Day 30 growth rate should be 0.5 (moderate)")
+    }
+
+    func test_growthController_dayNinety_conservativeRate() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: 90)
+        XCTAssertEqual(rate, 0.2, accuracy: 0.01,
+            "Day 90 growth rate should be 0.2 (conservative)")
+    }
+
+    func test_growthController_daySixMonths_stableRate() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: 180)
+        XCTAssertEqual(rate, 0.05, accuracy: 0.01,
+            "Day 180 growth rate should be 0.05 (stable)")
+    }
+
+    func test_growthController_dayBeyondSixMonths_stableRate() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: 365)
+        XCTAssertEqual(rate, 0.05, accuracy: 0.01,
+            "Beyond 180 days should remain at stable 0.05")
+    }
+
+    func test_growthController_negativeDay_handled() {
+        // Negative days should clamp to day 0 rate
+        let rate = GrowthController.interpolateGrowthRate(atDay: -10)
+        XCTAssertEqual(rate, 0.8, accuracy: 0.01,
+            "Negative day should return day 0 rate")
+    }
+
+    func test_growthController_veryLargeDay_noOverflow() {
+        let rate = GrowthController.interpolateGrowthRate(atDay: Int.max / 2)
+        XCTAssertEqual(rate, 0.05, accuracy: 0.01,
+            "Very large day should not overflow, should return stable rate")
+    }
+
+    func test_growthController_pruning_respects90DayThreshold() {
+        // 89 days + low performance → should NOT prune
+        XCTAssertFalse(GrowthController.shouldPrune(staleDays: 89, performance: 0.1),
+            "Should not prune before 90 days even with low performance")
+
+        // 90 days + low performance → SHOULD prune
+        XCTAssertTrue(GrowthController.shouldPrune(staleDays: 90, performance: 0.1),
+            "Should prune at 90 days with low performance")
+
+        // 90 days + good performance → should NOT prune
+        XCTAssertFalse(GrowthController.shouldPrune(staleDays: 90, performance: 0.5),
+            "Should not prune at 90 days with good performance (>= 0.3)")
+    }
+
+    func test_growthController_clusterCap_at100() {
+        // Should reject cluster creation when at 100 clusters
+        XCTAssertFalse(
+            GrowthController.shouldCreateCluster(
+                systemCreationDate: Date(),
+                existingClusterCount: 100,
+                patternStrength: 1.0
+            ),
+            "Should reject new clusters when at hard cap of 100"
+        )
+    }
+
+    func test_growthController_growthPhase_labels() {
+        // Fresh system = aggressive
+        XCTAssertEqual(GrowthController.growthPhase(systemCreationDate: Date()), "aggressive")
+
+        // 6-month old system = stable
+        let sixMonthsAgo = Date().addingTimeInterval(-180 * 86400)
+        XCTAssertEqual(GrowthController.growthPhase(systemCreationDate: sixMonthsAgo), "stable")
+    }
+
+    // MARK: - MitosisManager Path Security Tests
+
+    func test_mitosis_pathTraversal_blocked() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters")
+        )
+
+        // Attempt path traversal via topic name
+        let entry = KnowledgeEntry(
+            entity: "../../../etc/passwd",
+            entityType: "test",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+
+        await manager.registerEntry(entry, domain: "test", subdomain: "../../secret")
+
+        let paths = await manager.getActivePaths()
+        for path in paths {
+            XCTAssertFalse(path.contains(".."),
+                "Cluster path must not contain '..' (path traversal): \(path)")
+        }
+
+        await manager.reset()
+    }
+
+    func test_mitosis_slashesInTopic_sanitized() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters2")
+        )
+
+        let entry = KnowledgeEntry(
+            entity: "user/admin/root",
+            entityType: "hacker",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+
+        await manager.registerEntry(entry, domain: "test")
+
+        let paths = await manager.getActivePaths()
+        // Slash in entity should be replaced with underscore
+        for path in paths {
+            let components = path.components(separatedBy: "/")
+            // Each component should not contain raw slashes from user input
+            for component in components {
+                XCTAssertFalse(component.isEmpty, "Path components should not be empty")
+            }
+        }
+
+        await manager.reset()
+    }
+
+    // MARK: - MitosisManager Functional Security
+
+    func test_mitosis_clusterCreation_requiresThreshold() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters3")
+        )
+
+        // Single query should NOT create a cluster (threshold = 5)
+        let result = await manager.recordQuery(
+            topic: "test topic",
+            keywords: ["test", "topic"],
+            messageID: "msg1"
+        )
+        XCTAssertNil(result, "Single query should not trigger cluster creation (threshold = 5)")
+
+        await manager.reset()
+    }
+
+    func test_mitosis_emptyKeywords_handled() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters4")
+        )
+
+        let match = await manager.findMatchingCluster(keywords: [])
+        XCTAssertNil(match, "Empty keywords should return nil match")
+
+        await manager.reset()
+    }
+
+    func test_mitosis_pruningCycle_archivesStale() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters5")
+        )
+
+        // Create a cluster entry
+        let entry = KnowledgeEntry(
+            entity: "old topic",
+            entityType: "test",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.1 // Low confidence = low performance
+        )
+
+        await manager.registerEntry(entry, domain: "test")
+
+        // Pruning with fresh data should NOT prune (not stale enough)
+        let prunedCount = await manager.runPruningCycle()
+        XCTAssertEqual(prunedCount, 0, "Fresh clusters should not be pruned")
+
+        await manager.reset()
+    }
+
+    func test_mitosis_reset_clearsAll() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters6")
+        )
+
+        let entry = KnowledgeEntry(
+            entity: "test",
+            entityType: "test",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+
+        await manager.registerEntry(entry, domain: "test")
+        await manager.reset()
+
+        let stats = await manager.getStats()
+        XCTAssertEqual(stats.totalClusters, 0, "Reset should clear all clusters")
+    }
+
+    // MARK: - Oversized Data
+
+    func test_mitosis_oversizedEntityName_handled() async {
+        let manager = MitosisManager(
+            storagePath: FileManager.default.temporaryDirectory.appendingPathComponent("test_clusters7")
+        )
+
+        let longEntity = String(repeating: "a", count: 100_000)
+        let entry = KnowledgeEntry(
+            entity: longEntity,
+            entityType: "test",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 0.8
+        )
+
+        await manager.registerEntry(entry, domain: "test")
+        // Should not crash
+        let stats = await manager.getStats()
+        XCTAssertEqual(stats.totalClusters, 1, "Should handle oversized entity names")
+
+        await manager.reset()
+    }
+}

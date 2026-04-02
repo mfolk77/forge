@@ -1,0 +1,14 @@
+{
+  "name": "serena-orchestrator",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/SerenaOrchestrator.swift",
+  "line_count": 602,
+  "why": "Multi-path routing: IntentDetector \u2192 RTAI \u2192 LLM, graceful degradation",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

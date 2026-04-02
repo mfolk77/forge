@@ -1,0 +1,12 @@
+{
+  "name": "tool-execution-log",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/tools/execution_log.rs",
+  "line_count": 468,
+  "why": "Structured execution history logging",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,13 @@
+{
+  "name": "config-precedence-loader",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/config/loader.rs",
+  "line_count": 662,
+  "why": "4-level config precedence merging, TOML parsing, directory init",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

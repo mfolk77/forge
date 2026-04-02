@@ -1,0 +1,533 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Mitosis system — MitosisCell base type, MedicationCell,
+/// MitosisOrchestrator lifecycle, cell pool management, replication, pruning.
+///
+/// Target files:
+/// - Sources/SerenaCore/Mitosis/MitosisCell.swift
+/// - Sources/SerenaCore/Mitosis/MedicationCell.swift
+/// - Sources/SerenaCore/Mitosis/MitosisOrchestrator.swift
+@MainActor
+final class MitosisSystemRedTests: XCTestCase {
+
+    // MARK: - Helpers
+
+    /// Minimal concrete subclass for testing BaseMitosisCell without file I/O
+    private final class StubCell: BaseMitosisCell {
+        var stubbedResult: String = "stub result"
+        var executeInternalCallCount = 0
+
+        required init(cellType: String, ftaiFile: URL) {
+            super.init(cellType: cellType, ftaiFile: ftaiFile)
+        }
+
+        override func executeInternal(input: String, ftaiContent: String, context: [String: Any]) async throws -> String {
+            executeInternalCallCount += 1
+            return stubbedResult
+        }
+    }
+
+    private let dummyURL = URL(fileURLWithPath: "/tmp/test_mitosis_dummy.ftai")
+
+    // MARK: - Group 1: CellResponse
+
+    /// CellResponse stores content and processingTime correctly
+    func test_cellResponse_storesFields() {
+        let id = UUID()
+        let response = CellResponse(content: "hello", metadata: ["key": "val"], processingTime: 0.5, cellId: id)
+
+        XCTAssertEqual(response.content, "hello")
+        XCTAssertEqual(response.processingTime, 0.5)
+        XCTAssertEqual(response.cellId, id)
+        XCTAssertEqual(response.metadata["key"] as? String, "val")
+    }
+
+    /// CellResponse defaults metadata to empty dict
+    func test_cellResponse_defaultMetadata() {
+        let response = CellResponse(content: "x", processingTime: 0.1, cellId: UUID())
+        XCTAssertTrue(response.metadata.isEmpty)
+    }
+
+    // MARK: - Group 2: BaseMitosisCell Properties
+
+    /// BaseMitosisCell generates unique cellId on init
+    func test_baseMitosisCell_uniqueIds() {
+        let a = StubCell(cellType: "test", ftaiFile: dummyURL)
+        let b = StubCell(cellType: "test", ftaiFile: dummyURL)
+        XCTAssertNotEqual(a.cellId, b.cellId)
+    }
+
+    /// BaseMitosisCell stores cellType and ftaiFile
+    func test_baseMitosisCell_storesProperties() {
+        let url = URL(fileURLWithPath: "/tmp/med.ftai")
+        let cell = StubCell(cellType: "medication_lookup", ftaiFile: url)
+        XCTAssertEqual(cell.cellType, "medication_lookup")
+        XCTAssertEqual(cell.ftaiFile, url)
+    }
+
+    /// BaseMitosisCell starts with requestCount = 0
+    func test_baseMitosisCell_initialRequestCount() {
+        let cell = StubCell(cellType: "test", ftaiFile: dummyURL)
+        XCTAssertEqual(cell.requestCount, 0)
+    }
+
+    /// BaseMitosisCell starts with nil lastRequestTime
+    func test_baseMitosisCell_initialLastRequestTime() {
+        let cell = StubCell(cellType: "test", ftaiFile: dummyURL)
+        XCTAssertNil(cell.lastRequestTime)
+    }
+
+    /// BaseMitosisCell requestsPerSecond is 0 with no requests
+    func test_baseMitosisCell_initialRequestsPerSecond() {
+        let cell = StubCell(cellType: "test", ftaiFile: dummyURL)
+        XCTAssertEqual(cell.requestsPerSecond, 0.0)
+    }
+
+    // MARK: - Group 3: BaseMitosisCell Execution
+
+    /// execute() throws ftaiFileNotFound when .ftai file is missing
+    func test_baseMitosisCell_execute_throwsFileNotFound() async {
+        let cell = StubCell(cellType: "test", ftaiFile: URL(fileURLWithPath: "/nonexistent/path.ftai"))
+        do {
+            _ = try await cell.execute(input: "test", context: [:])
+            XCTFail("Should have thrown")
+        } catch {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains("not found"), "Error should mention file not found, got: \(desc)")
+        }
+    }
+
+    /// execute() calls executeInternal and tracks request when file exists
+    func test_baseMitosisCell_execute_tracksRequest() async throws {
+        // Create a temp .ftai file
+        let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitosis_test_\(UUID().uuidString).ftai")
+        try "Medication: TestDrug".write(to: tmpFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpFile) }
+
+        let cell = StubCell(cellType: "test", ftaiFile: tmpFile)
+        let response = try await cell.execute(input: "query", context: [:])
+
+        XCTAssertEqual(cell.requestCount, 1)
+        XCTAssertNotNil(cell.lastRequestTime)
+        XCTAssertEqual(response.content, "stub result")
+        XCTAssertEqual(cell.executeInternalCallCount, 1)
+    }
+
+    /// execute() increments requestCount on each call
+    func test_baseMitosisCell_execute_incrementsCount() async throws {
+        let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitosis_test_\(UUID().uuidString).ftai")
+        try "Medication: TestDrug".write(to: tmpFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpFile) }
+
+        let cell = StubCell(cellType: "test", ftaiFile: tmpFile)
+        _ = try await cell.execute(input: "a", context: [:])
+        _ = try await cell.execute(input: "b", context: [:])
+        _ = try await cell.execute(input: "c", context: [:])
+
+        XCTAssertEqual(cell.requestCount, 3)
+    }
+
+    /// executeInternal() on base class throws notImplemented
+    func test_baseMitosisCell_executeInternal_throwsNotImplemented() async {
+        let cell = BaseMitosisCell(cellType: "raw", ftaiFile: dummyURL)
+        do {
+            _ = try await cell.executeInternal(input: "x", ftaiContent: "y", context: [:])
+            XCTFail("Should have thrown notImplemented")
+        } catch {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains("not implemented") || desc.contains("Not implemented"),
+                          "Should mention not implemented, got: \(desc)")
+        }
+    }
+
+    // MARK: - Group 4: BaseMitosisCell Replication
+
+    /// shouldReplicate() returns false with no requests
+    func test_shouldReplicate_falseInitially() {
+        let cell = StubCell(cellType: "test", ftaiFile: dummyURL)
+        XCTAssertFalse(cell.shouldReplicate())
+    }
+
+    /// replicate() returns a new cell of the same type
+    func test_replicate_createsNewCell() {
+        let cell = StubCell(cellType: "test_type", ftaiFile: dummyURL)
+        let replica = cell.replicate()
+
+        XCTAssertNotEqual(cell.cellId, replica.cellId)
+        XCTAssertEqual(replica.cellType, "test_type")
+        XCTAssertEqual(replica.ftaiFile, dummyURL)
+    }
+
+    /// replicate() creates a cell with fresh state (requestCount = 0)
+    func test_replicate_freshState() {
+        let cell = StubCell(cellType: "test", ftaiFile: dummyURL)
+        cell.requestCount = 42
+        let replica = cell.replicate()
+        XCTAssertEqual(replica.requestCount, 0)
+    }
+
+    // MARK: - Group 5: MitosisError
+
+    /// MitosisError cases have meaningful descriptions
+    func test_mitosisError_descriptions() {
+        let errors: [(MitosisError, String)] = [
+            (.ftaiFileNotFound(URL(fileURLWithPath: "/a.ftai")), "/a.ftai"),
+            (.invalidFTAIFormat("bad"), "bad"),
+            (.cellNotFound("missing"), "missing"),
+            (.notImplemented("foo"), "foo"),
+        ]
+        for (error, expected) in errors {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains(expected), "'\(desc)' should contain '\(expected)'")
+        }
+    }
+
+    /// MitosisError.executionFailed wraps inner error description
+    func test_mitosisError_executionFailed() {
+        let inner = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+        let error = MitosisError.executionFailed(inner)
+        let desc = error.localizedDescription
+        XCTAssertTrue(desc.contains("boom"), "Should contain inner error description")
+    }
+
+    // MARK: - Group 6: MedicationCell
+
+    /// MedicationCell sets cellType based on medication name
+    func test_medicationCell_cellType() {
+        let cell = MedicationCell(medicationName: "epinephrine", ftaiFile: dummyURL)
+        XCTAssertEqual(cell.cellType, "medication_lookup_epinephrine")
+    }
+
+    /// MedicationCell required init sets cellType directly
+    func test_medicationCell_requiredInit() {
+        let cell = MedicationCell(cellType: "custom_type", ftaiFile: dummyURL)
+        XCTAssertEqual(cell.cellType, "custom_type")
+    }
+
+    /// MedicationCell executeInternal parses FTAI and returns dose info
+    func test_medicationCell_executeInternal_validFTAI() async throws {
+        let ftaiContent = """
+        Medication: Epinephrine
+
+        Dosing:
+        @cardiac_arrest
+        dose: 1mg route: IV frequency: q3-5min max: no maximum
+
+        Warnings:
+        - Use with caution in elderly
+        """
+
+        let cell = MedicationCell(medicationName: "epinephrine", ftaiFile: dummyURL)
+        let result = try await cell.executeInternal(input: "cardiac arrest code", ftaiContent: ftaiContent, context: [:])
+
+        XCTAssertTrue(result.contains("EPINEPHRINE"), "Response should contain medication name uppercased")
+        XCTAssertTrue(result.contains("1mg"), "Response should contain dose")
+        XCTAssertTrue(result.contains("Verify dosage"), "Response should contain safety warning")
+    }
+
+    /// MedicationCell uses context indication when provided
+    func test_medicationCell_contextIndication() async throws {
+        let ftaiContent = """
+        Medication: Epinephrine
+
+        Dosing:
+        @anaphylaxis
+        dose: 0.3mg route: IM frequency: q5-15min max: 3 doses
+        """
+
+        let cell = MedicationCell(medicationName: "epinephrine", ftaiFile: dummyURL)
+        let context: [String: Any] = ["indication": "anaphylaxis"]
+        let result = try await cell.executeInternal(input: "need epi", ftaiContent: ftaiContent, context: context)
+
+        XCTAssertTrue(result.contains("0.3mg"), "Should use anaphylaxis dose from context")
+        XCTAssertTrue(result.contains("IM"), "Should use IM route")
+    }
+
+    /// MedicationCell returns "no dosage" for unknown indication
+    func test_medicationCell_unknownIndication() async throws {
+        let ftaiContent = """
+        Medication: Epinephrine
+
+        Dosing:
+        @cardiac_arrest
+        dose: 1mg route: IV frequency: q3-5min
+        """
+
+        let cell = MedicationCell(medicationName: "epinephrine", ftaiFile: dummyURL)
+        let result = try await cell.executeInternal(input: "for headache", ftaiContent: ftaiContent, context: [:])
+
+        XCTAssertTrue(result.contains("No dosage information"), "Should indicate no dosage found")
+    }
+
+    /// MedicationCell throws invalidFTAIFormat when medication name is missing
+    func test_medicationCell_missingMedicationName() async {
+        let ftaiContent = """
+        Dosing:
+        @cardiac_arrest
+        dose: 1mg route: IV
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        do {
+            _ = try await cell.executeInternal(input: "test", ftaiContent: ftaiContent, context: [:])
+            XCTFail("Should throw invalidFTAIFormat")
+        } catch {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains("Missing medication name") || desc.contains("FTAI"),
+                          "Error should mention FTAI format, got: \(desc)")
+        }
+    }
+
+    /// MedicationCell indication extraction from input keywords
+    func test_medicationCell_indicationExtraction() async throws {
+        let ftaiContent = """
+        Medication: TestDrug
+
+        Dosing:
+        @anaphylaxis
+        dose: 0.5mg route: IM frequency: once
+
+        @bradycardia
+        dose: 0.5mg route: IV frequency: q3-5min
+
+        @hypotension
+        dose: 2mcg route: IV frequency: continuous
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+
+        // Test anaphylaxis detection
+        let r1 = try await cell.executeInternal(input: "allergic reaction severe", ftaiContent: ftaiContent, context: [:])
+        XCTAssertTrue(r1.contains("Anaphylaxis"), "Should detect anaphylaxis from 'allergic'")
+
+        // Test bradycardia detection
+        let r2 = try await cell.executeInternal(input: "patient has bradycardia", ftaiContent: ftaiContent, context: [:])
+        XCTAssertTrue(r2.contains("Bradycardia"), "Should detect bradycardia")
+
+        // Test hypotension detection
+        let r3 = try await cell.executeInternal(input: "low bp treatment", ftaiContent: ftaiContent, context: [:])
+        XCTAssertTrue(r3.contains("Hypotension"), "Should detect hypotension from 'low bp'")
+    }
+
+    /// MedicationCell includes max dose when present
+    func test_medicationCell_maxDoseInResponse() async throws {
+        let ftaiContent = """
+        Medication: TestDrug
+
+        Dosing:
+        @cardiac_arrest
+        dose: 1mg route: IV frequency: q3-5min max: 10mg total
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        let result = try await cell.executeInternal(input: "cardiac arrest", ftaiContent: ftaiContent, context: [:])
+
+        XCTAssertTrue(result.contains("Maximum"), "Should include maximum dose section")
+        XCTAssertTrue(result.contains("10mg total"), "Should show max dose value")
+    }
+
+    /// MedicationCell FTAI parser skips comment lines
+    func test_medicationCell_ftaiSkipsComments() async throws {
+        let ftaiContent = """
+        # This is a comment
+        Medication: TestDrug
+        # Another comment
+
+        Dosing:
+        @standard
+        dose: 5mg route: PO frequency: daily
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        let result = try await cell.executeInternal(input: "give me standard dose", ftaiContent: ftaiContent, context: [:])
+
+        XCTAssertTrue(result.contains("TESTDRUG"), "Should parse medication name ignoring comments")
+        XCTAssertTrue(result.contains("5mg"), "Should parse dose correctly")
+    }
+
+    // MARK: - Group 7: MitosisOrchestrator
+
+    /// MitosisOrchestrator starts with empty cell pool
+    func test_orchestrator_initialState() {
+        let orch = MitosisOrchestrator()
+        let status = orch.getCellPoolStatus()
+        XCTAssertTrue(status.isEmpty, "Should start with empty cell pool")
+    }
+
+    /// MitosisOrchestrator stats start at zero
+    func test_orchestrator_initialStats() {
+        let orch = MitosisOrchestrator()
+        XCTAssertEqual(orch.stats.totalCells, 0)
+        XCTAssertEqual(orch.stats.totalExecutions, 0)
+        XCTAssertEqual(orch.stats.totalReplications, 0)
+        XCTAssertEqual(orch.stats.totalPruned, 0)
+        XCTAssertEqual(orch.stats.averageExecutionTime, 0.0)
+        XCTAssertEqual(orch.stats.activeTypes, 0)
+    }
+
+    /// MitosisOrchestrator registerCellFactory adds factory
+    func test_orchestrator_registerCellFactory() {
+        let orch = MitosisOrchestrator()
+        orch.registerCellFactory(cellType: "custom_cell") { type, url in
+            StubCell(cellType: type, ftaiFile: url)
+        }
+        // No crash = success; factory is stored internally
+    }
+
+    /// MitosisOrchestrator canHandle returns false for unrecognized input
+    func test_orchestrator_canHandle_false() {
+        let orch = MitosisOrchestrator()
+        let result = orch.canHandle("random unrelated text about weather")
+        XCTAssertFalse(result)
+    }
+
+    /// MitosisOrchestrator canHandle returns true for epinephrine input
+    func test_orchestrator_canHandle_true() {
+        let orch = MitosisOrchestrator()
+        let result = orch.canHandle("epinephrine dose for cardiac arrest")
+        XCTAssertTrue(result)
+    }
+
+    /// MitosisOrchestrator matchingCellType returns correct type
+    func test_orchestrator_matchingCellType() {
+        let orch = MitosisOrchestrator()
+        let cellType = orch.matchingCellType(for: "epinephrine dose")
+        XCTAssertEqual(cellType, "medication_lookup_epinephrine")
+    }
+
+    /// MitosisOrchestrator matchingCellType returns nil for no match
+    func test_orchestrator_matchingCellType_nil() {
+        let orch = MitosisOrchestrator()
+        let cellType = orch.matchingCellType(for: "what is the weather today")
+        XCTAssertNil(cellType)
+    }
+
+    /// MitosisOrchestrator getRegisteredTriggers returns default triggers
+    func test_orchestrator_registeredTriggers() {
+        let orch = MitosisOrchestrator()
+        let triggers = orch.getRegisteredTriggers()
+        XCTAssertFalse(triggers.isEmpty, "Should have default triggers")
+
+        let cellTypes = triggers.map { $0.cellType }
+        XCTAssertTrue(cellTypes.contains("medication_lookup_epinephrine"))
+        XCTAssertTrue(cellTypes.contains("protocol_cardiac_arrest"))
+    }
+
+    /// MitosisOrchestrator execute throws for unrecognized input
+    func test_orchestrator_execute_throwsForUnknownInput() async {
+        let orch = MitosisOrchestrator()
+        do {
+            _ = try await orch.execute(input: "random text about gardening")
+            XCTFail("Should throw cellNotFound")
+        } catch {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains("No matching cell") || desc.contains("cell"),
+                          "Error should mention cell, got: \(desc)")
+        }
+    }
+
+    /// MitosisOrchestrator getCellStatistics returns nil for unknown type
+    func test_orchestrator_getCellStatistics_nil() {
+        let orch = MitosisOrchestrator()
+        let stats = orch.getCellStatistics(cellType: "nonexistent_type")
+        XCTAssertNil(stats)
+    }
+
+    /// MitosisOrchestrator pruneIdleCells does nothing on empty pool
+    func test_orchestrator_pruneIdleCells_emptyPool() async {
+        let orch = MitosisOrchestrator()
+        await orch.pruneIdleCells()
+        XCTAssertEqual(orch.stats.totalPruned, 0)
+    }
+
+    // MARK: - Group 8: MitosisStats
+
+    /// MitosisStats activeTypes reflects cellTypes count
+    func test_mitosisStats_activeTypes() {
+        var stats = MitosisStats()
+        XCTAssertEqual(stats.activeTypes, 0)
+
+        stats.cellTypes.insert("type_a")
+        stats.cellTypes.insert("type_b")
+        XCTAssertEqual(stats.activeTypes, 2)
+    }
+
+    /// MitosisStats fields are independently settable
+    func test_mitosisStats_fields() {
+        var stats = MitosisStats()
+        stats.totalCells = 5
+        stats.totalExecutions = 100
+        stats.totalReplications = 3
+        stats.totalPruned = 2
+        stats.averageExecutionTime = 0.05
+
+        XCTAssertEqual(stats.totalCells, 5)
+        XCTAssertEqual(stats.totalExecutions, 100)
+        XCTAssertEqual(stats.totalReplications, 3)
+        XCTAssertEqual(stats.totalPruned, 2)
+        XCTAssertEqual(stats.averageExecutionTime, 0.05)
+    }
+
+    // MARK: - Group 9: CellStatistics
+
+    /// CellStatistics stores all fields
+    func test_cellStatistics_fields() {
+        let cs = CellStatistics(cellType: "med", instanceCount: 3, totalRequests: 42, averageRequestsPerSecond: 1.5)
+        XCTAssertEqual(cs.cellType, "med")
+        XCTAssertEqual(cs.instanceCount, 3)
+        XCTAssertEqual(cs.totalRequests, 42)
+        XCTAssertEqual(cs.averageRequestsPerSecond, 1.5)
+    }
+
+    // MARK: - Group 10: MedicationCell FTAI edge cases
+
+    /// MedicationCell handles empty FTAI content
+    func test_medicationCell_emptyFTAI() async {
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        do {
+            _ = try await cell.executeInternal(input: "test", ftaiContent: "", context: [:])
+            XCTFail("Should throw for empty content (no medication name)")
+        } catch {
+            let desc = error.localizedDescription
+            XCTAssertTrue(desc.contains("Missing medication name") || desc.contains("FTAI"),
+                          "Should throw FTAI format error, got: \(desc)")
+        }
+    }
+
+    /// MedicationCell FTAI parser handles contraindications section
+    func test_medicationCell_ftaiContraindications() async throws {
+        let ftaiContent = """
+        Medication: TestDrug
+
+        Dosing:
+        @standard
+        dose: 10mg route: PO frequency: daily
+
+        Contraindications:
+        - Severe renal impairment
+        - Known allergy
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        // Should parse without error even with contraindications section
+        let result = try await cell.executeInternal(input: "standard dosing", ftaiContent: ftaiContent, context: [:])
+        XCTAssertTrue(result.contains("10mg"))
+    }
+
+    /// MedicationCell formats indication with underscores replaced by spaces
+    func test_medicationCell_indicationFormatting() async throws {
+        let ftaiContent = """
+        Medication: TestDrug
+
+        Dosing:
+        @cardiac_arrest
+        dose: 1mg route: IV frequency: q3-5min
+        """
+
+        let cell = MedicationCell(medicationName: "test", ftaiFile: dummyURL)
+        let result = try await cell.executeInternal(input: "cardiac arrest", ftaiContent: ftaiContent, context: [:])
+
+        XCTAssertTrue(result.contains("Cardiac Arrest"), "Should format indication with spaces and capitalization")
+    }
+}

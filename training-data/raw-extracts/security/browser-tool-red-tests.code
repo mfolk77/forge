@@ -1,0 +1,228 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Browser tool handler — URL validation, scheme blocking, action routing,
+/// search encoding, and security boundaries.
+///
+/// Note: ToolHelpers.isTestEnvironment prevents real AppleScript execution,
+/// so these tests verify logic without launching browsers.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/ToolHandlers/BrowserToolHandler.swift
+@MainActor
+final class BrowserToolHandlerRedTests: XCTestCase {
+
+    private var handler: BrowserToolHandler!
+
+    override func setUp() {
+        super.setUp()
+        handler = BrowserToolHandler()
+    }
+
+    // MARK: - Group 1: Tool Identity
+
+    /// Tool name should be "browser"
+    func test_toolName_isBrowser() {
+        XCTAssertEqual(handler.toolName, "browser")
+    }
+
+    // MARK: - Group 2: URL Scheme Security
+
+    /// file: scheme URLs must be blocked
+    func test_openURL_fileScheme_blocked() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "file:///etc/passwd"]
+        )
+        XCTAssertFalse(result.success, "file: URLs should be blocked")
+        XCTAssertTrue(result.error?.contains("Blocked") ?? false,
+                      "Error should mention blocking. Got: \(result.error ?? "nil")")
+    }
+
+    /// javascript: scheme URLs must be blocked (XSS prevention)
+    func test_openURL_javascriptScheme_blocked() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "javascript:alert('xss')"]
+        )
+        XCTAssertFalse(result.success, "javascript: URLs should be blocked")
+    }
+
+    /// data: scheme URLs must be blocked
+    func test_openURL_dataScheme_blocked() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "data:text/html,<h1>evil</h1>"]
+        )
+        XCTAssertFalse(result.success, "data: URLs should be blocked")
+    }
+
+    /// ftp: scheme URLs must be blocked
+    func test_openURL_ftpScheme_blocked() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "ftp://evil.com/malware.exe"]
+        )
+        XCTAssertFalse(result.success, "ftp: URLs should be blocked")
+    }
+
+    /// http: scheme URLs should be allowed
+    func test_openURL_httpScheme_allowed() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "http://example.com"]
+        )
+        XCTAssertTrue(result.success, "http: URLs should be allowed")
+    }
+
+    /// https: scheme URLs should be allowed
+    func test_openURL_httpsScheme_allowed() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "https://example.com"]
+        )
+        XCTAssertTrue(result.success, "https: URLs should be allowed")
+    }
+
+    /// URLs without scheme should auto-prepend https://
+    func test_openURL_noScheme_prependsHttps() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": "example.com"]
+        )
+        XCTAssertTrue(result.success, "URLs without scheme should work with auto-https")
+        XCTAssertTrue(result.output.contains("https://example.com"),
+                      "Should prepend https://. Got: \(result.output)")
+    }
+
+    // MARK: - Group 3: Missing/Empty Parameters
+
+    /// open_url with no URL should fail gracefully
+    func test_openURL_noURL_fails() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: [:]
+        )
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.error?.contains("No URL") ?? false)
+    }
+
+    /// open_url with empty URL should fail gracefully
+    func test_openURL_emptyURL_fails() async {
+        let result = await handler.execute(
+            action: "open_url",
+            params: ["url": ""]
+        )
+        XCTAssertFalse(result.success)
+    }
+
+    /// search with no query should fail gracefully
+    func test_search_noQuery_fails() async {
+        let result = await handler.execute(
+            action: "search",
+            params: [:]
+        )
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.error?.contains("No search query") ?? false)
+    }
+
+    /// search with empty query should fail gracefully
+    func test_search_emptyQuery_fails() async {
+        let result = await handler.execute(
+            action: "search",
+            params: ["query": ""]
+        )
+        XCTAssertFalse(result.success)
+    }
+
+    // MARK: - Group 4: Action Routing
+
+    /// Unknown action should return error with available actions list
+    func test_unknownAction_returnsError() async {
+        let result = await handler.execute(
+            action: "delete_history",
+            params: [:]
+        )
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.error?.contains("Unknown browser action") ?? false)
+        // Should list available actions
+        XCTAssertTrue(result.error?.contains("open_url") ?? false)
+        XCTAssertTrue(result.error?.contains("search") ?? false)
+        XCTAssertTrue(result.error?.contains("new_tab") ?? false)
+        XCTAssertTrue(result.error?.contains("close_tab") ?? false)
+    }
+
+    /// nil action should return error
+    func test_nilAction_returnsError() async {
+        let result = await handler.execute(
+            action: nil,
+            params: [:]
+        )
+        XCTAssertFalse(result.success)
+    }
+
+    /// "open" should work as alias for "open_url"
+    func test_openAction_aliasForOpenURL() async {
+        let result = await handler.execute(
+            action: "open",
+            params: ["url": "https://example.com"]
+        )
+        XCTAssertTrue(result.success, "'open' should work as alias for 'open_url'")
+    }
+
+    // MARK: - Group 5: Search
+
+    /// search should use Google URL
+    func test_search_usesGoogleURL() async {
+        let result = await handler.execute(
+            action: "search",
+            params: ["query": "swift programming"]
+        )
+        XCTAssertTrue(result.success)
+        // In test environment, ToolHelpers returns simulated result
+        // Just verify no crash and success
+    }
+
+    // MARK: - Group 6: Browser Parameter
+
+    /// Default browser should be Safari (when no browser param)
+    func test_defaultBrowser_isSafari() async {
+        let result = await handler.execute(
+            action: "new_tab",
+            params: [:]
+        )
+        // In test environment, may fail due to Apple Event auth — that's OK
+        // We're testing that it doesn't crash and returns a ToolResult
+        XCTAssertNotNil(result)
+    }
+
+    /// Chrome browser parameter should be accepted
+    func test_chromeBrowser_accepted() async {
+        let result = await handler.execute(
+            action: "new_tab",
+            params: ["browser": "Chrome"]
+        )
+        // May fail due to Apple Event auth in test environment
+        XCTAssertNotNil(result)
+    }
+
+    // MARK: - Group 7: Tab Operations
+
+    /// new_tab should return a result (may fail without Apple Event auth)
+    func test_newTab_returnsResult() async {
+        let result = await handler.execute(
+            action: "new_tab",
+            params: [:]
+        )
+        XCTAssertNotNil(result)
+    }
+
+    /// close_tab should return a result (may fail without Apple Event auth)
+    func test_closeTab_returnsResult() async {
+        let result = await handler.execute(
+            action: "close_tab",
+            params: [:]
+        )
+        XCTAssertNotNil(result)
+    }
+}

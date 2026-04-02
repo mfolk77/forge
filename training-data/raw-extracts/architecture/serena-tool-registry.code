@@ -1,0 +1,145 @@
+import Foundation
+
+/// Registry of available tools for validation
+/// Prevents execution of non-existent tools that the model might hallucinate
+public class ToolRegistry {
+    /// Set of built-in tool names (static)
+    public static let builtInTools: Set<String> = [
+        "calendar",    // EventKit calendar integration
+        "file",        // FileManager file operations
+        "app",         // NSWorkspace app launching
+        "executive",   // Multi-step task planning
+        "memory",      // User memory management (remember/forget facts)
+        "media",       // Music/Spotify control via AppleScript
+        "browser",     // Safari/Chrome control
+        "system",      // System settings, volume, brightness
+        "notes",       // Apple Notes integration via AppleScript
+        "web_search",  // Web search with result scraping
+        "websearch",   // Alias for web_search
+        "briefing",    // Morning briefing with calendar, reminders, weather
+        "screen",       // Screen intelligence - see what user is looking at
+        "window",       // Window snapping and tiling
+        "clipboard",    // Clipboard history
+        "file_search",  // Spotlight-powered file search
+        "snippet"       // Text expansion snippets
+    ]
+
+    /// Set of dynamically registered MCP tools
+    private static var mcpTools: Set<String> = []
+    private static var mcpToolDescriptions: [String: String] = [:]
+    private static let lock = NSLock()
+
+    /// All available tools (built-in + MCP)
+    public static var availableTools: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return builtInTools.union(mcpTools)
+    }
+
+    // MARK: - MCP Tool Registration
+
+    /// Register an MCP tool
+    public static func registerMCPTool(name: String, description: String? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        mcpTools.insert(name.lowercased())
+        if let desc = description {
+            mcpToolDescriptions[name.lowercased()] = desc
+        }
+    }
+
+    /// Register multiple MCP tools
+    public static func registerMCPTools(_ tools: [(name: String, description: String?)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        for (name, description) in tools {
+            mcpTools.insert(name.lowercased())
+            if let desc = description {
+                mcpToolDescriptions[name.lowercased()] = desc
+            }
+        }
+    }
+
+    /// Unregister an MCP tool
+    public static func unregisterMCPTool(name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        mcpTools.remove(name.lowercased())
+        mcpToolDescriptions.removeValue(forKey: name.lowercased())
+    }
+
+    /// Unregister all MCP tools
+    public static func unregisterAllMCPTools() {
+        lock.lock()
+        defer { lock.unlock() }
+        mcpTools.removeAll()
+        mcpToolDescriptions.removeAll()
+    }
+
+    /// Check if a tool is an MCP tool
+    public static func isMCPTool(_ toolName: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return mcpTools.contains(toolName.lowercased())
+    }
+
+    /// Get registered MCP tool names
+    public static var registeredMCPTools: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return mcpTools
+    }
+
+    // MARK: - Validation
+
+    /// Check if a tool name is valid (built-in or MCP)
+    public static func isValid(_ toolName: String) -> Bool {
+        return availableTools.contains(toolName.lowercased())
+    }
+
+    /// Get comma-separated list of available tools
+    public static func getAvailableList() -> String {
+        return availableTools.sorted().joined(separator: ", ")
+    }
+
+    /// Get detailed tool descriptions (built-in + MCP)
+    public static func getToolDescriptions() -> [String: String] {
+        var descriptions: [String: String] = [
+            "calendar": "Create, view, and manage calendar events using EventKit",
+            "file": "Search, read, list, create, delete, and open files. Actions: search (find files by name), read (view file contents), list (directory contents), create (new file), delete (remove file), open (launch with default app)",
+            "app": "Launch, quit, and manage macOS applications using NSWorkspace",
+            "executive": "Plan and execute multi-step tasks with role-based operations",
+            "memory": "Remember and recall facts about the user across conversations",
+            "media": "Control Music, Spotify - play, pause, skip, volume",
+            "browser": "Open URLs, search the web, control Safari/Chrome tabs",
+            "system": "Control volume, open System Settings, toggle Do Not Disturb",
+            "notes": "Create, read, and manage notes in Apple Notes via AppleScript",
+            "web_search": "Search the web and return results with links. Returns top 5 results with titles, URLs, and snippets.",
+            "briefing": "Get a morning briefing with calendar events, reminders, and weather",
+            "screen": "See what the user is looking at on screen using Accessibility APIs. Can read text, identify apps, recognize contacts.",
+            "window": "Snap and tile windows using Accessibility APIs. Layouts: left/right half, quarters, thirds, center, maximize.",
+            "clipboard": "Clipboard history with search, pinning, and sensitive data filtering.",
+            "file_search": "Search files using Spotlight index. Filters sensitive paths.",
+            "snippet": "Text expansion snippets with keyword triggers and dynamic variables."
+        ]
+
+        // Add MCP tool descriptions
+        lock.lock()
+        for (name, desc) in mcpToolDescriptions {
+            descriptions[name] = desc
+        }
+        lock.unlock()
+
+        return descriptions
+    }
+
+    /// Validate tool and return helpful error message if invalid
+    public static func validateOrError(_ toolName: String) -> (valid: Bool, error: String?) {
+        if isValid(toolName) {
+            return (true, nil)
+        } else {
+            let available = getAvailableList()
+            return (false, "Tool '\(toolName)' does not exist. Available tools: \(available)")
+        }
+    }
+}

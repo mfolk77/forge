@@ -1,0 +1,14 @@
+{
+  "name": "conversation-security-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/security_tests.rs",
+  "line_count": 1096,
+  "why": "Prompt injection, output injection, memory escape attacks",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

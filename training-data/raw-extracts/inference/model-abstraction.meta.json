@@ -1,0 +1,1 @@
+{"name": "model-abstraction", "category": "inference", "source_file": "/Users/michaelfolk/Developer/forge/src/inference/model.rs", "line_count":      382, "why": "Forge inference/model.rs", "distill_as": ["instruction", "conversation"]}

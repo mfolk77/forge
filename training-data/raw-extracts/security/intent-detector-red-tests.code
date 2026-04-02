@@ -1,0 +1,430 @@
+@testable import SerenaCore
+import XCTest
+
+@MainActor
+final class IntentDetectorRedTests: XCTestCase {
+
+    private var sut: IntentDetector!
+
+    override func setUp() {
+        super.setUp()
+        sut = IntentDetector.shared
+    }
+
+    // MARK: - Basic Contract
+
+    func test_detectIntent_nilForConversation() {
+        // Plain conversational text should return nil (no action)
+        let result = sut.detectIntent(from: "How are you doing today?")
+        XCTAssertNil(result, "Conversational input should not trigger any intent")
+    }
+
+    func test_detectIntent_nilForEmptyString() {
+        let result = sut.detectIntent(from: "")
+        XCTAssertNil(result, "Empty string should not trigger any intent")
+    }
+
+    func test_detectIntent_nilForWhitespace() {
+        let result = sut.detectIntent(from: "   ")
+        XCTAssertNil(result, "Whitespace-only input should not trigger any intent")
+    }
+
+    // MARK: - App Launch
+
+    func test_detectIntent_launchApp_openSafari() {
+        let result = sut.detectIntent(from: "open safari")
+        guard case .launchApp(let appName) = result else {
+            XCTFail("Expected launchApp intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(appName.lowercased(), "safari")
+    }
+
+    func test_detectIntent_launchApp_launchNotes() {
+        let result = sut.detectIntent(from: "launch notes")
+        guard case .launchApp(let appName) = result else {
+            XCTFail("Expected launchApp intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(appName.lowercased(), "notes")
+    }
+
+    func test_detectIntent_launchApp_filtersNonAppWords() {
+        // "open it" should NOT trigger app launch
+        let result = sut.detectIntent(from: "open it")
+        if case .launchApp = result {
+            XCTFail("'open it' should not trigger launchApp")
+        }
+    }
+
+    // MARK: - URL Detection
+
+    func test_detectIntent_openURL_domainWithTLD() {
+        let result = sut.detectIntent(from: "google.com")
+        guard case .openURL(let url) = result else {
+            XCTFail("Expected openURL intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertTrue(url.contains("google.com"), "URL should contain the domain")
+        XCTAssertTrue(url.hasPrefix("https://"), "URL should have https prefix added")
+    }
+
+    func test_detectIntent_openURL_explicitHTTPS() {
+        let result = sut.detectIntent(from: "https://example.com")
+        guard case .openURL(let url) = result else {
+            XCTFail("Expected openURL intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(url, "https://example.com")
+    }
+
+    func test_detectIntent_openURL_doesNotCaptureEmail() {
+        // Email addresses should NOT be captured as URLs
+        let result = sut.detectIntent(from: "send email to test@example.com")
+        if case .openURL = result {
+            XCTFail("Email address should not trigger openURL intent")
+        }
+    }
+
+    // MARK: - Email Detection
+
+    func test_detectIntent_composeEmail_withAddress() {
+        let result = sut.detectIntent(from: "send email to john@example.com")
+        guard case .composeEmail(let to, _, _) = result else {
+            XCTFail("Expected composeEmail intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(to, "john@example.com")
+    }
+
+    func test_detectIntent_composeEmail_standaloneAddress() {
+        let result = sut.detectIntent(from: "john@example.com")
+        guard case .composeEmail(let to, _, _) = result else {
+            XCTFail("Expected composeEmail for standalone email, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(to, "john@example.com")
+    }
+
+    // MARK: - Music Detection
+
+    func test_detectIntent_playMusic_specificSong() {
+        let result = sut.detectIntent(from: "play Bohemian Rhapsody")
+        guard case .playMusic(let query, _, _, _) = result else {
+            XCTFail("Expected playMusic intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(query?.lowercased(), "bohemian rhapsody")
+    }
+
+    func test_detectIntent_controlMusic_pause() {
+        let result = sut.detectIntent(from: "pause")
+        guard case .controlMusic(let action, _) = result else {
+            XCTFail("Expected controlMusic intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(action, .pause)
+    }
+
+    func test_detectIntent_controlMusic_next() {
+        let result = sut.detectIntent(from: "skip song")
+        guard case .controlMusic(let action, _) = result else {
+            XCTFail("Expected controlMusic intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(action, .next)
+    }
+
+    func test_detectIntent_playMusic_onSpotify() {
+        let result = sut.detectIntent(from: "play Despacito on spotify")
+        guard case .playMusic(let query, _, _, let app) = result else {
+            XCTFail("Expected playMusic intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(query?.lowercased(), "despacito")
+        XCTAssertEqual(app, "spotify")
+    }
+
+    func test_detectIntent_playMusic_genericPlayMusic() {
+        let result = sut.detectIntent(from: "play some music")
+        guard case .playMusic(let query, _, _, _) = result else {
+            XCTFail("Expected playMusic intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertNil(query, "Generic play music should have nil query")
+    }
+
+    // MARK: - Morning Briefing
+
+    func test_detectIntent_morningBriefing_goodMorning() {
+        let result = sut.detectIntent(from: "good morning")
+        guard case .morningBriefing = result else {
+            XCTFail("Expected morningBriefing intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_morningBriefing_startMyDay() {
+        let result = sut.detectIntent(from: "start my day")
+        guard case .morningBriefing = result else {
+            XCTFail("Expected morningBriefing intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_setBriefingTrigger() {
+        let result = sut.detectIntent(from: "when I say yo, give me my briefing")
+        guard case .setBriefingTrigger(let phrase) = result else {
+            XCTFail("Expected setBriefingTrigger intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(phrase, "yo")
+    }
+
+    // MARK: - Calendar Detection
+
+    func test_detectIntent_viewCalendar() {
+        let result = sut.detectIntent(from: "show my calendar")
+        guard case .viewCalendar = result else {
+            XCTFail("Expected viewCalendar intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_createCalendarEvent() {
+        let result = sut.detectIntent(from: "schedule a meeting on friday")
+        guard case .createCalendarEvent(_, _, _, _) = result else {
+            XCTFail("Expected createCalendarEvent intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_deleteCalendarEvent() {
+        let result = sut.detectIntent(from: "delete my meeting event")
+        guard case .deleteCalendarEvent = result else {
+            XCTFail("Expected deleteCalendarEvent intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    // MARK: - Reminder Detection
+
+    func test_detectIntent_createReminder() {
+        let result = sut.detectIntent(from: "remind me to buy groceries")
+        guard case .createReminder(let title, _, _, _) = result else {
+            XCTFail("Expected createReminder intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(title, "buy groceries")
+    }
+
+    func test_detectIntent_createReminder_longInputIgnored() {
+        // Inputs >300 chars should NOT trigger reminder detection (prevents false positives from pasted docs)
+        let longInput = "remind me " + String(repeating: "a", count: 300)
+        let result = sut.detectIntent(from: longInput)
+        if case .createReminder = result {
+            XCTFail("Long input should not trigger reminder intent")
+        }
+    }
+
+    func test_detectIntent_createReminder_dontForgetIsReminder() {
+        let result = sut.detectIntent(from: "don't forget to call mom")
+        guard case .createReminder(let title, _, _, _) = result else {
+            XCTFail("Expected createReminder for 'don't forget', got \(String(describing: result))")
+            return
+        }
+        XCTAssertTrue(title?.contains("call mom") == true)
+    }
+
+    // MARK: - Forget Memory Detection
+
+    func test_detectIntent_forgetMemory() {
+        let result = sut.detectIntent(from: "forget about my phone number")
+        guard case .forgetMemory(let query) = result else {
+            XCTFail("Expected forgetMemory intent, got \(String(describing: result))")
+            return
+        }
+        // "forget about my phone number" — regex captures "my phone number" but "my" is stripped
+        XCTAssertTrue(query.contains("phone number"), "Query should contain 'phone number', got '\(query)'")
+    }
+
+    func test_detectIntent_forgetMemory_dontForgetIsNotForget() {
+        // "don't forget" should be treated as a reminder, not a forget command
+        let result = sut.detectIntent(from: "don't forget to call mom")
+        if case .forgetMemory = result {
+            XCTFail("'don't forget' should NOT trigger forgetMemory intent")
+        }
+    }
+
+    // MARK: - Web Search Detection
+
+    func test_detectIntent_webSearch() {
+        let result = sut.detectIntent(from: "search the web for swift concurrency")
+        guard case .webSearch(let query) = result else {
+            XCTFail("Expected webSearch intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(query, "swift concurrency")
+    }
+
+    func test_detectIntent_webSearch_google() {
+        let result = sut.detectIntent(from: "google best restaurants nearby")
+        guard case .webSearch(let query) = result else {
+            XCTFail("Expected webSearch intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(query, "best restaurants nearby")
+    }
+
+    // MARK: - Screen Context Detection
+
+    func test_detectIntent_screenContext_whatsOnScreen() {
+        let result = sut.detectIntent(from: "what's on my screen")
+        guard case .screenContext = result else {
+            XCTFail("Expected screenContext intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_screenContext_whatAmILookingAt() {
+        let result = sut.detectIntent(from: "what am I looking at")
+        guard case .screenContext = result else {
+            XCTFail("Expected screenContext intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    // MARK: - Running Apps Detection
+
+    func test_detectIntent_listRunningApps() {
+        let result = sut.detectIntent(from: "what apps are running")
+        guard case .listRunningApps = result else {
+            XCTFail("Expected listRunningApps intent, got \(String(describing: result))")
+            return
+        }
+    }
+
+    // MARK: - Open Search Result
+
+    func test_detectIntent_openSearchResult_numericIndex() {
+        let result = sut.detectIntent(from: "open 2")
+        guard case .openSearchResult(let index) = result else {
+            XCTFail("Expected openSearchResult intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(index, 2)
+    }
+
+    func test_detectIntent_openSearchResult_ordinal() {
+        let result = sut.detectIntent(from: "open the third result")
+        guard case .openSearchResult(let index) = result else {
+            XCTFail("Expected openSearchResult intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(index, 3)
+    }
+
+    // MARK: - Notes Detection
+
+    func test_detectIntent_createNote() {
+        let result = sut.detectIntent(from: "create a note called Shopping List")
+        guard case .createNote(let title, _) = result else {
+            XCTFail("Expected createNote intent, got \(String(describing: result))")
+            return
+        }
+        // IntentDetector lowercases input, so title is lowercased
+        XCTAssertEqual(title?.lowercased(), "shopping list")
+    }
+
+    func test_detectIntent_deleteNote() {
+        let result = sut.detectIntent(from: "delete my shopping list note")
+        guard case .deleteNote(let title) = result else {
+            XCTFail("Expected deleteNote intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertTrue(title.lowercased().contains("shopping"))
+    }
+
+    // MARK: - File Detection
+
+    func test_detectIntent_searchFiles() {
+        let result = sut.detectIntent(from: "find files named resume")
+        guard case .searchFiles(let query, _) = result else {
+            XCTFail("Expected searchFiles intent, got \(String(describing: result))")
+            return
+        }
+        XCTAssertTrue(query.lowercased().contains("resume"))
+    }
+
+    // MARK: - Intent Description
+
+    func test_intentDescription_notEmpty() {
+        // All intent descriptions should be non-empty strings
+        let intents: [IntentDetector.Intent] = [
+            .launchApp(appName: "Safari"),
+            .openURL(url: "https://example.com"),
+            .conversation,
+            .morningBriefing,
+            .screenContext,
+            .listRunningApps,
+            .webSearch(query: "test"),
+            .forgetMemory(query: "test"),
+            .forgetMemory(query: "old stuff"),
+        ]
+        for intent in intents {
+            XCTAssertFalse(intent.description.isEmpty, "Intent description should not be empty for \(intent)")
+        }
+    }
+
+    // MARK: - Case Insensitivity
+
+    func test_detectIntent_caseInsensitive() {
+        // "OPEN SAFARI" should work the same as "open safari"
+        let upper = sut.detectIntent(from: "OPEN SAFARI")
+        let lower = sut.detectIntent(from: "open safari")
+
+        guard case .launchApp = upper, case .launchApp = lower else {
+            XCTFail("Intent detection should be case insensitive")
+            return
+        }
+    }
+
+    // MARK: - Priority / Ordering
+
+    func test_detectIntent_emailBeforeURL() {
+        // "email john@example.com" should be email, not URL
+        let result = sut.detectIntent(from: "email john@example.com")
+        guard case .composeEmail = result else {
+            XCTFail("Email detection should take priority over URL detection, got \(String(describing: result))")
+            return
+        }
+    }
+
+    func test_detectIntent_reminderBeforeCalendar() {
+        // "remind me about the meeting" should be reminder, not calendar
+        let result = sut.detectIntent(from: "remind me about the meeting")
+        guard case .createReminder = result else {
+            XCTFail("Reminder should take priority over calendar, got \(String(describing: result))")
+            return
+        }
+    }
+
+    // MARK: - MusicAction Enum
+
+    func test_musicAction_rawValues() {
+        XCTAssertEqual(IntentDetector.MusicAction.play.rawValue, "play")
+        XCTAssertEqual(IntentDetector.MusicAction.pause.rawValue, "pause")
+        XCTAssertEqual(IntentDetector.MusicAction.stop.rawValue, "stop")
+        XCTAssertEqual(IntentDetector.MusicAction.next.rawValue, "next")
+        XCTAssertEqual(IntentDetector.MusicAction.previous.rawValue, "previous")
+        XCTAssertEqual(IntentDetector.MusicAction.shuffle.rawValue, "shuffle")
+        XCTAssertEqual(IntentDetector.MusicAction.volumeUp.rawValue, "volumeUp")
+        XCTAssertEqual(IntentDetector.MusicAction.volumeDown.rawValue, "volumeDown")
+    }
+
+    // MARK: - Debug Logging Gate
+
+    func test_debugLoggingIsGated() {
+        XCTAssertTrue(IntentDetector.debugLoggingIsGated, "Debug logging should be gated by DebugSettings.fileLoggingEnabled")
+    }
+}

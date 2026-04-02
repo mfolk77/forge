@@ -1,0 +1,13 @@
+{
+  "name": "plugin-manager",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/manager.rs",
+  "line_count": 447,
+  "why": "Plugin lifecycle: load, install, uninstall, path validation",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

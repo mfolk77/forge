@@ -1,0 +1,313 @@
+import Foundation
+import os.log
+
+// MARK: - MCP Client Manager
+// Manages multiple MCP server connections
+// Provides server registration, connection lifecycle, and tool routing
+
+/// Configuration for an MCP server
+public struct MCPServerConfig: Sendable {
+    public let name: String
+    public let command: String
+    public let args: [String]
+    public let env: [String: String]
+
+    public init(name: String, command: String, args: [String], env: [String: String] = [:]) {
+        self.name = name
+        self.command = command
+        self.args = args
+        self.env = env
+    }
+}
+
+/// Manager for multiple MCP server connections
+public actor MCPClientManager {
+    private let logger = Logger(subsystem: "com.serenanet.mcp", category: "MCPClientManager")
+
+    // Singleton
+    public static let shared = MCPClientManager()
+
+    // Server configurations
+    private var serverConfigs: [String: MCPServerConfig] = [:]
+
+    // Active clients
+    private var clients: [String: MCPClient] = [:]
+
+    // Tool to server mapping (cached for fast lookup)
+    private var toolServerMap: [String: String] = [:]
+
+    private init() {}
+
+    // MARK: - Server Registration
+
+    /// Register an MCP server configuration
+    public func registerServer(_ config: MCPServerConfig) {
+        logger.info("Registering MCP server: \(config.name)")
+        serverConfigs[config.name] = config
+    }
+
+    /// Unregister an MCP server
+    public func unregisterServer(name: String) async throws {
+        // Disconnect if connected
+        if clients[name] != nil {
+            try await disconnect(serverName: name)
+        }
+        serverConfigs.removeValue(forKey: name)
+        logger.info("Unregistered MCP server: \(name)")
+    }
+
+    /// Get all registered server names
+    public var registeredServers: [String] {
+        return Array(serverConfigs.keys)
+    }
+
+    /// Get all connected server names
+    public var connectedServers: [String] {
+        return Array(clients.keys)
+    }
+
+    // MARK: - Connection Management
+
+    /// Connect to an MCP server
+    public func connect(serverName: String) async throws {
+        guard let config = serverConfigs[serverName] else {
+            throw MCPError.serverNotFound(serverName)
+        }
+
+        // Already connected?
+        if let existingClient = clients[serverName], await existingClient.isConnected {
+            logger.info("Server \(serverName) already connected")
+            return
+        }
+
+        logger.info("Connecting to MCP server: \(serverName)")
+
+        // Create transport
+        let transport = StdioTransport(
+            executablePath: config.command,
+            arguments: config.args,
+            environment: config.env
+        )
+
+        // Create client
+        let client = MCPClient(transport: transport)
+
+        // Connect
+        try await client.connect()
+
+        // Store client
+        clients[serverName] = client
+
+        // Update tool mapping
+        try await updateToolMapping(for: serverName)
+
+        logger.info("Connected to MCP server: \(serverName)")
+    }
+
+    /// Disconnect from an MCP server
+    public func disconnect(serverName: String) async throws {
+        guard let client = clients[serverName] else {
+            logger.warning("Server \(serverName) not connected")
+            return
+        }
+
+        logger.info("Disconnecting from MCP server: \(serverName)")
+
+        try await client.disconnect()
+        clients.removeValue(forKey: serverName)
+
+        // Remove tool mappings for this server
+        toolServerMap = toolServerMap.filter { $0.value != serverName }
+
+        logger.info("Disconnected from MCP server: \(serverName)")
+    }
+
+    /// Disconnect from all MCP servers
+    public func disconnectAll() async throws {
+        logger.info("Disconnecting from all MCP servers")
+
+        for serverName in clients.keys {
+            try await disconnect(serverName: serverName)
+        }
+
+        logger.info("Disconnected from all MCP servers")
+    }
+
+    /// Get the client for a server
+    public func client(for serverName: String) -> MCPClient? {
+        return clients[serverName]
+    }
+
+    // MARK: - Tool Operations
+
+    /// List all tools from all connected servers
+    /// Gracefully skips servers that don't support tools
+    public func listAllTools() async throws -> [(server: String, tool: MCPTool)] {
+        var allTools: [(server: String, tool: MCPTool)] = []
+
+        for (serverName, client) in clients {
+            // Check if server supports tools before listing
+            guard let capabilities = await client.capabilities, capabilities.supportsTools else {
+                logger.debug("Server \(serverName) doesn't support tools, skipping")
+                continue
+            }
+
+            do {
+                let tools = try await client.listTools()
+                for tool in tools {
+                    allTools.append((server: serverName, tool: tool))
+                }
+            } catch {
+                logger.warning("Failed to list tools from \(serverName): \(error.localizedDescription)")
+                // Continue to next server instead of failing completely
+            }
+        }
+
+        return allTools
+    }
+
+    /// Call a tool on a specific server
+    public func callTool(
+        serverName: String,
+        toolName: String,
+        arguments: [String: Any] = [:]
+    ) async throws -> MCPToolResult {
+        guard let client = clients[serverName] else {
+            throw MCPError.serverNotFound(serverName)
+        }
+
+        return try await client.callTool(name: toolName, arguments: arguments)
+    }
+
+    /// Call a tool by name (auto-routes to correct server)
+    public func callTool(
+        name: String,
+        arguments: [String: Any] = [:]
+    ) async throws -> MCPToolResult {
+        guard let serverName = toolServerMap[name] else {
+            throw MCPError.unknownTool(name)
+        }
+
+        return try await callTool(serverName: serverName, toolName: name, arguments: arguments)
+    }
+
+    /// Find which server provides a tool
+    public func serverForTool(name: String) -> String? {
+        return toolServerMap[name]
+    }
+
+    // MARK: - Resource Operations
+
+    /// List all resources from all connected servers
+    public func listAllResources() async throws -> [(server: String, resource: MCPResource)] {
+        var allResources: [(server: String, resource: MCPResource)] = []
+
+        for (serverName, client) in clients {
+            if let capabilities = await client.capabilities, capabilities.supportsResources {
+                let resources = try await client.listResources()
+                for resource in resources {
+                    allResources.append((server: serverName, resource: resource))
+                }
+            }
+        }
+
+        return allResources
+    }
+
+    // MARK: - Private Methods
+
+    private func updateToolMapping(for serverName: String) async throws {
+        guard let client = clients[serverName] else { return }
+
+        // Check if server supports tools before listing
+        guard let capabilities = await client.capabilities, capabilities.supportsTools else {
+            logger.debug("Server \(serverName) doesn't support tools, skipping tool mapping")
+            return
+        }
+
+        do {
+            let tools = try await client.listTools()
+            for tool in tools {
+                toolServerMap[tool.name] = serverName
+            }
+            logger.info("Updated tool mapping: \(tools.count) tools from \(serverName)")
+        } catch {
+            logger.warning("Failed to update tool mapping for \(serverName): \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Common Server Configurations
+
+extension MCPClientManager {
+    /// Set up the Notion MCP server
+    public func setupNotionServer(apiKey: String) {
+        let config = MCPServerConfig(
+            name: "notion",
+            command: findNpx() ?? "/usr/local/bin/npx",
+            args: ["-y", "@modelcontextprotocol/server-notion"],
+            env: ["NOTION_API_KEY": apiKey]
+        )
+        registerServer(config)
+    }
+
+    /// Set up the GitHub MCP server
+    public func setupGitHubServer(token: String) {
+        let config = MCPServerConfig(
+            name: "github",
+            command: findNpx() ?? "/usr/local/bin/npx",
+            args: ["-y", "@modelcontextprotocol/server-github"],
+            env: ["GITHUB_PERSONAL_ACCESS_TOKEN": token]
+        )
+        registerServer(config)
+    }
+
+    /// Set up the filesystem MCP server
+    public func setupFilesystemServer(allowedPaths: [String]) {
+        var args = ["-y", "@modelcontextprotocol/server-filesystem"]
+        args.append(contentsOf: allowedPaths)
+
+        let config = MCPServerConfig(
+            name: "filesystem",
+            command: findNpx() ?? "/usr/local/bin/npx",
+            args: args,
+            env: [:]
+        )
+        registerServer(config)
+    }
+
+    /// Set up the Slack MCP server
+    public func setupSlackServer(botToken: String, teamId: String) {
+        let config = MCPServerConfig(
+            name: "slack",
+            command: findNpx() ?? "/usr/local/bin/npx",
+            args: ["-y", "@modelcontextprotocol/server-slack"],
+            env: [
+                "SLACK_BOT_TOKEN": botToken,
+                "SLACK_TEAM_ID": teamId
+            ]
+        )
+        registerServer(config)
+    }
+
+    /// Set up the Google Drive MCP server
+    public func setupGoogleDriveServer(credentials: String) {
+        let config = MCPServerConfig(
+            name: "gdrive",
+            command: findNpx() ?? "/usr/local/bin/npx",
+            args: ["-y", "@modelcontextprotocol/server-gdrive"],
+            env: ["GDRIVE_CREDENTIALS": credentials]
+        )
+        registerServer(config)
+    }
+
+    // Find npx in common locations
+    private func findNpx() -> String? {
+        let paths = [
+            "/usr/local/bin/npx",
+            "/opt/homebrew/bin/npx",
+            "/usr/bin/npx"
+        ]
+        return paths.first { FileManager.default.fileExists(atPath: $0) }
+    }
+}

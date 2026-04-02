@@ -1,0 +1,13 @@
+{
+  "name": "encryption-manager-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/EncryptionManagerRedTests.swift",
+  "line_count": 244,
+  "why": "AES-GCM, nonce uniqueness, key rejection",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,12 @@
+{
+  "name": "search-store",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/search/store.rs",
+  "line_count": 372,
+  "why": "Vector store interface, cosine similarity",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

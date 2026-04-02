@@ -1,0 +1,170 @@
+import Foundation
+import os.log
+
+final class LoggingManager: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = LoggingManager()
+    
+    private let logger = Logger(subsystem: "com.serenanet.app", category: "general")
+    private let errorLogger = Logger(subsystem: "com.serenanet.app", category: "error")
+    private let securityLogger = Logger(subsystem: "com.serenanet.app", category: "security")
+    
+    private var isLoggingEnabled: Bool {
+        return UserDefaults.standard.bool(forKey: "SerenaNet.LocalLogging")
+    }
+    
+    private init() {}
+    
+    // MARK: - Public Logging Methods
+    
+    func log(_ message: String, category: LogCategory = .general, level: LogLevel = .info) {
+        guard isLoggingEnabled else { return }
+        
+        let logMessage = formatMessage(message, category: category, level: level)
+        
+        switch category {
+        case .general:
+            logWithLevel(logger, message: logMessage, level: level)
+        case .error:
+            logWithLevel(errorLogger, message: logMessage, level: level)
+        case .security:
+            logWithLevel(securityLogger, message: logMessage, level: level)
+        }
+    }
+    
+    func logError(_ error: Error, context: String = "", file: String = #file, function: String = #function, line: Int = #line) {
+        guard isLoggingEnabled else { return }
+        
+        let fileName = URL(fileURLWithPath: file).lastPathComponent
+        let errorMessage = "[\(fileName):\(line)] \(function) - \(context): \(error.localizedDescription)"
+        
+        log(errorMessage, category: .error, level: .error)
+    }
+    
+    func logSecurityEvent(_ event: String, details: String = "") {
+        guard isLoggingEnabled else { return }
+        
+        let securityMessage = "Security Event: \(event)"
+        let fullMessage = details.isEmpty ? securityMessage : "\(securityMessage) - \(details)"
+        
+        log(fullMessage, category: .security, level: .info)
+    }
+    
+    // MARK: - Log Management
+    
+    func enableLogging() {
+        UserDefaults.standard.set(true, forKey: "SerenaNet.LocalLogging")
+        log("Logging enabled by user", category: .general, level: .info)
+    }
+    
+    func disableLogging() {
+        log("Logging disabled by user", category: .general, level: .info)
+        UserDefaults.standard.set(false, forKey: "SerenaNet.LocalLogging")
+    }
+    
+    func clearLogs() {
+        // Note: os.log doesn't provide a direct way to clear logs
+        // This is a placeholder for future implementation if needed
+        log("Log clear requested", category: .general, level: .info)
+    }
+    
+    func getLogStatus() -> LogStatus {
+        return LogStatus(
+            isEnabled: isLoggingEnabled,
+            lastLogTime: getLastLogTime(),
+            estimatedLogSize: getEstimatedLogSize()
+        )
+    }
+    
+    // MARK: - Privacy Compliance
+    
+    func logWithPrivacyRedaction(_ message: String, category: LogCategory = .general, level: LogLevel = .info) {
+        guard isLoggingEnabled else { return }
+        
+        // Redact potentially sensitive information
+        let redactedMessage = redactSensitiveData(message)
+        log(redactedMessage, category: category, level: level)
+    }
+    
+    // MARK: - Private Methods
+    
+    private func logWithLevel(_ logger: Logger, message: String, level: LogLevel) {
+        switch level {
+        case .debug:
+            logger.debug("\(message, privacy: .public)")
+        case .info:
+            logger.info("\(message, privacy: .public)")
+        case .warning:
+            logger.warning("\(message, privacy: .public)")
+        case .error:
+            logger.error("\(message, privacy: .public)")
+        case .fault:
+            logger.fault("\(message, privacy: .public)")
+        }
+    }
+    
+    private func formatMessage(_ message: String, category: LogCategory, level: LogLevel) -> String {
+        let timestamp = DateFormatter.logFormatter.string(from: Date())
+        return "[\(timestamp)] [\(level.rawValue.uppercased())] [\(category.rawValue.uppercased())] \(message)"
+    }
+    
+    private func redactSensitiveData(_ message: String) -> String {
+        var redacted = message
+        
+        // Redact potential passwords, tokens, keys
+        let sensitivePatterns = [
+            "password[\"']?\\s*[:=]\\s*[\"']?([^\"'\\s,}]+)",
+            "token[\"']?\\s*[:=]\\s*[\"']?([^\"'\\s,}]+)",
+            "key[\"']?\\s*[:=]\\s*[\"']?([^\"'\\s,}]+)",
+            "secret[\"']?\\s*[:=]\\s*[\"']?([^\"'\\s,}]+)"
+        ]
+        
+        for pattern in sensitivePatterns {
+            redacted = redacted.replacingOccurrences(
+                of: pattern,
+                with: "$0[REDACTED]",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+        
+        return redacted
+    }
+    
+    private func getLastLogTime() -> Date? {
+        return UserDefaults.standard.object(forKey: "SerenaNet.LastLogTime") as? Date
+    }
+    
+    private func getEstimatedLogSize() -> Int64 {
+        // This is an estimate since os.log doesn't provide direct size access
+        return UserDefaults.standard.object(forKey: "SerenaNet.EstimatedLogSize") as? Int64 ?? 0
+    }
+}
+
+// MARK: - Supporting Types
+
+enum LogCategory: String, CaseIterable {
+    case general = "general"
+    case error = "error"
+    case security = "security"
+}
+
+enum LogLevel: String, CaseIterable {
+    case debug = "debug"
+    case info = "info"
+    case warning = "warning"
+    case error = "error"
+    case fault = "fault"
+}
+
+struct LogStatus {
+    let isEnabled: Bool
+    let lastLogTime: Date?
+    let estimatedLogSize: Int64
+}
+
+extension DateFormatter {
+    static let logFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return formatter
+    }()
+}

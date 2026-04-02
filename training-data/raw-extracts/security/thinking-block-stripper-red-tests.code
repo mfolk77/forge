@@ -1,0 +1,119 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Verify that plain-text thinking/reasoning from Qwen 3.5 is stripped
+/// before display. The model leaks reasoning in multiple formats:
+///   1. "Thinking Process:\n1. **Analyze..."
+///   2. "Okay, let me start by understanding..."
+///   3. References to "system prompt", "RTAI", "remembered facts"
+///
+/// Target file: Sources/SerenaCore/Services/ChatManager.swift (stripPlainTextThinking)
+@MainActor
+final class ThinkingBlockStripperRedTests: XCTestCase {
+
+    // MARK: - Format 1: "Thinking Process:" Header
+
+    func test_strip_thinkingProcessHeader() {
+        let modelOutput = """
+        Thinking Process:
+
+        1. **Analyze the Request:** The user is asking "what is my wifes name".
+
+        2. **Check Facts:** wife's name: Sarah
+
+        Your wife's name is Sarah.
+        """
+
+        let stripped = ChatManager.stripPlainTextThinking(modelOutput)
+
+        XCTAssertTrue(stripped.contains("Sarah"), "Answer should be preserved")
+        XCTAssertFalse(stripped.lowercased().contains("thinking process"), "Thinking header should be stripped")
+        XCTAssertFalse(stripped.contains("Analyze the Request"), "Reasoning steps should be stripped")
+    }
+
+    // MARK: - Format 2: "Okay, let me..." Preamble with Internal Leaks
+
+    func test_strip_okayLetMeWithSystemReferences() {
+        let modelOutput = """
+        Okay, let me start by understanding the user's message. They're correcting my previous answer about their wife's name. I had said Sarah, but they insist on Christina. Wait a minute, looking back at the conversation history provided in the system prompt, there's a remembered fact that says "wife's name: Christina". So why did I initially answer incorrectly?
+
+        Wait, but according to the instructions, I need to check if there are any new personal facts in this current message.
+
+        In this case, since "wife's name: Christina" was already a known fact from before (from RTAI library), there shouldn't be any new personal facts added now.
+
+        I apologize for the confusion earlier. Your wife's name is Christina.
+        """
+
+        let stripped = ChatManager.stripPlainTextThinking(modelOutput)
+
+        XCTAssertTrue(stripped.contains("Christina"), "Answer should be preserved")
+        XCTAssertFalse(stripped.lowercased().contains("system prompt"), "System prompt reference should be stripped")
+        XCTAssertFalse(stripped.lowercased().contains("rtai library"), "RTAI reference should be stripped")
+        XCTAssertFalse(stripped.lowercased().contains("according to the instructions"), "Instruction reference should be stripped")
+        XCTAssertFalse(stripped.lowercased().contains("okay, let me"), "Reasoning preamble should be stripped")
+    }
+
+    // MARK: - Format 3: "Wait," Self-Correction Chains
+
+    func test_strip_waitSelfCorrectionChain() {
+        let modelOutput = """
+        Wait, the user says their wife's name is Christina. But the remembered facts in the system prompt say "wife's name: Sarah". The user is correcting me.
+
+        Wait but looking back at the RTAI library, the stored fact was actually Christina all along.
+
+        Your wife's name is Christina. I apologize for the earlier confusion.
+        """
+
+        let stripped = ChatManager.stripPlainTextThinking(modelOutput)
+
+        XCTAssertTrue(stripped.contains("Christina"), "Answer should be preserved")
+        XCTAssertFalse(stripped.lowercased().contains("system prompt"), "System reference should be stripped")
+        XCTAssertFalse(stripped.lowercased().contains("rtai"), "RTAI reference should be stripped")
+    }
+
+    // MARK: - Safety: Don't Strip Valid Content
+
+    func test_passthrough_normalResponse() {
+        let normal = "Your wife's name is Sarah. Is there anything else you'd like to know?"
+        let stripped = ChatManager.stripPlainTextThinking(normal)
+        XCTAssertEqual(stripped, normal, "Normal response should be unchanged")
+    }
+
+    func test_passthrough_emptyString() {
+        let stripped = ChatManager.stripPlainTextThinking("")
+        XCTAssertEqual(stripped, "", "Empty input should return empty")
+    }
+
+    func test_passthrough_shortReasoningPreambleWithoutLeaks() {
+        // Short "let me" that doesn't reference internals — could be conversational
+        let response = "Let me check that for you. Your wife's name is Christina."
+        let stripped = ChatManager.stripPlainTextThinking(response)
+        XCTAssertEqual(stripped, response, "Short conversational preamble without leaks should pass through")
+    }
+
+    // MARK: - Edge Cases
+
+    func test_strip_reasoningOnly_noAnswer_returnsEmpty() {
+        let thinkingOnly = """
+        Okay, let me analyze the system prompt. The remembered facts section shows wife's name: Christina. According to the instructions, I should use this fact.
+        """
+
+        let stripped = ChatManager.stripPlainTextThinking(thinkingOnly)
+        // During streaming, should return empty to hide reasoning until answer emerges
+        XCTAssertTrue(stripped.isEmpty, "Reasoning-only text should return empty (streaming hides it)")
+    }
+
+    func test_strip_multipleInternalReferences() {
+        let modelOutput = """
+        Let me start by understanding this. The system prompt says I should be concise. The remembered facts from RTAI library include the wife's name. According to the instructions, I should acknowledge corrections. The prompt context also mentions being warm.
+
+        Got it, your wife's name is Christina.
+        """
+
+        let stripped = ChatManager.stripPlainTextThinking(modelOutput)
+
+        XCTAssertTrue(stripped.lowercased().contains("christina"), "Answer should be preserved")
+        XCTAssertFalse(stripped.lowercased().contains("system prompt"), "Should strip system prompt reference")
+        XCTAssertFalse(stripped.lowercased().contains("rtai"), "Should strip RTAI reference")
+    }
+}

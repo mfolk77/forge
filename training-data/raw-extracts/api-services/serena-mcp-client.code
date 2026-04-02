@@ -1,0 +1,420 @@
+import Foundation
+import os.log
+
+// MARK: - MCP Client
+// High-level client for communicating with MCP servers
+// Handles JSON-RPC protocol, request correlation, and timeouts
+
+/// Client for communicating with an MCP server
+public actor MCPClient {
+    private let logger = Logger(subsystem: "com.serenanet.mcp", category: "MCPClient")
+
+    // Transport
+    private let transport: MCPTransport
+    private let config: MCPTransportConfig
+
+    // Request management
+    private var requestId: Int = 0
+    private var pendingRequests: [Int: CheckedContinuation<JSONRPCResponse, Error>] = [:]
+
+    // State
+    private var serverCapabilities: MCPServerCapabilities?
+    private var serverInfo: MCPServerInfo?
+    private var isInitialized: Bool = false
+    private var receiveTask: Task<Void, Never>?
+
+    /// Server capabilities (available after connect)
+    public var capabilities: MCPServerCapabilities? {
+        return serverCapabilities
+    }
+
+    /// Server info (available after connect)
+    public var info: MCPServerInfo? {
+        return serverInfo
+    }
+
+    /// Whether the client is connected and initialized
+    public var isConnected: Bool {
+        return transport.isConnected && isInitialized
+    }
+
+    /// Initialize an MCP client with the given transport
+    public init(transport: MCPTransport, config: MCPTransportConfig = .default) {
+        self.transport = transport
+        self.config = config
+    }
+
+    // MARK: - Connection Lifecycle
+
+    /// Connect to the MCP server and perform initialization handshake
+    public func connect() async throws {
+        logger.info("Connecting to MCP server...")
+
+        // Start transport
+        try await transport.start()
+
+        // Start receiving messages
+        startReceiving()
+
+        // Perform MCP initialization handshake
+        let initParams = MCPInitializeParams()
+        let response = try await sendRequest(method: "initialize", params: [
+            "protocolVersion": AnyCodable(initParams.protocolVersion),
+            "capabilities": AnyCodable([String: Any]()),
+            "clientInfo": AnyCodable([
+                "name": initParams.clientInfo.name,
+                "version": initParams.clientInfo.version
+            ])
+        ])
+
+        // Parse initialization result
+        let result: MCPInitializeResult = try response.decodeResult(as: MCPInitializeResult.self)
+        serverCapabilities = result.capabilities
+        serverInfo = result.serverInfo
+
+        logger.info("Server: \(result.serverInfo.name) v\(result.serverInfo.version)")
+        logger.info("Protocol version: \(result.protocolVersion)")
+
+        // Send initialized notification
+        try await sendNotification(method: "notifications/initialized")
+
+        isInitialized = true
+        logger.info("MCP client connected and initialized")
+    }
+
+    /// Disconnect from the MCP server
+    public func disconnect() async throws {
+        logger.info("Disconnecting from MCP server...")
+
+        isInitialized = false
+        serverCapabilities = nil
+        serverInfo = nil
+
+        // Cancel receive task
+        receiveTask?.cancel()
+        receiveTask = nil
+
+        // Cancel all pending requests
+        for (id, continuation) in pendingRequests {
+            logger.warning("Cancelling pending request \(id)")
+            continuation.resume(throwing: MCPError.cancelled)
+        }
+        pendingRequests.removeAll()
+
+        // Stop transport
+        try await transport.stop()
+
+        logger.info("MCP client disconnected")
+    }
+
+    // MARK: - Tools API
+
+    /// List available tools from the server
+    public func listTools() async throws -> [MCPTool] {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsTools == true else {
+            throw MCPError.capabilityNotSupported("tools")
+        }
+
+        let response = try await sendRequest(method: "tools/list")
+        let result: MCPToolListResult = try response.decodeResult(as: MCPToolListResult.self)
+
+        logger.info("Listed \(result.tools.count) tools")
+        return result.tools
+    }
+
+    /// Call a tool on the server
+    public func callTool(name: String, arguments: [String: Any] = [:]) async throws -> MCPToolResult {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsTools == true else {
+            throw MCPError.capabilityNotSupported("tools")
+        }
+
+        logger.info("Calling tool: \(name)")
+
+        let params: [String: AnyCodable] = [
+            "name": AnyCodable(name),
+            "arguments": AnyCodable(arguments)
+        ]
+
+        let response = try await sendRequest(method: "tools/call", params: params)
+        let result: MCPToolResult = try response.decodeResult(as: MCPToolResult.self)
+
+        if result.isError == true {
+            logger.warning("Tool \(name) returned error: \(result.textContent)")
+        } else {
+            logger.info("Tool \(name) completed successfully")
+        }
+
+        return result
+    }
+
+    // MARK: - Resources API
+
+    /// List available resources from the server
+    public func listResources() async throws -> [MCPResource] {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsResources == true else {
+            throw MCPError.capabilityNotSupported("resources")
+        }
+
+        let response = try await sendRequest(method: "resources/list")
+        let result: MCPResourceListResult = try response.decodeResult(as: MCPResourceListResult.self)
+
+        logger.info("Listed \(result.resources.count) resources")
+        return result.resources
+    }
+
+    /// Read a resource from the server
+    public func readResource(uri: String) async throws -> MCPResourceContent {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsResources == true else {
+            throw MCPError.capabilityNotSupported("resources")
+        }
+
+        logger.info("Reading resource: \(uri)")
+
+        let response = try await sendRequest(method: "resources/read", params: [
+            "uri": AnyCodable(uri)
+        ])
+        let result: MCPResourceReadResult = try response.decodeResult(as: MCPResourceReadResult.self)
+
+        guard let content = result.contents.first else {
+            throw MCPError.invalidResponse
+        }
+
+        return content
+    }
+
+    // MARK: - Prompts API
+
+    /// List available prompts from the server
+    public func listPrompts() async throws -> [MCPPrompt] {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsPrompts == true else {
+            throw MCPError.capabilityNotSupported("prompts")
+        }
+
+        let response = try await sendRequest(method: "prompts/list")
+        let result: MCPPromptListResult = try response.decodeResult(as: MCPPromptListResult.self)
+
+        logger.info("Listed \(result.prompts.count) prompts")
+        return result.prompts
+    }
+
+    /// Get a prompt with arguments
+    public func getPrompt(name: String, arguments: [String: String] = [:]) async throws -> MCPPromptResult {
+        guard isConnected else { throw MCPError.notConnected }
+        guard serverCapabilities?.supportsPrompts == true else {
+            throw MCPError.capabilityNotSupported("prompts")
+        }
+
+        logger.info("Getting prompt: \(name)")
+
+        let response = try await sendRequest(method: "prompts/get", params: [
+            "name": AnyCodable(name),
+            "arguments": AnyCodable(arguments)
+        ])
+
+        return try response.decodeResult(as: MCPPromptResult.self)
+    }
+
+    // MARK: - Health Check API
+
+    /// Ping the server to verify connection is alive
+    /// Returns true if server responds, throws on timeout or error
+    public func ping() async throws -> Bool {
+        guard transport.isConnected else { throw MCPError.notConnected }
+
+        logger.debug("Pinging MCP server...")
+
+        // MCP ping is a simple request that expects an empty response
+        let response = try await sendRequest(method: "ping")
+
+        // Ping succeeds if we get any response (even empty)
+        logger.debug("Ping successful")
+        return response.isSuccess || response.result != nil
+    }
+
+    /// Check if connection is healthy (connected + server responds to ping)
+    public func isHealthy() async -> Bool {
+        guard isConnected else { return false }
+
+        do {
+            return try await ping()
+        } catch {
+            logger.warning("Health check failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Perform health check with custom timeout
+    public func healthCheck(timeout: TimeInterval = 5.0) async -> HealthCheckResult {
+        guard transport.isConnected else {
+            return HealthCheckResult(isHealthy: false, latencyMs: nil, error: "Not connected")
+        }
+
+        let startTime = Date()
+
+        do {
+            _ = try await withTimeout(seconds: timeout) {
+                try await self.ping()
+            }
+            let latencyMs = Date().timeIntervalSince(startTime) * 1000
+            return HealthCheckResult(isHealthy: true, latencyMs: latencyMs, error: nil)
+        } catch {
+            return HealthCheckResult(isHealthy: false, latencyMs: nil, error: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Low-Level API
+
+    /// Send a JSON-RPC request and wait for response
+    public func sendRequest(
+        method: String,
+        params: [String: AnyCodable]? = nil
+    ) async throws -> JSONRPCResponse {
+        guard transport.isConnected else {
+            throw MCPError.notConnected
+        }
+
+        // Generate request ID
+        requestId += 1
+        let id = requestId
+
+        // Create request
+        let request = JSONRPCRequest(id: id, method: method, params: params)
+
+        // Encode and send
+        let data = try request.encodeToLine()
+        try await transport.send(data)
+
+        // Wait for response with timeout
+        return try await withTimeout(seconds: config.requestTimeout) {
+            try await withCheckedThrowingContinuation { continuation in
+                self.pendingRequests[id] = continuation
+            }
+        }
+    }
+
+    /// Send a JSON-RPC notification (no response expected)
+    public func sendNotification(
+        method: String,
+        params: [String: AnyCodable]? = nil
+    ) async throws {
+        guard transport.isConnected else {
+            throw MCPError.notConnected
+        }
+
+        let notification = JSONRPCNotification(method: method, params: params)
+        let data = try notification.encodeToLine()
+        try await transport.send(data)
+    }
+
+    // MARK: - Private Methods
+
+    private func startReceiving() {
+        receiveTask = Task {
+            let stream = transport.receive()
+
+            for await data in stream {
+                await handleReceivedData(data)
+            }
+
+            logger.info("Receive loop ended")
+        }
+    }
+
+    private func handleReceivedData(_ data: Data) {
+        do {
+            let decoder = JSONDecoder()
+            let response = try decoder.decode(JSONRPCResponse.self, from: data)
+
+            if let id = response.id {
+                // This is a response to a request
+                if let continuation = pendingRequests.removeValue(forKey: id) {
+                    if let error = response.error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: response)
+                    }
+                } else {
+                    logger.warning("Received response for unknown request ID: \(id)")
+                }
+            } else {
+                // This is a notification from the server
+                handleServerNotification(response)
+            }
+        } catch {
+            logger.error("Failed to decode response: \(error.localizedDescription)")
+            if let text = String(data: data, encoding: .utf8) {
+                logger.error("Raw data: \(text)")
+            }
+        }
+    }
+
+    private func handleServerNotification(_ response: JSONRPCResponse) {
+        // Handle notifications from server (e.g., log messages, resource changes)
+        logger.debug("Received server notification")
+    }
+
+    /// Execute an async operation with a timeout
+    private func withTimeout<T>(
+        seconds: TimeInterval,
+        operation: @escaping () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw MCPError.timeout
+            }
+
+            guard let result = try await group.next() else {
+                throw MCPError.timeout
+            }
+
+            group.cancelAll()
+            return result
+        }
+    }
+}
+
+// MARK: - Health Check Result
+
+/// Result of an MCP health check
+public struct HealthCheckResult: Sendable {
+    /// Whether the server is healthy
+    public let isHealthy: Bool
+
+    /// Round-trip latency in milliseconds (if healthy)
+    public let latencyMs: Double?
+
+    /// Error message (if unhealthy)
+    public let error: String?
+
+    public init(isHealthy: Bool, latencyMs: Double?, error: String?) {
+        self.isHealthy = isHealthy
+        self.latencyMs = latencyMs
+        self.error = error
+    }
+}
+
+// MARK: - Convenience Extensions
+
+extension MCPClient {
+    /// Check if a specific tool is available
+    public func hasTool(named name: String) async throws -> Bool {
+        let tools = try await listTools()
+        return tools.contains { $0.name == name }
+    }
+
+    /// Get a tool by name
+    public func tool(named name: String) async throws -> MCPTool? {
+        let tools = try await listTools()
+        return tools.first { $0.name == name }
+    }
+}

@@ -1,0 +1,477 @@
+import Foundation
+import OSLog
+
+/// Coordinates the entire learning pipeline: analyze → extract → generate → register
+/// Part of the Adaptive Knowledge Engine (AKE) - System 1: Personal Learning
+actor LearningCoordinator {
+
+    // MARK: - Dependencies
+
+    private let conversationAnalyzer: ConversationAnalyzer
+    private let knowledgeExtractor: KnowledgeExtractor
+    private let ftaiGenerator: FTAIGenerator
+    private let dataStore: DataStore
+    private let logger = Logger(subsystem: "ai.folktech.serena", category: "LearningCoordinator")
+
+    // MARK: - RTAI Integration Statistics
+    private var rtaiPatternsRegistered: Int = 0
+
+    // MARK: - State
+
+    /// Track processed message IDs to avoid duplicate processing
+    private var processedMessageIDs: Set<String> = []
+
+    /// Track last analysis time for incremental processing
+    private var lastAnalysisTime: Date?
+
+    /// Internal mutable tracking for statistics
+    private var patternsDetected: Int = 0
+    private var knowledgeExtracted: Int = 0
+    private var ftaiFilesCreated: Int = 0
+    private var messagesProcessed: Int = 0
+    private var entriesByCategory: [KnowledgeCategory: Int] = [:]
+    private var needsReviewCount: Int = 0
+    private var lastRunTime: Date?
+
+    // MARK: - Configuration
+
+    /// Minimum messages before triggering analysis
+    private let minimumMessagesForAnalysis: Int = 10
+
+    /// Minimum time between analyses (seconds)
+    private let analysisDebounceInterval: TimeInterval = 300 // 5 minutes
+
+    // MARK: - Initialization
+
+    init(dataStore: DataStore, llmEngine: MixtralEngine) {
+        self.dataStore = dataStore
+        self.conversationAnalyzer = ConversationAnalyzer(dataStore: dataStore, llmEngine: llmEngine)
+        self.knowledgeExtractor = KnowledgeExtractor(dataStore: dataStore, llmEngine: llmEngine)
+        self.ftaiGenerator = FTAIGenerator()
+    }
+
+    /// Initialize with custom components (for testing)
+    init(
+        dataStore: DataStore,
+        conversationAnalyzer: ConversationAnalyzer,
+        knowledgeExtractor: KnowledgeExtractor,
+        ftaiGenerator: FTAIGenerator
+    ) {
+        self.dataStore = dataStore
+        self.conversationAnalyzer = conversationAnalyzer
+        self.knowledgeExtractor = knowledgeExtractor
+        self.ftaiGenerator = ftaiGenerator
+    }
+
+    // MARK: - Public API
+
+    /// Run full learning pipeline
+    /// - Returns: Array of created knowledge entries
+    func runLearningPipeline() async -> [KnowledgeEntry] {
+        logger.info("🧠 Starting learning pipeline...")
+        lastRunTime = Date()
+
+        // Step 1: Analyze conversations for patterns
+        logger.debug("Step 1: Analyzing conversations for patterns...")
+        let patterns: [PatternCandidate]
+
+        if let lastTime = lastAnalysisTime {
+            patterns = await conversationAnalyzer.analyzePatterns(since: lastTime)
+            logger.info("Found \(patterns.count) new patterns since \(lastTime)")
+        } else {
+            patterns = await conversationAnalyzer.analyzePatterns()
+            logger.info("Found \(patterns.count) patterns (full analysis)")
+        }
+
+        patternsDetected += patterns.count
+
+        guard !patterns.isEmpty else {
+            logger.info("No patterns found, pipeline complete")
+            return []
+        }
+
+        // Step 2: Extract knowledge from patterns
+        logger.debug("Step 2: Extracting knowledge from \(patterns.count) patterns...")
+        var entries: [KnowledgeEntry] = []
+
+        for pattern in patterns {
+            // Yield to user inference — cancel learning if user is waiting
+            guard !Task.isCancelled else {
+                logger.info("Learning pipeline cancelled — user inference takes priority")
+                break
+            }
+            if let entry = await knowledgeExtractor.extractKnowledge(from: pattern) {
+                entries.append(entry)
+                logger.debug("Extracted knowledge: \(entry.entity)")
+            }
+        }
+
+        knowledgeExtracted += entries.count
+        logger.info("Extracted \(entries.count) knowledge entries from \(patterns.count) patterns")
+
+        guard !entries.isEmpty else {
+            logger.info("No knowledge extracted, pipeline complete")
+            lastAnalysisTime = Date()
+            return []
+        }
+
+        // Step 3: Generate FTAI files
+        logger.debug("Step 3: Generating FTAI files for \(entries.count) entries...")
+        var successfulEntries: [KnowledgeEntry] = []
+
+        for entry in entries {
+            do {
+                let filePath = try await ftaiGenerator.generate(from: entry)
+                successfulEntries.append(entry)
+                ftaiFilesCreated += 1
+
+                // Track by category
+                entriesByCategory[entry.category, default: 0] += 1
+
+                // Track needs review
+                if entry.needsReview {
+                    needsReviewCount += 1
+                }
+
+                logger.info("Created FTAI: \(filePath.lastPathComponent)")
+
+                // Step 4: Route through MitosisManager for clustering
+                if FeatureFlags.mitosisClusteringEnabled {
+                    let domain = mapToDomain(entry.category)
+                    await MitosisManager.shared.registerEntry(entry, domain: domain, subdomain: entry.entityType)
+                }
+
+                // Step 5: Register with RTAI for instant retrieval
+                await registerWithRTAI(entry: entry)
+
+            } catch {
+                logger.error("Failed to generate FTAI for '\(entry.entity)': \(error.localizedDescription)")
+            }
+        }
+
+        // Update last analysis time
+        lastAnalysisTime = Date()
+
+        logger.info("🧠 Learning pipeline complete: \(successfulEntries.count) entries created")
+        return successfulEntries
+    }
+
+    /// Process a single message (called on each new message)
+    /// - Parameter message: The new message to process
+    /// - Returns: True if learning was triggered
+    @discardableResult
+    func processMessage(_ message: Message) async -> Bool {
+        // Skip if already processed
+        let messageID = message.id.uuidString
+        guard !processedMessageIDs.contains(messageID) else {
+            return false
+        }
+
+        processedMessageIDs.insert(messageID)
+        messagesProcessed += 1
+
+        // Only analyze user messages
+        guard message.role == .user else {
+            return false
+        }
+
+        // Check if we should trigger analysis
+        let shouldAnalyze = await shouldTriggerAnalysis()
+
+        if shouldAnalyze {
+            logger.info("Triggering learning pipeline after message processing")
+            _ = await runLearningPipeline()
+            return true
+        }
+
+        return false
+    }
+
+    /// Process multiple messages in batch
+    /// - Parameter messages: Messages to process
+    /// - Returns: Number of new entries created
+    func processMessages(_ messages: [Message]) async -> Int {
+        logger.info("Processing batch of \(messages.count) messages")
+
+        // Mark all as processed
+        for message in messages {
+            processedMessageIDs.insert(message.id.uuidString)
+        }
+
+        // Filter to user messages only
+        let userMessages = messages.filter { $0.role == .user }
+        messagesProcessed += userMessages.count
+
+        // Run pipeline if we have enough messages
+        if userMessages.count >= minimumMessagesForAnalysis {
+            let entries = await runLearningPipeline()
+            return entries.count
+        }
+
+        return 0
+    }
+
+    /// Get current learning statistics
+    func getStatistics() -> LearningStatistics {
+        return LearningStatistics(
+            totalEntries: ftaiFilesCreated,
+            entriesByCategory: entriesByCategory,
+            needsReviewCount: needsReviewCount,
+            lastLearningRun: lastRunTime,
+            messagesAnalyzed: messagesProcessed
+        )
+    }
+
+    /// Teach content directly — bypasses message count and debounce thresholds.
+    /// Use when user explicitly provides teaching content (e.g. "learn this", "remember this article", long pastes).
+    /// Queues LLM extraction to run after current response completes to avoid MLX concurrency.
+    /// - Parameter content: The content to teach (press release, article, facts, etc.)
+    /// - Returns: Array of created knowledge entries
+    func teachDirectly(content: String) async -> [KnowledgeEntry] {
+        logger.info("🧠 Direct teaching requested (\(content.count) chars)")
+
+        // Create a synthetic message for the analyzer
+        let syntheticMessage = Message(content: content, role: .user)
+
+        // Mark as processed to avoid duplicate handling
+        processedMessageIDs.insert(syntheticMessage.id.uuidString)
+        messagesProcessed += 1
+
+        // Run the pipeline directly — no threshold checks
+        lastRunTime = Date()
+
+        // Step 1: Analyze the content for patterns (bypasses shouldTriggerAnalysis)
+        logger.debug("Direct teach: Analyzing content for patterns...")
+        let patterns = await conversationAnalyzer.analyzeForDirectTeaching([syntheticMessage])
+
+        patternsDetected += patterns.count
+
+        guard !patterns.isEmpty else {
+            logger.info("Direct teach: No patterns found in content")
+            // Still update analysis time so we don't re-analyze immediately
+            lastAnalysisTime = Date()
+            return []
+        }
+
+        // Step 2: Extract knowledge
+        logger.debug("Direct teach: Extracting knowledge from \(patterns.count) patterns...")
+        var entries: [KnowledgeEntry] = []
+
+        for pattern in patterns {
+            if let entry = await knowledgeExtractor.extractKnowledge(from: pattern) {
+                entries.append(entry)
+                logger.debug("Extracted knowledge: \(entry.entity)")
+            }
+        }
+
+        knowledgeExtracted += entries.count
+
+        guard !entries.isEmpty else {
+            logger.info("Direct teach: No knowledge extracted")
+            lastAnalysisTime = Date()
+            return []
+        }
+
+        // Step 3: Generate FTAI files + register with RTAI
+        logger.debug("Direct teach: Generating FTAI for \(entries.count) entries...")
+        var successfulEntries: [KnowledgeEntry] = []
+
+        for entry in entries {
+            do {
+                let filePath = try await ftaiGenerator.generate(from: entry)
+                successfulEntries.append(entry)
+                ftaiFilesCreated += 1
+                entriesByCategory[entry.category, default: 0] += 1
+                if entry.needsReview { needsReviewCount += 1 }
+                logger.info("Created FTAI: \(filePath.lastPathComponent)")
+                await registerWithRTAI(entry: entry)
+            } catch {
+                logger.error("Direct teach: Failed to generate FTAI for '\(entry.entity)': \(error.localizedDescription)")
+            }
+        }
+
+        lastAnalysisTime = Date()
+        logger.info("🧠 Direct teaching complete: \(successfulEntries.count) entries created from \(content.count) chars")
+        return successfulEntries
+    }
+
+    /// Reset learning state (for testing or user request)
+    func reset() {
+        processedMessageIDs.removeAll()
+        lastAnalysisTime = nil
+        patternsDetected = 0
+        knowledgeExtracted = 0
+        ftaiFilesCreated = 0
+        messagesProcessed = 0
+        entriesByCategory = [:]
+        needsReviewCount = 0
+        lastRunTime = nil
+        logger.info("Learning coordinator reset")
+    }
+
+    /// Check if a knowledge entry already exists
+    func knowledgeExists(for entity: String) async -> Bool {
+        // Check if FTAI file exists
+        let testEntry = KnowledgeEntry(
+            entity: entity,
+            entityType: "unknown",
+            category: .personal,
+            categoryConfidence: 1.0,
+            attributes: [:],
+            relationships: [:],
+            sourceMessages: [],
+            confidence: 1.0,
+            createdAt: Date(),
+            needsReview: false
+        )
+
+        return await ftaiGenerator.fileExists(for: testEntry)
+    }
+
+    /// Get detailed pipeline statistics
+    func getPipelineStats() -> (patterns: Int, extracted: Int, files: Int, messages: Int) {
+        return (patternsDetected, knowledgeExtracted, ftaiFilesCreated, messagesProcessed)
+    }
+
+    // MARK: - Private Methods
+
+    /// Determine if we should trigger a full analysis
+    private func shouldTriggerAnalysis() async -> Bool {
+        // Check debounce interval
+        if let lastTime = lastAnalysisTime {
+            let timeSinceLastAnalysis = Date().timeIntervalSince(lastTime)
+            if timeSinceLastAnalysis < self.analysisDebounceInterval {
+                logger.debug("Skipping analysis: only \(Int(timeSinceLastAnalysis))s since last analysis (threshold: \(Int(self.analysisDebounceInterval))s)")
+                return false
+            }
+        }
+
+        // Check if we have enough new messages
+        do {
+            let conversations = try await dataStore.loadConversations()
+            let totalMessages = conversations.reduce(0) { $0 + $1.messages.count }
+            let unprocessedCount = totalMessages - processedMessageIDs.count
+
+            if unprocessedCount >= self.minimumMessagesForAnalysis {
+                logger.debug("Triggering analysis: \(unprocessedCount) unprocessed messages (threshold: \(self.minimumMessagesForAnalysis))")
+                return true
+            }
+
+            logger.debug("Not enough unprocessed messages: \(unprocessedCount) < \(self.minimumMessagesForAnalysis)")
+            return false
+
+        } catch {
+            logger.error("Failed to check message count: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    // MARK: - RTAI Integration
+
+    /// Register a knowledge entry with RTAI for instant retrieval
+    /// Uses MitosisRTAIIntegration to add pattern to learned patterns
+    private func registerWithRTAI(entry: KnowledgeEntry) async {
+        logger.info("🦀 Registering '\(entry.entity)' with RTAI...")
+
+        // Generate triggers from entry
+        let triggers = await ftaiGenerator.generateTriggers(for: entry)
+
+        // Build response text from entry
+        let responseText = buildResponseText(from: entry)
+
+        // Create RTAIPattern for instant retrieval
+        let rtaiPattern = RTAIPattern(
+            id: "ake_\(entry.id.uuidString)",
+            category: mapToPatternCategory(entry.category),
+            triggers: triggers.map { $0.replacingOccurrences(of: "@", with: "") }, // Remove @ prefix for matching
+            confidence: entry.confidence,
+            responseType: .staticResponse(responseText),
+            source: "ake_learning",
+            verificationSource: "conversation_extraction"
+        )
+
+        // Add to MitosisRTAIIntegration (runs on MainActor)
+        await MainActor.run {
+            MitosisRTAIIntegration.shared.addPattern(rtaiPattern)
+        }
+
+        rtaiPatternsRegistered += 1
+        logger.info("🦀 Registered RTAI pattern with \(triggers.count) triggers: \(triggers.joined(separator: ", "))")
+
+        // Layer 2: Notify proactive system of knowledge gain (disabled until tested)
+        if FeatureFlags.proactiveIntelligenceEnabled {
+            let domainID = "ake_\(entry.category)"
+            Task { await ProactiveIntegrationBridge.shared.observeKnowledgeGain(
+                domainID: domainID, confidenceBoost: min(entry.confidence * 0.2, 0.15)
+            ) }
+        }
+
+        // Persist patterns to disk for app restart
+        await persistRTAIPatterns()
+    }
+
+    /// Build a natural language response from a knowledge entry
+    private func buildResponseText(from entry: KnowledgeEntry) -> String {
+        var response = "\(entry.entity) is a \(entry.entityType)."
+
+        // Add attributes
+        if !entry.attributes.isEmpty {
+            let attributeStrings = entry.attributes.map { key, value in
+                let formattedKey = key.replacingOccurrences(of: "_", with: " ")
+                return "\(formattedKey.capitalized): \(value)"
+            }
+            response += " " + attributeStrings.joined(separator: ". ") + "."
+        }
+
+        // Add relationships
+        if !entry.relationships.isEmpty {
+            let relationStrings = entry.relationships.map { relation, target in
+                let formattedRelation = relation.replacingOccurrences(of: "_", with: " ")
+                return "\(formattedRelation.capitalized) \(target)"
+            }
+            response += " " + relationStrings.joined(separator: ", ") + "."
+        }
+
+        return response
+    }
+
+    /// Map KnowledgeCategory to domain string for MitosisManager
+    private func mapToDomain(_ category: KnowledgeCategory) -> String {
+        switch category {
+        case .people: return "people"
+        case .business: return "work"
+        case .personal: return "personal"
+        case .patterns: return "general"
+        }
+    }
+
+    /// Map KnowledgeCategory to PatternCategory
+    private func mapToPatternCategory(_ category: KnowledgeCategory) -> PatternCategory {
+        switch category {
+        case .people:
+            return .knowledge
+        case .business:
+            return .knowledge
+        case .personal:
+            return .knowledge
+        case .patterns:
+            return .general
+        }
+    }
+
+    /// Persist RTAI patterns to disk
+    /// Note: MitosisRTAIIntegration handles persistence internally when patterns are added.
+    /// This method logs that persistence will occur on next sync cycle.
+    private func persistRTAIPatterns() async {
+        await MainActor.run {
+            // The patterns are already added to MitosisRTAIIntegration
+            // Persistence happens automatically when the app exits or on sync
+            logger.info("💾 RTAI patterns will be persisted on next sync")
+        }
+    }
+
+    /// Get RTAI registration statistics
+    func getRTAIStats() -> Int {
+        return rtaiPatternsRegistered
+    }
+}

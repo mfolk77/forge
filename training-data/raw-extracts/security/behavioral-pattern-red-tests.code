@@ -1,0 +1,300 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: BehavioralPatternEngine — TCA weighted prediction engine
+///
+/// These tests verify that:
+/// 1. Observing actions updates internal patterns for prediction
+/// 2. Temporal prediction returns correct action for the observed hour
+/// 3. Sequential prediction learns A->B chains
+/// 4. Contextual prediction differentiates actions by context
+/// 5. TCA weighted formula produces score breakdowns
+/// 6. Recency decay allows newer patterns to compete with older ones
+/// 7. Minimum confidence threshold gates low-signal predictions
+/// 8. Multiple suggestions are returned sorted by confidence
+/// 9. Learned patterns are created after 3+ observations at same hour
+/// 10. Behavior summary returns a readable string
+///
+/// Target file:
+/// - Sources/SerenaCore/Services/TCA/BehavioralPatternEngine.swift
+@MainActor
+final class BehavioralPatternEngineRedTests: XCTestCase {
+
+    private var engine: BehavioralPatternEngine!
+
+    override func setUp() {
+        super.setUp()
+        engine = BehavioralPatternEngine.shared
+        engine.resetForTesting()
+    }
+
+    override func tearDown() {
+        engine.resetForTesting()
+        super.tearDown()
+    }
+
+    // MARK: - Helpers
+
+    /// Create a Date for today at a specific hour (0-23)
+    private func makeDate(hour: Int) -> Date {
+        let calendar = Calendar.current
+        var components = calendar.dateComponents([.year, .month, .day], from: Date())
+        components.hour = hour
+        components.minute = 0
+        components.second = 0
+        return calendar.date(from: components)!
+    }
+
+    // MARK: - Test 1: Observe Action Updates Patterns For Prediction
+
+    /// Observe the same action 5x at the same hour, then predict at that hour -> correct action
+    func test_observeAction_updatesPatternsForPrediction() {
+        let targetHour = 10
+        let targetDate = makeDate(hour: targetHour)
+
+        for _ in 0..<5 {
+            let interaction = UserInteraction(timestamp: targetDate, action: "check_email", context: [:])
+            engine.observeInteraction(interaction)
+        }
+
+        let prediction = engine.predictNextAction(currentTime: targetDate)
+
+        XCTAssertNotNil(prediction, "After 5 observations at hour \(targetHour), prediction should not be nil")
+        XCTAssertEqual(prediction?.action, "check_email",
+                       "Predicted action should be 'check_email', got '\(prediction?.action ?? "nil")'")
+    }
+
+    // MARK: - Test 2: Temporal Prediction At Correct Hour
+
+    /// Morning action vs evening action; predict at each hour returns the right one
+    func test_temporalPrediction_predictsActionAtCorrectHour() {
+        let morningDate = makeDate(hour: 8)
+        let eveningDate = makeDate(hour: 20)
+
+        // Interleave morning and evening observations so decay is balanced
+        // Need enough observations to survive recency decay (0.95 per observation)
+        for _ in 0..<10 {
+            engine.observeInteraction(UserInteraction(timestamp: morningDate, action: "morning_routine", context: [:]))
+            engine.observeInteraction(UserInteraction(timestamp: eveningDate, action: "evening_routine", context: [:]))
+        }
+
+        let morningPrediction = engine.predictNextAction(currentTime: morningDate)
+        let eveningPrediction = engine.predictNextAction(currentTime: eveningDate)
+
+        XCTAssertNotNil(morningPrediction, "Morning prediction should not be nil")
+        XCTAssertNotNil(eveningPrediction, "Evening prediction should not be nil")
+
+        // At morning hour, morning_routine should be the top prediction
+        XCTAssertEqual(morningPrediction?.action, "morning_routine",
+                       "At hour 8, should predict 'morning_routine', got '\(morningPrediction?.action ?? "nil")'")
+
+        // At evening hour, evening_routine should be the top prediction
+        XCTAssertEqual(eveningPrediction?.action, "evening_routine",
+                       "At hour 20, should predict 'evening_routine', got '\(eveningPrediction?.action ?? "nil")'")
+    }
+
+    // MARK: - Test 3: Sequential Prediction
+
+    /// A->B pattern 10x, predict after A -> should predict B
+    func test_sequentialPrediction_predictsNextActionInSequence() {
+        let date = makeDate(hour: 12)
+
+        // Train A -> B sequential pattern
+        for _ in 0..<10 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "open_app", context: [:]))
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "check_messages", context: [:]))
+        }
+
+        let prediction = engine.predictNextAction(currentTime: date, recentAction: "open_app")
+
+        XCTAssertNotNil(prediction, "Sequential prediction should not be nil after 10 A->B observations")
+        XCTAssertEqual(prediction?.action, "check_messages",
+                       "After 'open_app', should predict 'check_messages', got '\(prediction?.action ?? "nil")'")
+    }
+
+    // MARK: - Test 4: Contextual Prediction
+
+    /// Different actions in different contexts; predict based on context
+    func test_contextualPrediction_predictsBasedOnContext() {
+        let date = makeDate(hour: 12)
+
+        // Train "work" context -> code_review
+        for _ in 0..<8 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "code_review",
+                                                      context: ["location": "work"]))
+        }
+
+        // Train "home" context -> play_music
+        for _ in 0..<8 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "play_music",
+                                                      context: ["location": "home"]))
+        }
+
+        let workPrediction = engine.predictNextAction(currentTime: date, context: ["location": "work"])
+        let homePrediction = engine.predictNextAction(currentTime: date, context: ["location": "home"])
+
+        XCTAssertNotNil(workPrediction, "Work context prediction should not be nil")
+        XCTAssertNotNil(homePrediction, "Home context prediction should not be nil")
+
+        XCTAssertEqual(workPrediction?.action, "code_review",
+                       "In work context should predict 'code_review', got '\(workPrediction?.action ?? "nil")'")
+        XCTAssertEqual(homePrediction?.action, "play_music",
+                       "In home context should predict 'play_music', got '\(homePrediction?.action ?? "nil")'")
+    }
+
+    // MARK: - Test 5: TCA Weighted Formula Score Breakdown
+
+    /// Verify the prediction includes a scores object with temporal, frequency, contextual > 0
+    func test_tcaWeightedFormula_includesScoreBreakdown() {
+        let date = makeDate(hour: 14)
+
+        for _ in 0..<8 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "write_code",
+                                                      context: ["app": "xcode"]))
+        }
+
+        let prediction = engine.predictNextAction(currentTime: date, context: ["app": "xcode"])
+
+        XCTAssertNotNil(prediction, "Prediction should not be nil")
+        XCTAssertNotNil(prediction?.scores, "Prediction should include PredictionScores breakdown")
+
+        if let scores = prediction?.scores {
+            XCTAssertGreaterThan(scores.temporal, 0,
+                                 "Temporal score should be > 0 for action observed at this hour")
+            XCTAssertGreaterThan(scores.frequency, 0,
+                                 "Frequency score should be > 0 for observed action")
+            XCTAssertGreaterThan(scores.contextual, 0,
+                                 "Contextual score should be > 0 when matching context is provided")
+        }
+    }
+
+    // MARK: - Test 6: Recency Decay — Newer Patterns Compete
+
+    /// old_action 20x then new_action 15x — both should appear in suggestions
+    func test_recencyDecay_newerPatternsWin() {
+        let date = makeDate(hour: 15)
+
+        // Old action: 20 observations
+        for _ in 0..<20 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "old_action", context: [:]))
+        }
+
+        // New action: 15 observations (fewer, but more recent — less decayed)
+        for _ in 0..<15 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "new_action", context: [:]))
+        }
+
+        let suggestions = engine.getProactiveSuggestions(currentTime: date, topN: 5)
+
+        XCTAssertFalse(suggestions.isEmpty, "Should have at least one suggestion")
+
+        let actions = suggestions.map { $0.action }
+        // Both actions should appear since they have significant observations
+        let hasOld = actions.contains("old_action")
+        let hasNew = actions.contains("new_action")
+
+        XCTAssertTrue(hasOld || hasNew,
+                      "At least one of old_action/new_action should appear in suggestions. Got: \(actions)")
+        // With recency decay, both should be present in suggestions
+        XCTAssertTrue(hasOld && hasNew,
+                      "Both old_action and new_action should appear in suggestions due to significant observations. Got: \(actions)")
+    }
+
+    // MARK: - Test 7: Minimum Confidence — Single Observation
+
+    /// 1 observation at a different hour than prediction time -> nil or very low confidence
+    func test_minimumConfidence_singleObservationReturnsNil() {
+        // Observe once at hour 3
+        let observeDate = makeDate(hour: 3)
+        engine.observeInteraction(UserInteraction(timestamp: observeDate, action: "rare_action", context: [:]))
+
+        // Predict at hour 16 (far from observed hour)
+        let predictDate = makeDate(hour: 16)
+        let prediction = engine.predictNextAction(currentTime: predictDate)
+
+        // With only 1 observation at a distant hour, should be nil or below minConfidence (0.3)
+        if let prediction = prediction {
+            XCTAssertLessThanOrEqual(prediction.confidence, 0.3,
+                                     "Single observation at distant hour should yield confidence <= 0.3, got \(prediction.confidence)")
+        }
+        // nil is also acceptable — means it didn't meet minConfidence threshold
+    }
+
+    // MARK: - Test 8: Multiple Suggestions Sorted By Confidence
+
+    /// 3 actions with different observation strengths; suggestions should be sorted descending
+    func test_multipleSuggestions_returnsSortedByConfidence() {
+        let date = makeDate(hour: 11)
+
+        // Strong action: 12 observations
+        for _ in 0..<12 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "strong_action", context: [:]))
+        }
+
+        // Medium action: 6 observations
+        for _ in 0..<6 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "medium_action", context: [:]))
+        }
+
+        // Weak action: 3 observations
+        for _ in 0..<3 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "weak_action", context: [:]))
+        }
+
+        let suggestions = engine.getProactiveSuggestions(currentTime: date, topN: 3)
+
+        XCTAssertGreaterThanOrEqual(suggestions.count, 2,
+                                     "Should return at least 2 suggestions for 3 distinct actions")
+
+        // Verify sorted by confidence descending
+        for i in 0..<(suggestions.count - 1) {
+            XCTAssertGreaterThanOrEqual(suggestions[i].confidence, suggestions[i + 1].confidence,
+                                         "Suggestions should be sorted by confidence descending. " +
+                                         "Index \(i) (\(suggestions[i].confidence)) should >= index \(i+1) (\(suggestions[i+1].confidence))")
+        }
+    }
+
+    // MARK: - Test 9: Learned Patterns After 3 Observations
+
+    /// Observations at same hour -> a learned pattern should exist (needs 5 due to decay)
+    func test_learnedPatterns_createdAfterThreeObservations() {
+        let targetHour = 9
+        let date = makeDate(hour: targetHour)
+
+        // Need more than 3 raw observations because recency decay (0.95) reduces
+        // the weighted count each time. ~5 observations ensures decayed count >= 3.0
+        for _ in 0..<5 {
+            engine.observeInteraction(UserInteraction(timestamp: date, action: "standup_meeting", context: [:]))
+        }
+
+        let patterns = engine.getLearnedPatterns()
+
+        XCTAssertFalse(patterns.isEmpty,
+                       "After 3 observations at the same hour, at least one learned pattern should exist")
+
+        let standupPattern = patterns.first { $0.action == "standup_meeting" && $0.typicalHour == targetHour }
+        XCTAssertNotNil(standupPattern,
+                        "Should have a learned pattern for 'standup_meeting' at hour \(targetHour). " +
+                        "Patterns: \(patterns.map { "\($0.action)@\($0.typicalHour)" })")
+    }
+
+    // MARK: - Test 10: Behavior Summary Readable String
+
+    /// Summary should contain key phrases indicating it's a readable behavioral report
+    func test_behaviorSummary_returnsReadableString() {
+        let morningDate = makeDate(hour: 8)
+
+        // Add some interactions so summary has content
+        for _ in 0..<5 {
+            engine.observeInteraction(UserInteraction(timestamp: morningDate, action: "check_email", context: [:]))
+        }
+
+        let summary = engine.getBehaviorSummary()
+
+        XCTAssertFalse(summary.isEmpty, "Behavior summary should not be empty")
+        XCTAssertTrue(summary.contains("Behavioral Patterns") || summary.contains("Patterns"),
+                      "Summary should contain 'Patterns'. Got: '\(summary)'")
+        XCTAssertTrue(summary.contains("interactions") || summary.contains("interaction"),
+                      "Summary should mention interactions. Got: '\(summary)'")
+    }
+}

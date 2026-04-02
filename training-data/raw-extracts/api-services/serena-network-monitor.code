@@ -1,0 +1,301 @@
+import Foundation
+import Network
+import os.log
+
+/// Manages network connectivity monitoring and offline mode handling
+@MainActor
+public class NetworkConnectivityManager: ObservableObject {
+    @Published public private(set) var isConnected: Bool = true
+    @Published public private(set) var connectionType: NWInterface.InterfaceType?
+    @Published public private(set) var isExpensive: Bool = false
+    @Published public private(set) var isConstrained: Bool = false
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkConnectivityMonitor")
+    private let logger = Logger(subsystem: "com.serenanet.network", category: "ConnectivityManager")
+
+    // Offline mode capabilities
+    @Published public private(set) var offlineModeEnabled: Bool = true
+    @Published public private(set) var offlineCapabilities: OfflineCapabilities = .full
+
+    public init() {
+        startMonitoring()
+    }
+    
+    deinit {
+        monitor.cancel()
+    }
+    
+    // MARK: - Network Monitoring
+    
+    private func startMonitoring() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                self?.updateNetworkStatus(path)
+            }
+        }
+        monitor.start(queue: queue)
+        logger.info("Network connectivity monitoring started")
+    }
+    
+    private func stopMonitoring() {
+        monitor.cancel()
+        logger.info("Network connectivity monitoring stopped")
+    }
+    
+    private func updateNetworkStatus(_ path: NWPath) {
+        let wasConnected = isConnected
+        isConnected = path.status == .satisfied
+        isExpensive = path.isExpensive
+        isConstrained = path.isConstrained
+        
+        // Determine connection type
+        if path.usesInterfaceType(.wifi) {
+            connectionType = .wifi
+        } else if path.usesInterfaceType(.cellular) {
+            connectionType = .cellular
+        } else if path.usesInterfaceType(.wiredEthernet) {
+            connectionType = .wiredEthernet
+        } else {
+            connectionType = nil
+        }
+        
+        // Log connectivity changes
+        if wasConnected != isConnected {
+            if isConnected {
+                logger.info("Network connectivity restored - Type: \(self.connectionType?.description ?? "unknown")")
+            } else {
+                logger.notice("Network connectivity lost - Entering offline mode")
+            }
+        }
+        
+        // Update offline capabilities based on connection status
+        updateOfflineCapabilities()
+    }
+    
+    private func updateOfflineCapabilities() {
+        if isConnected {
+            offlineCapabilities = .full
+        } else {
+            // In offline mode, we still have full capabilities since AI runs locally
+            offlineCapabilities = .full
+            logger.info("Offline mode active - All AI features remain available")
+        }
+    }
+    
+    // MARK: - Offline Mode Management
+    
+    /// Check if a specific feature is available in current network state
+    func isFeatureAvailable(_ feature: NetworkFeature) -> Bool {
+        switch feature {
+        case .localAI:
+            return true // Always available since AI runs locally
+        case .voiceInput:
+            return true // Uses local speech recognition
+        case .dataSync:
+            return isConnected // Requires network for syncing
+        case .updates:
+            return isConnected // Requires network for app updates
+        case .externalAPIs:
+            return isConnected // Requires network for external services
+        }
+    }
+    
+    /// Get user-friendly status message for current network state
+    public func getStatusMessage() -> String {
+        if isConnected {
+            let typeDescription = connectionType?.description ?? "unknown connection"
+            var message = "Connected via \(typeDescription)"
+            
+            if isExpensive {
+                message += " (cellular data)"
+            }
+            if isConstrained {
+                message += " (limited bandwidth)"
+            }
+            
+            return message
+        } else {
+            return "Offline - AI features continue to work normally"
+        }
+    }
+    
+    /// Get offline mode guidance for users
+    public func getOfflineModeGuidance() -> String {
+        if isConnected {
+            return "All features are available"
+        } else {
+            return """
+            You're currently offline, but don't worry:
+            • AI conversations work normally (processed locally)
+            • Voice input continues to function
+            • Your conversations are saved locally
+            • All features will sync when connection is restored
+            """
+        }
+    }
+    
+    // MARK: - Network Quality Assessment
+    
+    /// Assess current network quality for bandwidth-sensitive operations
+    func getNetworkQuality() -> NetworkQuality {
+        guard isConnected else { return .offline }
+        
+        if isConstrained {
+            return .poor
+        } else if isExpensive {
+            return .limited
+        } else if connectionType == .wifi {
+            return .excellent
+        } else if connectionType == .wiredEthernet {
+            return .excellent
+        } else if connectionType == .cellular {
+            return .good
+        } else {
+            return .unknown
+        }
+    }
+    
+    /// Check if network is suitable for large operations
+    func isSuitableForLargeOperations() -> Bool {
+        let quality = getNetworkQuality()
+        return quality == .excellent || quality == .good
+    }
+    
+    // MARK: - Fallback Handling
+    
+    /// Handle network-dependent operation with fallback
+    func performWithFallback<T>(
+        networkOperation: @escaping () async throws -> T,
+        offlineFallback: @escaping () async throws -> T
+    ) async throws -> T {
+        if isConnected {
+            do {
+                return try await networkOperation()
+            } catch {
+                logger.warning("Network operation failed, falling back to offline mode: \(error.localizedDescription)")
+                return try await offlineFallback()
+            }
+        } else {
+            logger.info("Performing operation in offline mode")
+            return try await offlineFallback()
+        }
+    }
+    
+    /// Validate that offline operation can proceed
+    public func validateOfflineOperation(_ operation: OfflineOperation) throws {
+        switch operation {
+        case .aiInference:
+            // Always available
+            break
+        case .voiceRecognition:
+            // Always available with local speech recognition
+            break
+        case .dataStorage:
+            // Always available with local storage
+            break
+        case .dataSync:
+            if !isConnected {
+                throw SerenaError.networkUnavailable
+            }
+        }
+    }
+}
+
+// MARK: - Supporting Types
+
+public enum NetworkFeature {
+    case localAI
+    case voiceInput
+    case dataSync
+    case updates
+    case externalAPIs
+}
+
+public enum OfflineCapabilities {
+    case full        // All features available offline
+    case limited     // Some features unavailable
+    case minimal     // Only basic features available
+
+    public var description: String {
+        switch self {
+        case .full:
+            return "All features available"
+        case .limited:
+            return "Some features unavailable"
+        case .minimal:
+            return "Basic features only"
+        }
+    }
+}
+
+public enum NetworkQuality {
+    case offline
+    case poor
+    case limited
+    case good
+    case excellent
+    case unknown
+
+    public var description: String {
+        switch self {
+        case .offline:
+            return "Offline"
+        case .poor:
+            return "Poor connection"
+        case .limited:
+            return "Limited connection"
+        case .good:
+            return "Good connection"
+        case .excellent:
+            return "Excellent connection"
+        case .unknown:
+            return "Unknown connection quality"
+        }
+    }
+    
+    public var systemImageName: String {
+        switch self {
+        case .offline:
+            return "wifi.slash"
+        case .poor:
+            return "wifi.exclamationmark"
+        case .limited:
+            return "wifi"
+        case .good:
+            return "wifi"
+        case .excellent:
+            return "wifi"
+        case .unknown:
+            return "questionmark.circle"
+        }
+    }
+}
+
+public enum OfflineOperation {
+    case aiInference
+    case voiceRecognition
+    case dataStorage
+    case dataSync
+}
+
+// MARK: - NWInterface.InterfaceType Extension
+
+extension NWInterface.InterfaceType {
+    var description: String {
+        switch self {
+        case .wifi:
+            return "Wi-Fi"
+        case .cellular:
+            return "Cellular"
+        case .wiredEthernet:
+            return "Ethernet"
+        case .loopback:
+            return "Loopback"
+        case .other:
+            return "Other"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+}

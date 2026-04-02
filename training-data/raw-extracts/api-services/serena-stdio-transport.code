@@ -1,0 +1,337 @@
+import Foundation
+import os.log
+
+// MARK: - Stdio Transport
+// Spawns MCP servers as child processes and communicates via stdin/stdout
+// Uses newline-delimited JSON for message framing
+
+/// Transport implementation that communicates with MCP servers via stdin/stdout
+public final class StdioTransport: MCPTransport, @unchecked Sendable {
+    private let logger = Logger(subsystem: "com.serenanet.mcp", category: "StdioTransport")
+
+    // Configuration
+    private let executablePath: String
+    private let arguments: [String]
+    private let environment: [String: String]
+    private let config: MCPTransportConfig
+
+    // Process management
+    private var process: Process?
+    private var stdinPipe: Pipe?
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
+
+    // State - all mutable state protected by stateLock
+    private var _isConnected: Bool = false
+    private var _receiveContinuation: AsyncStream<Data>.Continuation?
+    private let stateLock = NSLock()
+
+    public var isConnected: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isConnected
+    }
+
+    // Thread-safe access to receiveContinuation
+    private var receiveContinuation: AsyncStream<Data>.Continuation? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _receiveContinuation
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _receiveContinuation = newValue
+        }
+    }
+
+    /// Initialize a stdio transport for an MCP server
+    /// - Parameters:
+    ///   - executablePath: Path to the executable (e.g., "/usr/local/bin/npx")
+    ///   - arguments: Command line arguments (e.g., ["@modelcontextprotocol/server-notion"])
+    ///   - environment: Additional environment variables (e.g., API keys)
+    ///   - config: Transport configuration
+    public init(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String] = [:],
+        config: MCPTransportConfig = .default
+    ) {
+        self.executablePath = executablePath
+        self.arguments = arguments
+        self.environment = environment
+        self.config = config
+    }
+
+    // MARK: - MCPTransport Protocol
+
+    public func start() async throws {
+        logger.info("Starting MCP server: \(self.executablePath) \(self.arguments.joined(separator: " "))")
+
+        // Verify executable exists
+        guard FileManager.default.fileExists(atPath: executablePath) else {
+            throw MCPError.serverNotFound(executablePath)
+        }
+
+        // Create pipes
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+
+        // Create process
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executablePath)
+        proc.arguments = arguments
+        proc.standardInput = stdin
+        proc.standardOutput = stdout
+        proc.standardError = stderr
+
+        // Merge environment
+        var env = ProcessInfo.processInfo.environment
+        for (key, value) in environment {
+            env[key] = value
+        }
+        proc.environment = env
+
+        // Set up termination handler
+        proc.terminationHandler = { [weak self] process in
+            self?.handleProcessTermination(exitCode: process.terminationStatus)
+        }
+
+        // Start process
+        do {
+            try proc.run()
+        } catch {
+            throw MCPError.processSpawnFailed(error.localizedDescription)
+        }
+
+        // Store references
+        self.process = proc
+        self.stdinPipe = stdin
+        self.stdoutPipe = stdout
+        self.stderrPipe = stderr
+
+        // Mark as connected
+        stateLock.lock()
+        _isConnected = true
+        stateLock.unlock()
+
+        // Start reading stderr for debugging
+        startStderrReading()
+
+        logger.info("MCP server started with PID: \(proc.processIdentifier)")
+    }
+
+    public func stop() async throws {
+        logger.info("Stopping MCP server")
+
+        stateLock.lock()
+        _isConnected = false
+        stateLock.unlock()
+
+        // Close stdin first (signals EOF to server)
+        stdinPipe?.fileHandleForWriting.closeFile()
+
+        // Give server a moment to gracefully shutdown
+        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+
+        // Terminate if still running
+        if let proc = process, proc.isRunning {
+            proc.terminate()
+
+            // Wait briefly for termination
+            try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+
+            // Force kill if still running
+            if proc.isRunning {
+                proc.interrupt()
+            }
+        }
+
+        // Finish receive stream
+        receiveContinuation?.finish()
+        receiveContinuation = nil
+
+        // Clean up
+        process = nil
+        stdinPipe = nil
+        stdoutPipe = nil
+        stderrPipe = nil
+
+        logger.info("MCP server stopped")
+    }
+
+    public func send(_ data: Data) async throws {
+        guard isConnected, let stdin = stdinPipe else {
+            throw MCPError.notConnected
+        }
+
+        // Ensure data ends with newline
+        var messageData = data
+        if !messageData.isEmpty && messageData.last != UInt8(ascii: "\n") {
+            messageData.append(contentsOf: "\n".utf8)
+        }
+
+        do {
+            try stdin.fileHandleForWriting.write(contentsOf: messageData)
+            logger.debug("Sent: \(String(data: data, encoding: .utf8) ?? "binary")")
+        } catch {
+            throw MCPError.transportError("Failed to write to stdin: \(error.localizedDescription)")
+        }
+    }
+
+    public func receive() -> AsyncStream<Data> {
+        return AsyncStream { continuation in
+            self.receiveContinuation = continuation
+
+            guard let stdout = self.stdoutPipe else {
+                continuation.finish()
+                return
+            }
+
+            // Start reading in background task
+            Task {
+                await self.readLoop(from: stdout.fileHandleForReading, continuation: continuation)
+            }
+        }
+    }
+
+    // MARK: - Private Methods
+
+    private func readLoop(from handle: FileHandle, continuation: AsyncStream<Data>.Continuation) async {
+        var buffer = Data()
+
+        while isConnected {
+            do {
+                // Read available data
+                let availableData: Data?
+                if #available(macOS 10.15.4, *) {
+                    availableData = try handle.availableData
+                } else {
+                    availableData = handle.availableData
+                }
+
+                guard let data = availableData, !data.isEmpty else {
+                    // EOF or no data - check if process is still running
+                    if process?.isRunning != true {
+                        break
+                    }
+                    // Brief sleep to avoid busy waiting
+                    try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+                    continue
+                }
+
+                buffer.append(data)
+
+                // Process complete lines
+                while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    let lineData = buffer[buffer.startIndex..<newlineIndex]
+                    buffer = buffer[(newlineIndex + 1)...]
+
+                    if !lineData.isEmpty {
+                        let line = Data(lineData)
+                        logger.debug("Received: \(String(data: line, encoding: .utf8) ?? "binary")")
+                        continuation.yield(line)
+                    }
+                }
+            } catch {
+                logger.error("Read error: \(error.localizedDescription)")
+                break
+            }
+        }
+
+        continuation.finish()
+    }
+
+    private func startStderrReading() {
+        guard let stderr = stderrPipe else { return }
+
+        Task {
+            let handle = stderr.fileHandleForReading
+            while isConnected {
+                let data = handle.availableData
+                if data.isEmpty {
+                    if process?.isRunning != true {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    continue
+                }
+
+                if let text = String(data: data, encoding: .utf8) {
+                    logger.warning("MCP Server stderr: \(text)")
+                }
+            }
+        }
+    }
+
+    private func handleProcessTermination(exitCode: Int32) {
+        logger.info("MCP server process terminated with exit code: \(exitCode)")
+
+        stateLock.lock()
+        _isConnected = false
+        stateLock.unlock()
+
+        receiveContinuation?.finish()
+    }
+}
+
+// MARK: - Convenience Initializers
+
+extension StdioTransport {
+    /// Create transport for an npx-based MCP server
+    /// - Parameters:
+    ///   - package: NPM package name (e.g., "@modelcontextprotocol/server-notion")
+    ///   - environment: Environment variables for the server
+    public static func npx(
+        package: String,
+        environment: [String: String] = [:]
+    ) -> StdioTransport {
+        // Find npx
+        let npxPath = findNpx() ?? "/usr/local/bin/npx"
+
+        return StdioTransport(
+            executablePath: npxPath,
+            arguments: ["-y", package],
+            environment: environment
+        )
+    }
+
+    /// Create transport for a Node.js script
+    /// - Parameters:
+    ///   - scriptPath: Path to the JavaScript file
+    ///   - environment: Environment variables for the server
+    public static func node(
+        scriptPath: String,
+        environment: [String: String] = [:]
+    ) -> StdioTransport {
+        let nodePath = findNode() ?? "/usr/local/bin/node"
+
+        return StdioTransport(
+            executablePath: nodePath,
+            arguments: [scriptPath],
+            environment: environment
+        )
+    }
+
+    // Find npx in common locations
+    private static func findNpx() -> String? {
+        let paths = [
+            "/usr/local/bin/npx",
+            "/opt/homebrew/bin/npx",
+            "/usr/bin/npx"
+        ]
+        return paths.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    // Find node in common locations
+    private static func findNode() -> String? {
+        let paths = [
+            "/usr/local/bin/node",
+            "/opt/homebrew/bin/node",
+            "/usr/bin/node"
+        ]
+        return paths.first { FileManager.default.fileExists(atPath: $0) }
+    }
+}

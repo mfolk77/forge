@@ -1,0 +1,467 @@
+import XCTest
+import EventKit
+@testable import SerenaCore
+
+/// Red Tests: AppToolHandler, BriefingToolHandler, ExecutiveToolHandler, and ToolHandler/ToolResult base types.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/ToolHandlers/ToolHandler.swift
+/// - Sources/SerenaCore/Services/ToolHandlers/AppToolHandler.swift
+/// - Sources/SerenaCore/Services/ToolHandlers/BriefingToolHandler.swift
+/// - Sources/SerenaCore/Services/ToolHandlers/ExecutiveToolHandler.swift
+@MainActor
+final class ToolHandlersRedTests: XCTestCase {
+
+    // MARK: - ToolResult Tests
+
+    /// ToolResult stores success, output, error, and requiresUpgrade
+    func test_toolResult_initStoresAllFields() {
+        let result = ToolResult(success: true, output: "hello", error: "warn", requiresUpgrade: true)
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.output, "hello")
+        XCTAssertEqual(result.error, "warn")
+        XCTAssertTrue(result.requiresUpgrade)
+    }
+
+    /// requiresUpgrade defaults to false
+    func test_toolResult_requiresUpgradeDefaultsFalse() {
+        let result = ToolResult(success: false, output: "", error: nil)
+        XCTAssertFalse(result.requiresUpgrade)
+    }
+
+    /// ToolResult with nil error
+    func test_toolResult_nilError() {
+        let result = ToolResult(success: true, output: "ok", error: nil)
+        XCTAssertNil(result.error)
+    }
+
+    // MARK: - AppToolHandler Identity
+
+    /// Tool name must be "app"
+    func test_appToolHandler_toolName() {
+        let handler = AppToolHandler()
+        XCTAssertEqual(handler.toolName, "app")
+    }
+
+    // MARK: - AppToolHandler Action Routing
+
+    /// Unknown action returns error
+    func test_appToolHandler_unknownAction_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "reboot", params: [:])
+        XCTAssertFalse(result.success)
+        let error = result.error
+        XCTAssertNotNil(error)
+        XCTAssertTrue(error?.contains("Unknown app action") ?? false,
+                      "Expected 'Unknown app action' in error. Got: \(error ?? "nil")")
+    }
+
+    /// Nil action returns error
+    func test_appToolHandler_nilAction_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: nil, params: [:])
+        XCTAssertFalse(result.success)
+        let error = result.error
+        XCTAssertNotNil(error)
+    }
+
+    // MARK: - AppToolHandler list_active
+
+    /// list_active returns success and contains "Active applications"
+    func test_appToolHandler_listActive_succeeds() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "list_active", params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("Active applications"),
+                      "Expected 'Active applications' in output. Got: \(output)")
+    }
+
+    /// list_active limits to 15 apps max
+    func test_appToolHandler_listActive_limitsTo15() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "list_active", params: [:])
+        XCTAssertTrue(result.success)
+        // Count lines starting with "- " (each app entry)
+        let appLines = result.output.components(separatedBy: "\n").filter { $0.hasPrefix("- ") }
+        XCTAssertLessThanOrEqual(appLines.count, 15)
+    }
+
+    /// list_active has nil error on success
+    func test_appToolHandler_listActive_noError() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "list_active", params: [:])
+        XCTAssertNil(result.error)
+    }
+
+    // MARK: - AppToolHandler launch
+
+    /// launch with empty app_name fails
+    func test_appToolHandler_launch_emptyName_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "launch", params: ["app_name": ""])
+        XCTAssertFalse(result.success)
+        let error = result.error
+        XCTAssertTrue(error?.contains("Could not find or launch") ?? false,
+                      "Expected launch failure. Got: \(error ?? "nil")")
+    }
+
+    /// launch with no app_name param fails
+    func test_appToolHandler_launch_missingName_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "launch", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    /// launch with nonexistent app fails
+    func test_appToolHandler_launch_nonexistentApp_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(
+            action: "launch",
+            params: ["app_name": "ZZZNonExistentAppXYZ12345"]
+        )
+        XCTAssertFalse(result.success)
+        let error = result.error
+        XCTAssertTrue(error?.contains("Could not find or launch") ?? false)
+    }
+
+    /// launch with known mapped app succeeds (Finder is always available)
+    func test_appToolHandler_launch_finder_succeeds() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(
+            action: "launch",
+            params: ["app_name": "Finder"]
+        )
+        XCTAssertTrue(result.success, "Finder should always be launchable. Error: \(result.error ?? "nil")")
+        let output = result.output
+        XCTAssertTrue(output.contains("Launched"), "Output should confirm launch. Got: \(output)")
+    }
+
+    /// launch is case-insensitive for mapped apps
+    func test_appToolHandler_launch_caseInsensitive() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(
+            action: "launch",
+            params: ["app_name": "finder"]
+        )
+        XCTAssertTrue(result.success, "Case-insensitive lookup should find Finder")
+    }
+
+    // MARK: - AppToolHandler quit
+
+    /// quit with nonexistent app reports not running
+    func test_appToolHandler_quit_notRunning_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(
+            action: "quit",
+            params: ["app_name": "ZZZNonExistentAppXYZ12345"]
+        )
+        XCTAssertFalse(result.success)
+        let error = result.error
+        XCTAssertTrue(error?.contains("is not running") ?? false,
+                      "Expected 'is not running'. Got: \(error ?? "nil")")
+    }
+
+    /// quit with empty app_name reports not running
+    func test_appToolHandler_quit_emptyName_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "quit", params: ["app_name": ""])
+        XCTAssertFalse(result.success)
+    }
+
+    /// quit with missing app_name param fails
+    func test_appToolHandler_quit_missingName_fails() async {
+        let handler = AppToolHandler()
+        let result = await handler.execute(action: "quit", params: [:])
+        XCTAssertFalse(result.success)
+    }
+
+    // MARK: - ExecutiveToolHandler Identity
+
+    /// Tool name must be "executive"
+    func test_executiveToolHandler_toolName() {
+        let handler = ExecutiveToolHandler()
+        XCTAssertEqual(handler.toolName, "executive")
+    }
+
+    // MARK: - ExecutiveToolHandler Date Operations
+
+    /// get_current_day returns today's date
+    func test_executive_getCurrentDay_returnsToday() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_current_day"])
+        XCTAssertTrue(result.success)
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM d, yyyy"
+        let expectedDatePart = formatter.string(from: Date())
+
+        let output = result.output
+        XCTAssertTrue(output.contains(expectedDatePart),
+                      "Expected today's date in output. Got: \(output)")
+    }
+
+    /// get_date is alias for get_current_day
+    func test_executive_getDate_alias() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_date"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.hasPrefix("Today is"))
+    }
+
+    /// get_today is alias for get_current_day
+    func test_executive_getToday_alias() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_today"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.hasPrefix("Today is"))
+    }
+
+    /// get_current_day includes weekday name
+    func test_executive_getCurrentDay_includesWeekday() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_current_day"])
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEEE"
+        let weekday = formatter.string(from: Date())
+
+        let output = result.output
+        XCTAssertTrue(output.contains(weekday),
+                      "Expected weekday '\(weekday)' in output. Got: \(output)")
+    }
+
+    // MARK: - ExecutiveToolHandler Time Operations
+
+    /// get_time returns current time
+    func test_executive_getTime_succeeds() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_time"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("current time is"),
+                      "Expected 'current time is'. Got: \(output)")
+    }
+
+    /// get_current_time is alias for get_time
+    func test_executive_getCurrentTime_alias() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_current_time"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("current time is"))
+    }
+
+    /// Time output contains AM or PM
+    func test_executive_getTime_containsAmPm() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_time"])
+        let output = result.output
+        let hasAmPm = output.contains("AM") || output.contains("PM")
+        XCTAssertTrue(hasAmPm, "Time should contain AM or PM. Got: \(output)")
+    }
+
+    // MARK: - ExecutiveToolHandler Default/Unknown Operations
+
+    /// Unknown operation returns success with acknowledgement
+    func test_executive_unknownOperation_returnsAcknowledgement() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(
+            action: nil,
+            params: ["operation": "fire_missiles", "role": "admin"]
+        )
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("fire_missiles"),
+                      "Should echo operation name. Got: \(output)")
+        XCTAssertTrue(output.contains("admin"),
+                      "Should echo role. Got: \(output)")
+    }
+
+    /// Missing operation defaults to "unknown"
+    func test_executive_missingOperation_usesDefault() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("unknown"),
+                      "Missing operation should default to 'unknown'. Got: \(output)")
+    }
+
+    /// Missing role defaults to "unknown"
+    func test_executive_missingRole_usesDefault() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "check_status"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("unknown"),
+                      "Missing role should default to 'unknown'. Got: \(output)")
+    }
+
+    /// Operation matching is case-insensitive
+    func test_executive_operationCaseInsensitive() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "GET_DATE"])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.hasPrefix("Today is"),
+                      "Case-insensitive 'GET_DATE' should work. Got: \(output)")
+    }
+
+    /// No error field on success
+    func test_executive_noErrorOnSuccess() async {
+        let handler = ExecutiveToolHandler()
+        let result = await handler.execute(action: nil, params: ["operation": "get_date"])
+        XCTAssertNil(result.error)
+    }
+
+    // MARK: - BriefingToolHandler Identity
+
+    /// Tool name must be "briefing"
+    func test_briefingToolHandler_toolName() {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        XCTAssertEqual(handler.toolName, "briefing")
+    }
+
+    // MARK: - BriefingToolHandler Access Flags
+
+    /// Default access flags are false
+    func test_briefing_defaultAccessFlags() {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        XCTAssertFalse(handler.calendarAccessGranted)
+        XCTAssertFalse(handler.remindersAccessGranted)
+    }
+
+    /// Access flags are settable
+    func test_briefing_accessFlagsSettable() {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        handler.calendarAccessGranted = true
+        handler.remindersAccessGranted = true
+        XCTAssertTrue(handler.calendarAccessGranted)
+        XCTAssertTrue(handler.remindersAccessGranted)
+    }
+
+    // MARK: - BriefingToolHandler Execute (No Access)
+
+    /// Briefing always succeeds (graceful degradation)
+    func test_briefing_execute_alwaysSucceeds() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: [:])
+        XCTAssertTrue(result.success)
+        XCTAssertNil(result.error)
+    }
+
+    /// Briefing with no access still produces output
+    func test_briefing_noAccess_producesOutput() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: [:])
+        let output = result.output
+        XCTAssertFalse(output.isEmpty, "Briefing should always produce output")
+    }
+
+    /// Briefing includes greeting
+    func test_briefing_includesGreeting() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: [:])
+        let output = result.output
+        XCTAssertTrue(output.contains("Good morning"),
+                      "Briefing should include greeting. Got: \(output)")
+    }
+
+    /// Briefing includes today's date
+    func test_briefing_includesTodaysDate() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: [:])
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM d, yyyy"
+        let expectedDate = formatter.string(from: Date())
+
+        let output = result.output
+        XCTAssertTrue(output.contains(expectedDate),
+                      "Briefing should include today's date '\(expectedDate)'. Got: \(output)")
+    }
+
+    /// Without calendar access, briefing notes missing data
+    func test_briefing_noCalendarAccess_notesIt() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        handler.calendarAccessGranted = false
+        let result = await handler.execute(action: nil, params: [:])
+        let output = result.output
+        XCTAssertTrue(output.contains("Could not fetch calendar data"),
+                      "Should note missing calendar data. Got: \(output)")
+    }
+
+    /// Without reminders access, briefing notes missing data
+    func test_briefing_noRemindersAccess_notesIt() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        handler.remindersAccessGranted = false
+        let result = await handler.execute(action: nil, params: [:])
+        let output = result.output
+        XCTAssertTrue(output.contains("Could not fetch reminders"),
+                      "Should note missing reminders. Got: \(output)")
+    }
+
+    /// Briefing action param is ignored (always generates briefing)
+    func test_briefing_anyAction_stillWorks() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: "nonsense", params: [:])
+        XCTAssertTrue(result.success)
+        let output = result.output
+        XCTAssertTrue(output.contains("Good morning"))
+    }
+
+    /// Briefing params are ignored
+    func test_briefing_extraParams_ignored() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: ["foo": "bar", "baz": "qux"])
+        XCTAssertTrue(result.success)
+    }
+
+    /// Briefing notes weather failure when weather service returns nil
+    func test_briefing_noWeather_notesIt() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        // Weather requires location permission which tests don't have
+        let result = await handler.execute(action: nil, params: [:])
+        let output = result.output
+        // In test environment, weather likely fails — check that note appears
+        // (if weather happens to succeed, this is still valid since we check contains)
+        // The note section uses "_Note:" prefix
+        if output.contains("Could not fetch weather data") {
+            // Expected in test env without location
+            XCTAssertTrue(true)
+        } else {
+            // Weather somehow succeeded — that's fine too, just verify structure
+            XCTAssertTrue(output.contains("Good morning"))
+        }
+    }
+
+    /// Briefing includes weekday in date
+    func test_briefing_includesWeekday() async {
+        let store = EKEventStore()
+        let handler = BriefingToolHandler(eventStore: store)
+        let result = await handler.execute(action: nil, params: [:])
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEEE"
+        let weekday = formatter.string(from: Date())
+
+        let output = result.output
+        XCTAssertTrue(output.contains(weekday),
+                      "Briefing should include weekday '\(weekday)'. Got: \(output)")
+    }
+}

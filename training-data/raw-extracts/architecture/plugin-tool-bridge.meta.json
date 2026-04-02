@@ -1,0 +1,12 @@
+{
+  "name": "plugin-tool-bridge",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/tool_bridge.rs",
+  "line_count": 205,
+  "why": "IPC abstraction, timeout enforcement",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

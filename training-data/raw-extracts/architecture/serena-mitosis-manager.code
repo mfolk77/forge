@@ -1,0 +1,477 @@
+import Foundation
+import OSLog
+
+/// Manages the lifecycle of knowledge clusters in the Mitosis system.
+///
+/// Hierarchy: Domain → Subdomain → Topic → Concept
+/// Storage: `~/Library/Application Support/Serena/Clusters/` (default), configurable to NAS
+///
+/// Cluster lifecycle: `.learning` → `.active` → decay → `.pruned` (archived, never hard-deleted)
+/// Trigger: 5 similar queries on same topic create a new cluster
+///
+/// All fact writes still go through `UserFTAIManager.addExtractedFact()` —
+/// this manager handles the clustering/organization layer ABOVE that.
+public actor MitosisManager {
+
+    // MARK: - Singleton
+
+    public static let shared = MitosisManager()
+
+    // MARK: - Dependencies
+
+    private let logger = Logger(subsystem: "ai.folktech.serena", category: "MitosisManager")
+
+    // MARK: - Configuration
+
+    /// Minimum similar queries before creating a cluster
+    private let clusterTriggerThreshold: Int = 5
+
+    /// Storage base path (configurable — user can set NAS path in settings)
+    private var storagePath: URL
+
+    /// Archive path for pruned clusters
+    private var archivePath: URL
+
+    /// When the system was first initialized (for growth rate calculation)
+    private var systemCreationDate: Date
+
+    // MARK: - State
+
+    /// Active clusters keyed by domain path (e.g., "technology/swift/concurrency")
+    private var clusters: [String: MitosisCluster] = [:]
+
+    /// Query tracker: topic → recent query fingerprints
+    private var queryTracker: [String: [QueryFingerprint]] = [:]
+
+    /// Metrics
+    private var totalClustersCreated: Int = 0
+    private var totalClustersPruned: Int = 0
+
+    // MARK: - Initialization
+
+    private init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let serenaDir = appSupport.appendingPathComponent("Serena")
+        self.storagePath = serenaDir.appendingPathComponent("Clusters")
+        self.archivePath = serenaDir.appendingPathComponent("Clusters/_archived")
+        self.systemCreationDate = Date()
+
+        // Load persisted state
+        Task { await loadState() }
+    }
+
+    /// Initialize with custom path (for testing)
+    init(storagePath: URL, systemCreationDate: Date = Date()) {
+        self.storagePath = storagePath
+        self.archivePath = storagePath.appendingPathComponent("_archived")
+        self.systemCreationDate = systemCreationDate
+    }
+
+    // MARK: - Public API
+
+    /// Record a query and check if it should trigger cluster creation.
+    /// Called from LearningCoordinator when a pattern is detected.
+    /// - Parameters:
+    ///   - topic: The detected topic/domain
+    ///   - keywords: Keywords associated with the query
+    ///   - messageID: The message that triggered this
+    /// - Returns: The cluster path if a new cluster was created, nil otherwise
+    @discardableResult
+    public func recordQuery(topic: String, keywords: [String], messageID: String) -> String? {
+        let normalizedTopic = normalizeTopic(topic)
+        let fingerprint = QueryFingerprint(
+            messageID: messageID,
+            keywords: Set(keywords.map { $0.lowercased() }),
+            timestamp: Date()
+        )
+
+        // Add to tracker
+        var existing = queryTracker[normalizedTopic] ?? []
+        existing.append(fingerprint)
+
+        // Keep only recent queries (last 30 days)
+        let cutoff = Date().addingTimeInterval(-30 * 86400)
+        existing = existing.filter { $0.timestamp > cutoff }
+        queryTracker[normalizedTopic] = existing
+
+        // Check trigger threshold
+        if existing.count >= clusterTriggerThreshold {
+            // Check growth controller approval
+            let patternStrength = Double(existing.count) / 10.0 // Saturates at 10
+            if GrowthController.shouldCreateCluster(
+                systemCreationDate: systemCreationDate,
+                existingClusterCount: clusters.count,
+                patternStrength: min(1.0, patternStrength)
+            ) {
+                let clusterPath = createCluster(topic: normalizedTopic, keywords: keywords)
+                queryTracker.removeValue(forKey: normalizedTopic) // Reset tracker
+                return clusterPath
+            }
+        }
+
+        return nil
+    }
+
+    /// Register a knowledge entry with the appropriate cluster.
+    /// Creates the cluster hierarchy if it doesn't exist.
+    /// - Parameters:
+    ///   - entry: The knowledge entry to cluster
+    ///   - domain: Top-level domain (e.g., "people", "technology")
+    ///   - subdomain: Optional subdomain (e.g., "family", "programming")
+    public func registerEntry(_ entry: KnowledgeEntry, domain: String, subdomain: String? = nil) {
+        let path = buildClusterPath(domain: domain, subdomain: subdomain, topic: entry.entity)
+
+        if var cluster = clusters[path] {
+            cluster.addEntry(entryID: entry.id.uuidString, confidence: entry.confidence)
+            clusters[path] = cluster
+            logger.info("Registered entry '\(entry.entity)' to cluster '\(path)'")
+        } else {
+            // Auto-create cluster
+            var cluster = MitosisCluster(
+                path: path,
+                domain: domain,
+                subdomain: subdomain ?? "general",
+                topic: entry.entity,
+                status: .learning
+            )
+            cluster.addEntry(entryID: entry.id.uuidString, confidence: entry.confidence)
+            clusters[path] = cluster
+            totalClustersCreated += 1
+            logger.info("Created new cluster '\(path)' for entry '\(entry.entity)'")
+        }
+    }
+
+    /// Find the best matching cluster for a query.
+    /// Used by RTAI to route queries to the right knowledge domain.
+    /// - Parameter keywords: Keywords from the user query
+    /// - Returns: The cluster path and match score, or nil
+    public func findMatchingCluster(keywords: [String]) -> (path: String, score: Double)? {
+        let normalizedKeywords = Set(keywords.map { $0.lowercased() })
+        guard !normalizedKeywords.isEmpty else { return nil }
+
+        var bestMatch: (path: String, score: Double)?
+
+        for (path, cluster) in clusters where cluster.status != .pruned {
+            let clusterKeywords = Set(cluster.keywords.map { $0.lowercased() })
+            let overlap = normalizedKeywords.intersection(clusterKeywords)
+
+            guard !overlap.isEmpty else { continue }
+
+            // Jaccard-like similarity
+            let score = Double(overlap.count) / Double(normalizedKeywords.union(clusterKeywords).count)
+
+            if score > (bestMatch?.score ?? 0) {
+                bestMatch = (path, score)
+            }
+        }
+
+        return bestMatch
+    }
+
+    /// Run pruning cycle — archive stale, low-performing clusters.
+    /// Call periodically (e.g., daily or weekly).
+    /// - Returns: Number of clusters pruned
+    @discardableResult
+    public func runPruningCycle() -> Int {
+        var prunedCount = 0
+
+        for (path, cluster) in clusters {
+            let staleDays = Int(Date().timeIntervalSince(cluster.lastAccessed) / 86400)
+
+            if GrowthController.shouldPrune(staleDays: staleDays, performance: cluster.performance) {
+                var pruned = cluster
+                pruned.status = .pruned
+                clusters[path] = pruned
+                prunedCount += 1
+                totalClustersPruned += 1
+
+                logger.info("Pruned cluster '\(path)' (stale \(staleDays)d, perf \(String(format: "%.2f", cluster.performance)))")
+
+                // Archive to disk
+                archiveCluster(pruned)
+            }
+        }
+
+        if prunedCount > 0 {
+            logger.info("Pruning cycle complete: \(prunedCount) clusters archived")
+        }
+
+        return prunedCount
+    }
+
+    /// Get cluster statistics
+    public func getStats() -> ClusterStats {
+        let active = clusters.values.filter { $0.status == .active }.count
+        let learning = clusters.values.filter { $0.status == .learning }.count
+        let pruned = clusters.values.filter { $0.status == .pruned }.count
+
+        return ClusterStats(
+            totalClusters: clusters.count,
+            activeClusters: active,
+            learningClusters: learning,
+            prunedClusters: pruned,
+            totalCreated: totalClustersCreated,
+            totalPruned: totalClustersPruned,
+            growthRate: GrowthController.currentGrowthRate(systemCreationDate: systemCreationDate),
+            growthPhase: GrowthController.growthPhase(systemCreationDate: systemCreationDate),
+            trackedTopics: queryTracker.count
+        )
+    }
+
+    /// Get all active cluster paths (for diagnostics)
+    public func getActivePaths() -> [String] {
+        clusters.filter { $0.value.status != .pruned }.map(\.key).sorted()
+    }
+
+    /// Update the storage path (e.g., user configures NAS path in settings)
+    public func setStoragePath(_ path: URL) {
+        storagePath = path
+        archivePath = path.appendingPathComponent("_archived")
+        logger.info("Storage path updated to \(path.path)")
+    }
+
+    /// Record access to a cluster (updates lastAccessed, prevents stale pruning)
+    public func recordAccess(clusterPath: String) {
+        if var cluster = clusters[clusterPath] {
+            cluster.recordAccess()
+
+            // Promote from .learning to .active after enough activity
+            if cluster.status == .learning && cluster.accessCount >= 10 {
+                cluster.status = .active
+                logger.info("Promoted cluster '\(clusterPath)' to active")
+            }
+
+            clusters[clusterPath] = cluster
+        }
+    }
+
+    /// Reset all state (for testing)
+    public func reset() {
+        clusters.removeAll()
+        queryTracker.removeAll()
+        totalClustersCreated = 0
+        totalClustersPruned = 0
+        systemCreationDate = Date()
+        logger.info("MitosisManager reset")
+    }
+
+    // MARK: - Persistence
+
+    /// Save state to disk
+    public func saveState() {
+        do {
+            try FileManager.default.createDirectory(at: storagePath, withIntermediateDirectories: true)
+
+            let stateFile = storagePath.appendingPathComponent("mitosis_state.json")
+            let state = MitosisState(
+                clusters: clusters,
+                systemCreationDate: systemCreationDate,
+                totalClustersCreated: totalClustersCreated,
+                totalClustersPruned: totalClustersPruned
+            )
+
+            let data = try JSONEncoder().encode(state)
+            try data.write(to: stateFile, options: .atomic)
+            logger.info("Saved MitosisManager state (\(self.clusters.count) clusters)")
+        } catch {
+            logger.error("Failed to save state: \(error.localizedDescription)")
+        }
+    }
+
+    /// Load state from disk
+    private func loadState() {
+        let stateFile = storagePath.appendingPathComponent("mitosis_state.json")
+
+        guard FileManager.default.fileExists(atPath: stateFile.path) else {
+            logger.info("No persisted state found — starting fresh")
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: stateFile)
+            let state = try JSONDecoder().decode(MitosisState.self, from: data)
+
+            self.clusters = state.clusters
+            self.systemCreationDate = state.systemCreationDate
+            self.totalClustersCreated = state.totalClustersCreated
+            self.totalClustersPruned = state.totalClustersPruned
+
+            logger.info("Loaded MitosisManager state (\(self.clusters.count) clusters)")
+        } catch {
+            logger.error("Failed to load state: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    private func createCluster(topic: String, keywords: [String]) -> String {
+        let domain = inferDomain(from: keywords)
+        let path = buildClusterPath(domain: domain, subdomain: nil, topic: topic)
+
+        let cluster = MitosisCluster(
+            path: path,
+            domain: domain,
+            subdomain: "general",
+            topic: topic,
+            status: .learning,
+            keywords: keywords
+        )
+
+        clusters[path] = cluster
+        totalClustersCreated += 1
+        logger.info("Created cluster '\(path)' from \(keywords.count) keywords")
+
+        return path
+    }
+
+    private func buildClusterPath(domain: String, subdomain: String?, topic: String) -> String {
+        let safeComponents = [domain, subdomain ?? "general", topic].map { component in
+            component.lowercased()
+                .replacingOccurrences(of: " ", with: "_")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "..", with: "_") // Path traversal protection
+        }
+        return safeComponents.joined(separator: "/")
+    }
+
+    private func normalizeTopic(_ topic: String) -> String {
+        topic.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private func inferDomain(from keywords: [String]) -> String {
+        let kw = Set(keywords.map { $0.lowercased() })
+
+        // Simple keyword-based domain inference
+        let domainSignals: [(domain: String, signals: Set<String>)] = [
+            ("people",     ["wife", "husband", "son", "daughter", "friend", "family", "name", "birthday"]),
+            ("work",       ["work", "job", "project", "meeting", "deadline", "office", "team", "manager"]),
+            ("health",     ["doctor", "medication", "allergic", "condition", "symptom", "health", "hospital"]),
+            ("technology", ["code", "programming", "swift", "python", "api", "software", "computer"]),
+            ("finance",    ["budget", "money", "payment", "bank", "salary", "investment", "expense"]),
+            ("schedule",   ["schedule", "calendar", "appointment", "reminder", "event", "meeting"]),
+        ]
+
+        var bestDomain = "general"
+        var bestOverlap = 0
+
+        for (domain, signals) in domainSignals {
+            let overlap = kw.intersection(signals).count
+            if overlap > bestOverlap {
+                bestOverlap = overlap
+                bestDomain = domain
+            }
+        }
+
+        return bestDomain
+    }
+
+    private func archiveCluster(_ cluster: MitosisCluster) {
+        do {
+            try FileManager.default.createDirectory(at: archivePath, withIntermediateDirectories: true)
+            let archiveFile = archivePath.appendingPathComponent("\(cluster.path.replacingOccurrences(of: "/", with: "_")).json")
+            let data = try JSONEncoder().encode(cluster)
+            try data.write(to: archiveFile, options: .atomic)
+        } catch {
+            logger.error("Failed to archive cluster '\(cluster.path)': \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Supporting Types
+
+/// A knowledge cluster in the Mitosis hierarchy
+public struct MitosisCluster: Codable, Sendable {
+    public let path: String           // e.g., "people/family/christina"
+    public let domain: String         // Top-level domain
+    public let subdomain: String      // Sub-domain
+    public let topic: String          // Specific topic
+    public var status: ClusterStatus
+    public var keywords: [String]
+    public var entryIDs: [String]     // Knowledge entry IDs in this cluster
+    public var entryConfidences: [String: Double] // entryID → confidence
+    public let createdAt: Date
+    public var lastAccessed: Date
+    public var accessCount: Int
+
+    /// Performance score (0.0–1.0) based on access frequency and entry confidence
+    public var performance: Double {
+        guard !entryConfidences.isEmpty else { return 0.0 }
+        let avgConfidence = entryConfidences.values.reduce(0, +) / Double(entryConfidences.count)
+        let accessFactor = min(1.0, Double(accessCount) / 20.0)
+        return (avgConfidence + accessFactor) / 2.0
+    }
+
+    public init(
+        path: String,
+        domain: String,
+        subdomain: String,
+        topic: String,
+        status: ClusterStatus = .learning,
+        keywords: [String] = []
+    ) {
+        self.path = path
+        self.domain = domain
+        self.subdomain = subdomain
+        self.topic = topic
+        self.status = status
+        self.keywords = keywords
+        self.entryIDs = []
+        self.entryConfidences = [:]
+        self.createdAt = Date()
+        self.lastAccessed = Date()
+        self.accessCount = 0
+    }
+
+    mutating func addEntry(entryID: String, confidence: Double) {
+        if !entryIDs.contains(entryID) {
+            entryIDs.append(entryID)
+        }
+        entryConfidences[entryID] = confidence
+        lastAccessed = Date()
+        accessCount += 1
+    }
+
+    mutating func recordAccess() {
+        lastAccessed = Date()
+        accessCount += 1
+    }
+}
+
+/// Cluster lifecycle status
+public enum ClusterStatus: String, Codable, Sendable {
+    case learning  // New cluster, still accumulating data
+    case active    // Established cluster with sufficient data
+    case pruned    // Archived — stale + low performance
+}
+
+/// Query fingerprint for tracking similar queries
+struct QueryFingerprint: Codable {
+    let messageID: String
+    let keywords: Set<String>
+    let timestamp: Date
+}
+
+/// Persisted state
+private struct MitosisState: Codable {
+    let clusters: [String: MitosisCluster]
+    let systemCreationDate: Date
+    let totalClustersCreated: Int
+    let totalClustersPruned: Int
+}
+
+/// Mitosis cluster statistics
+public struct ClusterStats: Sendable {
+    public let totalClusters: Int
+    public let activeClusters: Int
+    public let learningClusters: Int
+    public let prunedClusters: Int
+    public let totalCreated: Int
+    public let totalPruned: Int
+    public let growthRate: Double
+    public let growthPhase: String
+    public let trackedTopics: Int
+}

@@ -1,0 +1,1049 @@
+/// Red tests for core model types.
+///
+/// Target files:
+/// - Sources/SerenaCore/Models/Conversation.swift
+/// - Sources/SerenaCore/Models/Message.swift
+/// - Sources/SerenaCore/Models/FTAIDocument.swift
+/// - Sources/SerenaCore/Models/SerenaError.swift
+/// - Sources/SerenaCore/Models/PricingConfig.swift
+/// - Sources/SerenaCore/Models/SerenaIdentity.swift
+/// - Sources/SerenaCore/Models/SubscriptionStatus.swift
+/// - Sources/SerenaCore/Models/SubscriptionTier.swift
+/// - Sources/SerenaCore/Models/UserConfig.swift
+/// - Sources/SerenaCore/Models/UserTier.swift
+
+import XCTest
+@testable import SerenaCore
+
+@MainActor
+final class CoreModelsRedTests: XCTestCase {
+
+    // MARK: - Message & MessageRole
+
+    func testMessageConvenienceInit() {
+        let msg = Message(content: "hello", role: .user)
+        XCTAssertEqual(msg.content, "hello")
+        XCTAssertEqual(msg.role, .user)
+        XCTAssertFalse(msg.id.uuidString.isEmpty)
+    }
+
+    func testMessageFullInit() {
+        let id = UUID()
+        let date = Date(timeIntervalSince1970: 1_000_000)
+        let msg = Message(id: id, content: "hi", role: .assistant, timestamp: date)
+        XCTAssertEqual(msg.id, id)
+        XCTAssertEqual(msg.timestamp, date)
+    }
+
+    func testMessageCodableRoundtrip() throws {
+        let original = Message(content: "roundtrip", role: .assistant)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(Message.self, from: data)
+        XCTAssertEqual(original, decoded)
+    }
+
+    func testMessageRoleDisplayNames() {
+        XCTAssertEqual(MessageRole.user.displayName, "You")
+        XCTAssertEqual(MessageRole.assistant.displayName, "SerenaNet")
+    }
+
+    func testMessageRoleCaseIterable() {
+        XCTAssertEqual(MessageRole.allCases.count, 2)
+    }
+
+    func testMessageRoleRawValues() {
+        XCTAssertEqual(MessageRole.user.rawValue, "user")
+        XCTAssertEqual(MessageRole.assistant.rawValue, "assistant")
+    }
+
+    func testMessageEquality() {
+        let id = UUID()
+        let date = Date()
+        let a = Message(id: id, content: "x", role: .user, timestamp: date)
+        let b = Message(id: id, content: "x", role: .user, timestamp: date)
+        XCTAssertEqual(a, b)
+    }
+
+    func testMessageInequality() {
+        let a = Message(content: "a", role: .user)
+        let b = Message(content: "b", role: .user)
+        XCTAssertNotEqual(a, b)
+    }
+
+    // MARK: - Conversation
+
+    func testConversationDefaultTitle() {
+        let conv = Conversation()
+        XCTAssertEqual(conv.title, "New Conversation")
+        XCTAssertTrue(conv.isEmpty)
+        XCTAssertNil(conv.lastMessage)
+    }
+
+    func testConversationCustomTitle() {
+        let conv = Conversation(title: "My Chat")
+        XCTAssertEqual(conv.title, "My Chat")
+    }
+
+    func testConversationFullInit() {
+        let id = UUID()
+        let now = Date()
+        let msgs = [Message(content: "hi", role: .user)]
+        let conv = Conversation(id: id, title: "T", messages: msgs, createdAt: now, updatedAt: now)
+        XCTAssertEqual(conv.id, id)
+        XCTAssertEqual(conv.messages.count, 1)
+    }
+
+    func testConversationAddMessageUpdatesTimestamp() {
+        var conv = Conversation()
+        let before = conv.updatedAt
+        // Small delay to ensure timestamp differs
+        let msg = Message(content: "test", role: .user)
+        conv.addMessage(msg)
+        XCTAssertGreaterThanOrEqual(conv.updatedAt, before)
+        XCTAssertFalse(conv.isEmpty)
+        let last = try! XCTUnwrap(conv.lastMessage)
+        XCTAssertEqual(last.content, "test")
+    }
+
+    func testConversationAutoTitleFromFirstUserMessage() {
+        var conv = Conversation()
+        // Add assistant message first — should not trigger title change
+        conv.addMessage(Message(content: "Hello!", role: .assistant))
+        XCTAssertEqual(conv.title, "New Conversation")
+
+        // Now add user message — should auto-title
+        conv.addMessage(Message(content: "Short question", role: .user))
+        XCTAssertEqual(conv.title, "Short question")
+    }
+
+    func testConversationAutoTitleTruncatesLongMessages() {
+        var conv = Conversation()
+        let longMsg = String(repeating: "a", count: 100)
+        conv.addMessage(Message(content: longMsg, role: .user))
+        XCTAssertTrue(conv.title.hasSuffix("..."))
+        // 50 chars + "..."
+        XCTAssertEqual(conv.title.count, 53)
+    }
+
+    func testConversationAutoTitleDoesNotOverwrite() {
+        var conv = Conversation(title: "Custom Title")
+        conv.addMessage(Message(content: "new msg", role: .user))
+        // Custom title should remain
+        XCTAssertEqual(conv.title, "Custom Title")
+    }
+
+    func testConversationGetContextMessagesDefault() {
+        var conv = Conversation()
+        for i in 0..<30 {
+            conv.addMessage(Message(content: "msg \(i)", role: i % 2 == 0 ? .user : .assistant))
+        }
+        // Default limit=10 means 20 messages
+        let context = conv.getContextMessages()
+        XCTAssertEqual(context.count, 20)
+        // Should be the last 20
+        XCTAssertEqual(context.first?.content, "msg 10")
+    }
+
+    func testConversationGetContextMessagesCustomLimit() {
+        var conv = Conversation()
+        for i in 0..<10 {
+            conv.addMessage(Message(content: "\(i)", role: .user))
+        }
+        let context = conv.getContextMessages(limit: 2)
+        XCTAssertEqual(context.count, 4)
+    }
+
+    func testConversationGetContextMessagesFewerThanLimit() {
+        var conv = Conversation()
+        conv.addMessage(Message(content: "only", role: .user))
+        let context = conv.getContextMessages()
+        XCTAssertEqual(context.count, 1)
+    }
+
+    func testConversationCodableRoundtrip() throws {
+        var conv = Conversation(title: "Test")
+        conv.addMessage(Message(content: "hi", role: .user))
+        let data = try JSONEncoder().encode(conv)
+        let decoded = try JSONDecoder().decode(Conversation.self, from: data)
+        XCTAssertEqual(conv, decoded)
+    }
+
+    // MARK: - FTAIDocument
+
+    func testFTAIDocumentBasicInit() {
+        let doc = FTAIDocument(version: "1.0", content: "hello")
+        XCTAssertEqual(doc.version, "1.0")
+        XCTAssertEqual(doc.content, "hello")
+        XCTAssertTrue(doc.metadata.isEmpty)
+        XCTAssertNil(doc.schema)
+    }
+
+    func testFTAIDocumentWithMetadataAndSchema() {
+        let field = FTAIField(name: "title", type: .string, required: true, description: "doc title")
+        let schema = FTAISchema(name: "TestSchema", version: "1.0", fields: [field], description: "A test schema")
+        let doc = FTAIDocument(version: "2.0", metadata: ["author": "test"], content: "body", schema: schema)
+        XCTAssertEqual(doc.metadata["author"], "test")
+        let unwrappedSchema = try! XCTUnwrap(doc.schema)
+        XCTAssertEqual(unwrappedSchema.name, "TestSchema")
+        XCTAssertEqual(unwrappedSchema.fields.count, 1)
+        XCTAssertEqual(unwrappedSchema.fields[0].type, .string)
+        XCTAssertTrue(unwrappedSchema.fields[0].required)
+    }
+
+    func testFTAIDocumentCodableRoundtrip() throws {
+        let field = FTAIField(name: "count", type: .integer)
+        let schema = FTAISchema(name: "S", version: "1", fields: [field])
+        let doc = FTAIDocument(version: "1.0", metadata: ["k": "v"], content: "c", schema: schema)
+        let data = try JSONEncoder().encode(doc)
+        let decoded = try JSONDecoder().decode(FTAIDocument.self, from: data)
+        XCTAssertEqual(doc, decoded)
+    }
+
+    func testFTAIFieldTypeDisplayNames() {
+        XCTAssertEqual(FTAIFieldType.string.displayName, "String")
+        XCTAssertEqual(FTAIFieldType.integer.displayName, "Integer")
+        XCTAssertEqual(FTAIFieldType.boolean.displayName, "Boolean")
+        XCTAssertEqual(FTAIFieldType.array.displayName, "Array")
+        XCTAssertEqual(FTAIFieldType.object.displayName, "Object")
+        XCTAssertEqual(FTAIFieldType.date.displayName, "Date")
+    }
+
+    func testFTAIFieldTypeCaseIterable() {
+        XCTAssertEqual(FTAIFieldType.allCases.count, 6)
+    }
+
+    func testFTAIFieldDefaultValues() {
+        let field = FTAIField(name: "f", type: .boolean)
+        XCTAssertFalse(field.required)
+        XCTAssertNil(field.description)
+    }
+
+    func testFTAISchemaDefaultDescription() {
+        let schema = FTAISchema(name: "S", version: "1", fields: [])
+        XCTAssertNil(schema.description)
+    }
+
+    // MARK: - SerenaError
+
+    func testSerenaErrorDescriptions() {
+        // Verify every case produces a non-nil errorDescription
+        let errors: [SerenaError] = [
+            .aiModelNotLoaded,
+            .aiModelNotFound("missing"),
+            .aiModelInitializationFailed("fail"),
+            .aiResponseGenerationFailed("gen"),
+            .aiProcessingError("proc"),
+            .voicePermissionDenied,
+            .voiceRecognitionFailed("vr"),
+            .voiceRecognitionUnavailable,
+            .voiceRecognitionSetupFailed,
+            .databaseError("db"),
+            .networkUnavailable,
+            .invalidFTAIFormat("fmt"),
+            .configurationError("cfg"),
+            .conversationNotFound,
+            .emptyMessage,
+            .unknownError("unk"),
+        ]
+        for error in errors {
+            XCTAssertNotNil(error.errorDescription, "Missing errorDescription for \(error)")
+            XCTAssertNotNil(error.recoverySuggestion, "Missing recoverySuggestion for \(error)")
+        }
+    }
+
+    func testSerenaErrorDescriptionContainsMessage() {
+        let err = SerenaError.databaseError("corruption")
+        let desc = try! XCTUnwrap(err.errorDescription)
+        XCTAssertTrue(desc.contains("corruption"))
+    }
+
+    func testSerenaErrorRecoverableClassification() {
+        // Recoverable
+        XCTAssertTrue(SerenaError.aiModelNotLoaded.isRecoverable)
+        XCTAssertTrue(SerenaError.networkUnavailable.isRecoverable)
+        XCTAssertTrue(SerenaError.emptyMessage.isRecoverable)
+        XCTAssertTrue(SerenaError.conversationNotFound.isRecoverable)
+        XCTAssertTrue(SerenaError.aiResponseGenerationFailed("x").isRecoverable)
+        XCTAssertTrue(SerenaError.voiceRecognitionFailed("x").isRecoverable)
+        XCTAssertTrue(SerenaError.invalidFTAIFormat("x").isRecoverable)
+        XCTAssertTrue(SerenaError.unknownError("x").isRecoverable)
+
+        // Not recoverable
+        XCTAssertFalse(SerenaError.aiModelNotFound("x").isRecoverable)
+        XCTAssertFalse(SerenaError.aiModelInitializationFailed("x").isRecoverable)
+        XCTAssertFalse(SerenaError.databaseError("x").isRecoverable)
+        XCTAssertFalse(SerenaError.configurationError("x").isRecoverable)
+    }
+
+    func testSerenaErrorSeverityClassification() {
+        XCTAssertEqual(SerenaError.networkUnavailable.severity, .info)
+        XCTAssertEqual(SerenaError.emptyMessage.severity, .info)
+        XCTAssertEqual(SerenaError.voicePermissionDenied.severity, .warning)
+        XCTAssertEqual(SerenaError.conversationNotFound.severity, .warning)
+        XCTAssertEqual(SerenaError.aiModelNotLoaded.severity, .error)
+        XCTAssertEqual(SerenaError.aiResponseGenerationFailed("x").severity, .error)
+        XCTAssertEqual(SerenaError.databaseError("x").severity, .critical)
+        XCTAssertEqual(SerenaError.unknownError("x").severity, .critical)
+    }
+
+    func testSerenaErrorEquatable() {
+        XCTAssertEqual(SerenaError.aiModelNotLoaded, SerenaError.aiModelNotLoaded)
+        XCTAssertEqual(SerenaError.databaseError("a"), SerenaError.databaseError("a"))
+        XCTAssertNotEqual(SerenaError.databaseError("a"), SerenaError.databaseError("b"))
+        XCTAssertNotEqual(SerenaError.emptyMessage, SerenaError.networkUnavailable)
+    }
+
+    func testErrorSeveritySystemImageNames() {
+        XCTAssertEqual(ErrorSeverity.info.systemImageName, "info.circle")
+        XCTAssertEqual(ErrorSeverity.warning.systemImageName, "exclamationmark.triangle")
+        XCTAssertEqual(ErrorSeverity.error.systemImageName, "xmark.circle")
+        XCTAssertEqual(ErrorSeverity.critical.systemImageName, "exclamationmark.octagon")
+    }
+
+    func testErrorSeverityColors() {
+        XCTAssertEqual(ErrorSeverity.info.color, "blue")
+        XCTAssertEqual(ErrorSeverity.warning.color, "orange")
+        XCTAssertEqual(ErrorSeverity.error.color, "red")
+        XCTAssertEqual(ErrorSeverity.critical.color, "red")
+    }
+
+    // MARK: - PricingConfig
+
+    func testPricingConfigDefaults() {
+        let config = PricingConfig.default
+        XCTAssertEqual(config.corePrice, 0)
+        XCTAssertEqual(config.plusPrice, 20.00)
+        XCTAssertEqual(config.businessPrice, 99.99)
+        XCTAssertEqual(config.additionalSeatPrice, 15)
+        XCTAssertEqual(config.currency, "USD")
+    }
+
+    func testPricingConfigCustomInit() {
+        let config = PricingConfig(corePrice: 5, plusPrice: 25, businessPrice: 120, additionalSeatPrice: 20, currency: "EUR")
+        XCTAssertEqual(config.corePrice, 5)
+        XCTAssertEqual(config.currency, "EUR")
+        XCTAssertEqual(config.additionalSeatPrice, 20)
+    }
+
+    func testPricingConfigCodableRoundtrip() throws {
+        let original = PricingConfig(corePrice: 0, plusPrice: 10, businessPrice: 50)
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(original)
+        let decoded = try JSONDecoder().decode(PricingConfig.self, from: data)
+        XCTAssertEqual(decoded.corePrice, original.corePrice)
+        XCTAssertEqual(decoded.plusPrice, original.plusPrice)
+        XCTAssertEqual(decoded.businessPrice, original.businessPrice)
+    }
+
+    func testJakeBundlePricingDefaults() {
+        let jake = PricingConfig.JakeBundlePricing.default
+        XCTAssertEqual(jake.jakePersonalBundle, 189)
+        XCTAssertEqual(jake.jakeBusinessBundle, 999)
+        XCTAssertEqual(jake.jakePersonalHardware, 4000)
+        XCTAssertEqual(jake.jakeBusinessHardware, 8000)
+    }
+
+    func testPricingConfigJakeBundlingProperty() {
+        let config = PricingConfig.default
+        let bundling = config.jakeBundling
+        XCTAssertEqual(bundling.jakePersonalBundle, 189)
+    }
+
+    // MARK: - SerenaIdentity
+
+    func testSerenaIdentityConstants() {
+        XCTAssertEqual(SerenaIdentity.name, "Serena")
+        XCTAssertEqual(SerenaIdentity.creator, "FolkTech AI")
+        XCTAssertEqual(SerenaIdentity.founderName, "Mike Folk")
+        XCTAssertFalse(SerenaIdentity.founderBackground.isEmpty)
+    }
+
+    func testSerenaIdentityCapabilities() {
+        XCTAssertFalse(SerenaIdentity.capabilities.isEmpty)
+        XCTAssertTrue(SerenaIdentity.capabilities.count >= 4)
+    }
+
+    func testSerenaIdentityLearningSystems() {
+        XCTAssertEqual(SerenaIdentity.learningSystems.count, 3)
+        XCTAssertNotNil(SerenaIdentity.learningSystems["Personal Learning"])
+        XCTAssertNotNil(SerenaIdentity.learningSystems["Domain Expansion"])
+        XCTAssertNotNil(SerenaIdentity.learningSystems["Style Adaptation"])
+    }
+
+    func testSerenaIdentityValues() {
+        XCTAssertTrue(SerenaIdentity.values.count >= 5)
+        XCTAssertNotNil(SerenaIdentity.values["Privacy First"])
+    }
+
+    func testSerenaIdentityEcosystem() {
+        XCTAssertNotNil(SerenaIdentity.ecosystem["MacroAI"])
+        XCTAssertNotNil(SerenaIdentity.ecosystem["Jake"])
+        XCTAssertNotNil(SerenaIdentity.ecosystem["Pocket Medic"])
+    }
+
+    func testGenerateSystemPromptWithCapabilities() {
+        let prompt = SerenaIdentity.generateSystemPrompt(includeCapabilities: true)
+        XCTAssertTrue(prompt.contains("Serena"))
+        XCTAssertTrue(prompt.contains("FolkTech AI"))
+        XCTAssertTrue(prompt.contains("Scheduling"))
+    }
+
+    func testGenerateSystemPromptWithoutCapabilities() {
+        let prompt = SerenaIdentity.generateSystemPrompt(includeCapabilities: false)
+        XCTAssertTrue(prompt.contains("Serena"))
+        // Should NOT contain the capability bullets
+        XCTAssertFalse(prompt.contains("Scheduling and calendar management"))
+    }
+
+    func testGenerateIdentityResponse() {
+        let response = SerenaIdentity.generateIdentityResponse()
+        XCTAssertTrue(response.contains("Serena"))
+        XCTAssertTrue(response.contains("Mike Folk"))
+    }
+
+    func testGenerateCapabilitiesResponse() {
+        let response = SerenaIdentity.generateCapabilitiesResponse()
+        XCTAssertTrue(response.contains("help you with"))
+        XCTAssertTrue(response.contains("privacy"))
+    }
+
+    func testGenerateLearningResponse() {
+        let response = SerenaIdentity.generateLearningResponse()
+        XCTAssertTrue(response.contains("learning systems"))
+    }
+
+    func testGenerateValuesResponse() {
+        let response = SerenaIdentity.generateValuesResponse()
+        XCTAssertTrue(response.contains("core values"))
+    }
+
+    func testGenerateEcosystemResponse() {
+        let response = SerenaIdentity.generateEcosystemResponse()
+        XCTAssertTrue(response.contains("MacroAI"))
+        XCTAssertTrue(response.contains("Jake"))
+    }
+
+    func testGenerateNameOriginResponse() {
+        let response = SerenaIdentity.generateNameOriginResponse()
+        XCTAssertTrue(response.contains("book"))
+    }
+
+    // MARK: - Identity Query Detection
+
+    func testDetectIdentityQueryWhoAreYou() {
+        let result = SerenaIdentity.detectIdentityQuery("Who are you?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .identity)
+    }
+
+    func testDetectIdentityQueryCreator() {
+        let result = SerenaIdentity.detectIdentityQuery("Who created you?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .creator)
+    }
+
+    func testDetectIdentityQueryCapabilities() {
+        let result = SerenaIdentity.detectIdentityQuery("What can you do?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .capabilities)
+    }
+
+    func testDetectIdentityQueryLearning() {
+        let result = SerenaIdentity.detectIdentityQuery("How do you learn?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .learning)
+    }
+
+    func testDetectIdentityQueryPrivacy() {
+        let result = SerenaIdentity.detectIdentityQuery("Is my data safe?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .privacy)
+    }
+
+    func testDetectIdentityQueryValues() {
+        let result = SerenaIdentity.detectIdentityQuery("What are your values?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .values)
+    }
+
+    func testDetectIdentityQueryNameOrigin() {
+        let result = SerenaIdentity.detectIdentityQuery("Why are you called Serena?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .nameOrigin)
+    }
+
+    func testDetectIdentityQueryNonIdentity() {
+        let result = SerenaIdentity.detectIdentityQuery("What's the weather today?")
+        XCTAssertFalse(result.isIdentityQuery)
+        XCTAssertNil(result.topic)
+    }
+
+    func testDetectIdentityQueryFolktech() {
+        let result = SerenaIdentity.detectIdentityQuery("Tell me about folktech")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .creator)
+    }
+
+    func testDetectIdentityQueryCloud() {
+        let result = SerenaIdentity.detectIdentityQuery("Does anything go to the cloud?")
+        XCTAssertTrue(result.isIdentityQuery)
+        XCTAssertEqual(result.topic, .privacy)
+    }
+
+    func testGenerateResponseForAllTopics() {
+        for topic in IdentityTopic.allCases {
+            let response = SerenaIdentity.generateResponse(for: topic)
+            XCTAssertFalse(response.isEmpty, "Empty response for topic \(topic)")
+        }
+    }
+
+    func testIdentityTopicRawValues() {
+        XCTAssertEqual(IdentityTopic.identity.rawValue, "identity")
+        XCTAssertEqual(IdentityTopic.creator.rawValue, "creator")
+        XCTAssertEqual(IdentityTopic.nameOrigin.rawValue, "name_origin")
+        XCTAssertEqual(IdentityTopic.capabilities.rawValue, "capabilities")
+        XCTAssertEqual(IdentityTopic.learning.rawValue, "learning")
+        XCTAssertEqual(IdentityTopic.privacy.rawValue, "privacy")
+        XCTAssertEqual(IdentityTopic.values.rawValue, "values")
+    }
+
+    // MARK: - SubscriptionTier
+
+    func testSubscriptionTierDisplayNames() {
+        XCTAssertEqual(SubscriptionTier.core.displayName, "Serena Core")
+        XCTAssertEqual(SubscriptionTier.plus.displayName, "Serena Plus")
+        XCTAssertEqual(SubscriptionTier.business.displayName, "Serena Business")
+        XCTAssertEqual(SubscriptionTier.expired.displayName, "Expired")
+    }
+
+    func testSubscriptionTierMonthlyPriceDefaults() {
+        XCTAssertEqual(SubscriptionTier.core.monthlyPrice(), 0)
+        XCTAssertEqual(SubscriptionTier.plus.monthlyPrice(), 20.00)
+        XCTAssertEqual(SubscriptionTier.business.monthlyPrice(), 99.99)
+        XCTAssertEqual(SubscriptionTier.expired.monthlyPrice(), 0)
+    }
+
+    func testSubscriptionTierMonthlyPriceCustomConfig() {
+        let config = PricingConfig(corePrice: 5, plusPrice: 30, businessPrice: 150)
+        XCTAssertEqual(SubscriptionTier.core.monthlyPrice(from: config), 5)
+        XCTAssertEqual(SubscriptionTier.plus.monthlyPrice(from: config), 30)
+        XCTAssertEqual(SubscriptionTier.business.monthlyPrice(from: config), 150)
+    }
+
+    func testSubscriptionTierFeatureGates() {
+        // Knowledge expansion
+        XCTAssertFalse(SubscriptionTier.core.allowsKnowledgeExpansion)
+        XCTAssertTrue(SubscriptionTier.plus.allowsKnowledgeExpansion)
+        XCTAssertTrue(SubscriptionTier.business.allowsKnowledgeExpansion)
+        XCTAssertFalse(SubscriptionTier.expired.allowsKnowledgeExpansion)
+
+        // Advanced models
+        XCTAssertFalse(SubscriptionTier.core.allowsAdvancedModels)
+        XCTAssertTrue(SubscriptionTier.plus.allowsAdvancedModels)
+        XCTAssertTrue(SubscriptionTier.business.allowsAdvancedModels)
+
+        // Thinking models — business only
+        XCTAssertFalse(SubscriptionTier.core.allowsThinkingModels)
+        XCTAssertFalse(SubscriptionTier.plus.allowsThinkingModels)
+        XCTAssertTrue(SubscriptionTier.business.allowsThinkingModels)
+
+        // Proactive AI
+        XCTAssertFalse(SubscriptionTier.core.allowsProactiveAI)
+        XCTAssertTrue(SubscriptionTier.plus.allowsProactiveAI)
+        XCTAssertTrue(SubscriptionTier.business.allowsProactiveAI)
+    }
+
+    func testSubscriptionTierVerificationIntervals() {
+        XCTAssertEqual(SubscriptionTier.core.verificationInterval, 30 * 24 * 60 * 60)
+        XCTAssertEqual(SubscriptionTier.plus.verificationInterval, 7 * 24 * 60 * 60)
+        XCTAssertEqual(SubscriptionTier.business.verificationInterval, 24 * 60 * 60)
+        XCTAssertEqual(SubscriptionTier.expired.verificationInterval, 24 * 60 * 60)
+    }
+
+    func testSubscriptionTierGracePeriodDays() {
+        XCTAssertEqual(SubscriptionTier.core.gracePeriodDays, 7)
+        XCTAssertEqual(SubscriptionTier.plus.gracePeriodDays, 3)
+        XCTAssertEqual(SubscriptionTier.business.gracePeriodDays, 1)
+        XCTAssertEqual(SubscriptionTier.expired.gracePeriodDays, 0)
+    }
+
+    func testSubscriptionTierMaxDevices() {
+        XCTAssertEqual(SubscriptionTier.core.maxDevices, 2)
+        XCTAssertEqual(SubscriptionTier.plus.maxDevices, 3)
+        XCTAssertEqual(SubscriptionTier.business.maxDevices, 5)
+        XCTAssertEqual(SubscriptionTier.expired.maxDevices, 1)
+    }
+
+    func testSubscriptionTierKnowledgeExpansionLimits() {
+        XCTAssertEqual(SubscriptionTier.core.knowledgeExpansionDailyLimit, 0)
+        XCTAssertEqual(SubscriptionTier.plus.knowledgeExpansionDailyLimit, 50)
+        XCTAssertNil(SubscriptionTier.business.knowledgeExpansionDailyLimit)
+        XCTAssertEqual(SubscriptionTier.expired.knowledgeExpansionDailyLimit, 0)
+    }
+
+    func testSubscriptionTierBenefits() {
+        XCTAssertFalse(SubscriptionTier.core.benefits.isEmpty)
+        XCTAssertFalse(SubscriptionTier.plus.benefits.isEmpty)
+        XCTAssertFalse(SubscriptionTier.business.benefits.isEmpty)
+        XCTAssertTrue(SubscriptionTier.expired.benefits.isEmpty)
+        // Plus should have more benefits than core
+        XCTAssertGreaterThan(SubscriptionTier.plus.benefits.count, SubscriptionTier.core.benefits.count)
+    }
+
+    func testSubscriptionTierUpgradeURLs() {
+        XCTAssertTrue(SubscriptionTier.core.upgradeURL.absoluteString.contains("core"))
+        XCTAssertTrue(SubscriptionTier.plus.upgradeURL.absoluteString.contains("plus"))
+        XCTAssertTrue(SubscriptionTier.business.upgradeURL.absoluteString.contains("business"))
+        XCTAssertTrue(SubscriptionTier.expired.upgradeURL.absoluteString.contains("renew"))
+    }
+
+    func testSubscriptionTierCodableRoundtrip() throws {
+        for tier in SubscriptionTier.allCases {
+            let data = try JSONEncoder().encode(tier)
+            let decoded = try JSONDecoder().decode(SubscriptionTier.self, from: data)
+            XCTAssertEqual(tier, decoded)
+        }
+    }
+
+    // MARK: - SubscriptionStatus
+
+    func testSubscriptionStatusExpiredFactory() {
+        let status = SubscriptionStatus.expired(deviceId: "dev1")
+        XCTAssertEqual(status.tier, .expired)
+        XCTAssertEqual(status.deviceId, "dev1")
+        XCTAssertFalse(status.isActive)
+        XCTAssertTrue(status.isExpired)
+        XCTAssertNil(status.gracePeriodEndsAt)
+        XCTAssertFalse(status.isInGracePeriod)
+    }
+
+    func testSubscriptionStatusTrialFactory() {
+        let status = SubscriptionStatus.trial(deviceId: "dev2")
+        XCTAssertEqual(status.tier, .plus)
+        XCTAssertEqual(status.deviceId, "dev2")
+        XCTAssertTrue(status.isActive)
+        XCTAssertFalse(status.isExpired)
+        // Should expire in ~7 days
+        XCTAssertGreaterThanOrEqual(status.daysUntilExpiration, 6)
+        XCTAssertLessThanOrEqual(status.daysUntilExpiration, 7)
+    }
+
+    func testSubscriptionStatusActiveWithFutureExpiry() {
+        let futureDate = Calendar.current.date(byAdding: .day, value: 30, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus,
+            expiresAt: futureDate,
+            lastVerified: Date(),
+            gracePeriodEndsAt: nil,
+            isInGracePeriod: false,
+            deviceId: "dev"
+        )
+        XCTAssertTrue(status.isActive)
+        XCTAssertFalse(status.isExpired)
+        let days = status.daysUntilExpiration
+        XCTAssertGreaterThanOrEqual(days, 29)
+        XCTAssertLessThanOrEqual(days, 30)
+    }
+
+    func testSubscriptionStatusExpiredWithPastExpiry() {
+        let pastDate = Calendar.current.date(byAdding: .day, value: -5, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus,
+            expiresAt: pastDate,
+            lastVerified: Date(),
+            gracePeriodEndsAt: nil,
+            isInGracePeriod: false,
+            deviceId: "dev"
+        )
+        XCTAssertFalse(status.isActive)
+        XCTAssertTrue(status.isExpired)
+        XCTAssertEqual(status.daysUntilExpiration, 0)
+    }
+
+    func testSubscriptionStatusGracePeriodActive() {
+        let pastExpiry = Calendar.current.date(byAdding: .day, value: -1, to: Date())!
+        let futureGrace = Calendar.current.date(byAdding: .day, value: 2, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus,
+            expiresAt: pastExpiry,
+            lastVerified: Date(),
+            gracePeriodEndsAt: futureGrace,
+            isInGracePeriod: true,
+            deviceId: "dev"
+        )
+        XCTAssertTrue(status.isActive)
+        let graceRemaining = try! XCTUnwrap(status.daysRemainingInGracePeriod)
+        XCTAssertGreaterThanOrEqual(graceRemaining, 1)
+    }
+
+    func testSubscriptionStatusGracePeriodExpired() {
+        let pastExpiry = Calendar.current.date(byAdding: .day, value: -10, to: Date())!
+        let pastGrace = Calendar.current.date(byAdding: .day, value: -3, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus,
+            expiresAt: pastExpiry,
+            lastVerified: Date(),
+            gracePeriodEndsAt: pastGrace,
+            isInGracePeriod: true,
+            deviceId: "dev"
+        )
+        XCTAssertFalse(status.isActive)
+        XCTAssertTrue(status.isExpired)
+        XCTAssertEqual(status.daysRemainingInGracePeriod, 0)
+    }
+
+    func testSubscriptionStatusMessageActive() {
+        let futureDate = Calendar.current.date(byAdding: .day, value: 30, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus, expiresAt: futureDate, lastVerified: Date(),
+            gracePeriodEndsAt: nil, isInGracePeriod: false, deviceId: "dev"
+        )
+        XCTAssertEqual(status.statusMessage, "Active")
+    }
+
+    func testSubscriptionStatusMessageExpiresSoon() {
+        let soonDate = Calendar.current.date(byAdding: .day, value: 3, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus, expiresAt: soonDate, lastVerified: Date(),
+            gracePeriodEndsAt: nil, isInGracePeriod: false, deviceId: "dev"
+        )
+        XCTAssertTrue(status.statusMessage.contains("Expires in"))
+    }
+
+    func testSubscriptionStatusMessageExpired() {
+        let status = SubscriptionStatus.expired(deviceId: "dev")
+        XCTAssertEqual(status.statusMessage, "Subscription expired")
+    }
+
+    func testSubscriptionStatusMessageGracePeriod() {
+        let pastExpiry = Calendar.current.date(byAdding: .day, value: -1, to: Date())!
+        let futureGrace = Calendar.current.date(byAdding: .day, value: 5, to: Date())!
+        let status = SubscriptionStatus(
+            tier: .plus, expiresAt: pastExpiry, lastVerified: Date(),
+            gracePeriodEndsAt: futureGrace, isInGracePeriod: true, deviceId: "dev"
+        )
+        XCTAssertTrue(status.statusMessage.contains("Grace period"))
+    }
+
+    func testSubscriptionStatusDaysRemainingNilWhenNoGracePeriod() {
+        let status = SubscriptionStatus(
+            tier: .core, expiresAt: Date(), lastVerified: Date(),
+            gracePeriodEndsAt: nil, isInGracePeriod: false, deviceId: "dev"
+        )
+        XCTAssertNil(status.daysRemainingInGracePeriod)
+    }
+
+    func testSubscriptionStatusCodableRoundtrip() throws {
+        let original = SubscriptionStatus.trial(deviceId: "roundtrip-dev")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(SubscriptionStatus.self, from: data)
+        XCTAssertEqual(decoded.tier, original.tier)
+        XCTAssertEqual(decoded.deviceId, original.deviceId)
+    }
+
+    func testSubscriptionStatusLicenseKey() {
+        var status = SubscriptionStatus.trial(deviceId: "dev")
+        XCTAssertNil(status.licenseKey)
+        status.licenseKey = "ABC-123"
+        XCTAssertEqual(status.licenseKey, "ABC-123")
+    }
+
+    // MARK: - SubscriptionError
+
+    func testSubscriptionErrorDescriptions() {
+        let errors: [SubscriptionError] = [
+            .noLicenseKey,
+            .invalidLicenseKey,
+            .licenseExpired,
+            .deviceLimitExceeded,
+            .verificationFailed(NSError(domain: "test", code: 1)),
+            .networkUnavailable,
+            .serverError(500),
+        ]
+        for error in errors {
+            XCTAssertNotNil(error.errorDescription, "Missing errorDescription for \(error)")
+        }
+    }
+
+    func testSubscriptionErrorServerErrorContainsCode() {
+        let err = SubscriptionError.serverError(403)
+        let desc = try! XCTUnwrap(err.errorDescription)
+        XCTAssertTrue(desc.contains("403"))
+    }
+
+    // MARK: - UserConfig
+
+    func testUserConfigDefaults() {
+        let config = UserConfig.default
+        XCTAssertEqual(config.nickname, "User")
+        XCTAssertEqual(config.theme, .system)
+        XCTAssertTrue(config.voiceInputEnabled)
+        XCTAssertFalse(config.passcodeEnabled)
+        XCTAssertTrue(config.rtaiEnabled)
+        XCTAssertEqual(config.responseStyle, .balanced)
+        XCTAssertEqual(config.occupation, "")
+        XCTAssertEqual(config.aboutYou, "")
+        XCTAssertEqual(config.customInstructions, "")
+        XCTAssertEqual(config.weatherLocation, "")
+    }
+
+    func testUserConfigCustomInit() {
+        let config = UserConfig(
+            nickname: "Mike",
+            theme: .dark,
+            voiceInputEnabled: false,
+            passcodeEnabled: true,
+            rtaiEnabled: false,
+            occupation: "Developer",
+            aboutYou: "I like Swift",
+            customInstructions: "Be brief",
+            responseStyle: .technical,
+            weatherLocation: "Las Vegas"
+        )
+        XCTAssertEqual(config.nickname, "Mike")
+        XCTAssertEqual(config.theme, .dark)
+        XCTAssertFalse(config.voiceInputEnabled)
+        XCTAssertTrue(config.passcodeEnabled)
+        XCTAssertEqual(config.occupation, "Developer")
+        XCTAssertEqual(config.responseStyle, .technical)
+        XCTAssertEqual(config.weatherLocation, "Las Vegas")
+    }
+
+    func testUserConfigCodableRoundtrip() throws {
+        let original = UserConfig(nickname: "Test", theme: .light, responseStyle: .casual, weatherLocation: "NYC")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(UserConfig.self, from: data)
+        XCTAssertEqual(original, decoded)
+    }
+
+    func testUserConfigBackwardsCompatibleDecoding() throws {
+        // Simulate an older config without new fields
+        let json = """
+        {
+            "nickname": "OldUser",
+            "theme": "dark",
+            "voiceInputEnabled": true,
+            "passcodeEnabled": false,
+            "rtaiEnabled": true
+        }
+        """
+        let data = Data(json.utf8)
+        let config = try JSONDecoder().decode(UserConfig.self, from: data)
+        XCTAssertEqual(config.nickname, "OldUser")
+        XCTAssertEqual(config.theme, .dark)
+        // New fields should default
+        XCTAssertEqual(config.occupation, "")
+        XCTAssertEqual(config.responseStyle, .balanced)
+        XCTAssertEqual(config.weatherLocation, "")
+    }
+
+    func testUserConfigDecodesEmptyJSON() throws {
+        let data = Data("{}".utf8)
+        let config = try JSONDecoder().decode(UserConfig.self, from: data)
+        XCTAssertEqual(config.nickname, "User")
+        XCTAssertEqual(config.theme, .system)
+    }
+
+    // MARK: - ResponseStyle
+
+    func testResponseStyleAllCases() {
+        XCTAssertEqual(ResponseStyle.allCases.count, 4)
+    }
+
+    func testResponseStyleDisplayNames() {
+        XCTAssertEqual(ResponseStyle.casual.displayName, "Casual & Friendly")
+        XCTAssertEqual(ResponseStyle.balanced.displayName, "Balanced")
+        XCTAssertEqual(ResponseStyle.professional.displayName, "Professional")
+        XCTAssertEqual(ResponseStyle.technical.displayName, "Technical & Detailed")
+    }
+
+    func testResponseStyleDescriptions() {
+        for style in ResponseStyle.allCases {
+            XCTAssertFalse(style.description.isEmpty)
+        }
+    }
+
+    func testResponseStyleDirectives() {
+        // Balanced has empty directive
+        XCTAssertEqual(ResponseStyle.balanced.directive, "")
+        // Others have non-empty directives
+        XCTAssertFalse(ResponseStyle.casual.directive.isEmpty)
+        XCTAssertFalse(ResponseStyle.professional.directive.isEmpty)
+        XCTAssertFalse(ResponseStyle.technical.directive.isEmpty)
+    }
+
+    func testResponseStyleCodableRoundtrip() throws {
+        for style in ResponseStyle.allCases {
+            let data = try JSONEncoder().encode(style)
+            let decoded = try JSONDecoder().decode(ResponseStyle.self, from: data)
+            XCTAssertEqual(style, decoded)
+        }
+    }
+
+    // MARK: - AppTheme
+
+    func testAppThemeDisplayNames() {
+        XCTAssertEqual(AppTheme.light.displayName, "Light")
+        XCTAssertEqual(AppTheme.dark.displayName, "Dark")
+        XCTAssertEqual(AppTheme.system.displayName, "System")
+    }
+
+    func testAppThemeColorScheme() {
+        XCTAssertEqual(AppTheme.light.colorScheme, .light)
+        XCTAssertEqual(AppTheme.dark.colorScheme, .dark)
+        XCTAssertNil(AppTheme.system.colorScheme)
+    }
+
+    func testAppThemeCaseIterable() {
+        XCTAssertEqual(AppTheme.allCases.count, 3)
+    }
+
+    // MARK: - AIParameters
+
+    func testAIParametersDefaults() {
+        let params = AIParameters()
+        XCTAssertEqual(params.temperature, 0.7)
+        XCTAssertEqual(params.maxTokens, 1000)
+        XCTAssertEqual(params.contextWindow, 10)
+    }
+
+    func testAIParametersClamping() {
+        let params = AIParameters(temperature: 5.0, maxTokens: 99999, contextWindow: 100)
+        XCTAssertEqual(params.temperature, 2.0)
+        XCTAssertEqual(params.maxTokens, 4000)
+        XCTAssertEqual(params.contextWindow, 20)
+
+        let paramsLow = AIParameters(temperature: -1.0, maxTokens: 1, contextWindow: 0)
+        XCTAssertEqual(paramsLow.temperature, 0.0)
+        XCTAssertEqual(paramsLow.maxTokens, 100)
+        XCTAssertEqual(paramsLow.contextWindow, 1)
+    }
+
+    func testAIParametersCodableRoundtrip() throws {
+        let original = AIParameters(temperature: 1.2, maxTokens: 2000, contextWindow: 5)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AIParameters.self, from: data)
+        XCTAssertEqual(original, decoded)
+    }
+
+    // MARK: - VoiceSettings
+
+    func testVoiceSettingsDefaults() {
+        let settings = VoiceSettings()
+        XCTAssertTrue(settings.noiseReductionEnabled)
+        XCTAssertTrue(settings.voiceCommandsEnabled)
+        XCTAssertFalse(settings.autoSendEnabled)
+        XCTAssertEqual(settings.microphoneSensitivity, 0.5)
+        XCTAssertEqual(settings.speechTimeout, 3.0)
+        XCTAssertEqual(settings.language, "en-US")
+    }
+
+    func testVoiceSettingsClamping() {
+        let settings = VoiceSettings(microphoneSensitivity: 2.0, speechTimeout: 100.0)
+        XCTAssertEqual(settings.microphoneSensitivity, 1.0)
+        XCTAssertEqual(settings.speechTimeout, 10.0)
+
+        let settingsLow = VoiceSettings(microphoneSensitivity: -1.0, speechTimeout: 0.1)
+        XCTAssertEqual(settingsLow.microphoneSensitivity, 0.0)
+        XCTAssertEqual(settingsLow.speechTimeout, 1.0)
+    }
+
+    func testVoiceSettingsCodableRoundtrip() throws {
+        let original = VoiceSettings(language: "fr-FR")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(VoiceSettings.self, from: data)
+        XCTAssertEqual(original, decoded)
+    }
+
+    // MARK: - UserTier
+
+    func testUserTierRawValues() {
+        XCTAssertEqual(UserTier.free.rawValue, "free")
+        XCTAssertEqual(UserTier.paid.rawValue, "paid")
+    }
+
+    func testUserTierMemoryRetention() {
+        XCTAssertEqual(UserTier.free.memoryRetentionDays, 30)
+        XCTAssertEqual(UserTier.paid.memoryRetentionDays, 3650)
+    }
+
+    func testUserTierMaxHistoryMessages() {
+        XCTAssertEqual(UserTier.free.maxHistoryMessages, 1000)
+        XCTAssertEqual(UserTier.paid.maxHistoryMessages, 10000)
+    }
+
+    func testUserTierDisplayNames() {
+        XCTAssertEqual(UserTier.free.displayName, "Free")
+        XCTAssertEqual(UserTier.paid.displayName, "Paid")
+    }
+
+    func testUserTierFeatures() {
+        XCTAssertFalse(UserTier.free.features.isEmpty)
+        XCTAssertFalse(UserTier.paid.features.isEmpty)
+        XCTAssertGreaterThan(UserTier.paid.features.count, UserTier.free.features.count)
+    }
+
+    func testUserTierCodableRoundtrip() throws {
+        for tier in [UserTier.free, UserTier.paid] {
+            let data = try JSONEncoder().encode(tier)
+            let decoded = try JSONDecoder().decode(UserTier.self, from: data)
+            XCTAssertEqual(tier, decoded)
+        }
+    }
+
+    // MARK: - UserTierConfig
+
+    func testUserTierConfigDefaults() {
+        let config = UserTierConfig()
+        XCTAssertEqual(config.currentTier, .free)
+        XCTAssertNil(config.lastCleanupDate)
+    }
+
+    func testUserTierConfigPaidInit() {
+        let config = UserTierConfig(tier: .paid)
+        XCTAssertEqual(config.currentTier, .paid)
+    }
+
+    func testUserTierConfigIsWithinRetentionRecent() {
+        let config = UserTierConfig(tier: .free)
+        let recentDate = Calendar.current.date(byAdding: .day, value: -10, to: Date())!
+        XCTAssertTrue(config.isWithinRetention(recentDate))
+    }
+
+    func testUserTierConfigIsWithinRetentionOld() {
+        let config = UserTierConfig(tier: .free)
+        let oldDate = Calendar.current.date(byAdding: .day, value: -60, to: Date())!
+        XCTAssertFalse(config.isWithinRetention(oldDate))
+    }
+
+    func testUserTierConfigPaidRetainsFarBack() {
+        let config = UserTierConfig(tier: .paid)
+        let farBack = Calendar.current.date(byAdding: .year, value: -5, to: Date())!
+        XCTAssertTrue(config.isWithinRetention(farBack))
+    }
+
+    func testUserTierConfigShouldRunCleanupNoLastCleanup() {
+        let config = UserTierConfig()
+        XCTAssertTrue(config.shouldRunCleanup())
+    }
+
+    func testUserTierConfigShouldRunCleanupRecentCleanup() {
+        var config = UserTierConfig()
+        config.lastCleanupDate = Date()
+        XCTAssertFalse(config.shouldRunCleanup())
+    }
+
+    func testUserTierConfigShouldRunCleanupOldCleanup() {
+        var config = UserTierConfig()
+        config.lastCleanupDate = Calendar.current.date(byAdding: .day, value: -2, to: Date())
+        XCTAssertTrue(config.shouldRunCleanup())
+    }
+
+    func testUserTierConfigCodableRoundtrip() throws {
+        var original = UserTierConfig(tier: .paid)
+        original.lastCleanupDate = Date()
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(UserTierConfig.self, from: data)
+        XCTAssertEqual(decoded.currentTier, original.currentTier)
+    }
+}

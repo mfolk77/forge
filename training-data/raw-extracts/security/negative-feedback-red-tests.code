@@ -1,0 +1,303 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red tests for NegativeFeedbackDetector + ContradictionDetector
+///
+/// Attack vectors tested:
+/// - Injection in feedback text
+/// - False positive/negative boundary testing
+/// - Unicode homoglyph keys in ContradictionDetector
+/// - Injection in fact keys
+/// - Empty/edge case inputs
+final class NegativeFeedbackRedTests: XCTestCase {
+
+    private var feedbackDetector: NegativeFeedbackDetector!
+    private var contradictionDetector: ContradictionDetector!
+
+    override func setUp() async throws {
+        feedbackDetector = NegativeFeedbackDetector()
+        contradictionDetector = ContradictionDetector()
+    }
+
+    // MARK: - NegativeFeedbackDetector: Injection Tests
+
+    func test_feedback_scriptInjection_treatedAsText() async {
+        let feedback = await feedbackDetector.detect(
+            in: "<script>alert('xss')</script> that's wrong",
+            recentFactKeys: ["wife's name"]
+        )
+        // Should detect the negative feedback, treating script as text
+        XCTAssertNotNil(feedback, "Should still detect 'that's wrong' even with script tags")
+        XCTAssertEqual(feedback?.severity, .strong)
+    }
+
+    func test_feedback_appleScriptInjection_treatedAsText() async {
+        let feedback = await feedbackDetector.detect(
+            in: "that's wrong\" & do shell script \"whoami\" & \"",
+            recentFactKeys: []
+        )
+        // Should detect feedback without executing
+        XCTAssertNotNil(feedback, "Should detect feedback even with AppleScript injection")
+    }
+
+    func test_feedback_nullBytes_handled() async {
+        let feedback = await feedbackDetector.detect(
+            in: "that's\0 wrong\0",
+            recentFactKeys: []
+        )
+        // Null bytes should not prevent detection
+        XCTAssertNotNil(feedback, "Should handle null bytes gracefully")
+    }
+
+    // MARK: - NegativeFeedbackDetector: False Positive Boundary
+
+    func test_feedback_positiveMessage_noFalsePositive() async {
+        let feedback = await feedbackDetector.detect(
+            in: "That's right! You remembered correctly.",
+            recentFactKeys: []
+        )
+        XCTAssertNil(feedback, "Positive messages should not trigger false positive")
+    }
+
+    func test_feedback_neutralMessage_noFalsePositive() async {
+        let feedback = await feedbackDetector.detect(
+            in: "Tell me about the weather today",
+            recentFactKeys: []
+        )
+        XCTAssertNil(feedback, "Neutral messages should not trigger false positive")
+    }
+
+    func test_feedback_rightWord_noFalsePositive() async {
+        // "right" in a non-rejection context
+        let feedback = await feedbackDetector.detect(
+            in: "Turn right at the next intersection",
+            recentFactKeys: []
+        )
+        XCTAssertNil(feedback, "Directional 'right' should not trigger negative feedback")
+    }
+
+    // MARK: - NegativeFeedbackDetector: True Detection
+
+    func test_feedback_strongRejection_detected() async {
+        let testCases = [
+            "that's completely wrong",
+            "you're mistaken",
+            "that's incorrect",
+            "I never said that",
+            "no, that's not right",
+        ]
+
+        for input in testCases {
+            let feedback = await feedbackDetector.detect(in: input, recentFactKeys: ["test"])
+            XCTAssertNotNil(feedback, "Should detect strong rejection: '\(input)'")
+            if let feedback = feedback {
+                XCTAssertEqual(feedback.severity, .strong,
+                    "'\(input)' should be classified as strong rejection")
+            }
+        }
+    }
+
+    func test_feedback_mildRejection_detected() async {
+        let testCases = [
+            "not quite right",
+            "that's not exactly what I meant",
+            "hmm, no",
+            "not really",
+            "close but not quite",
+        ]
+
+        for input in testCases {
+            let feedback = await feedbackDetector.detect(in: input, recentFactKeys: ["test"])
+            XCTAssertNotNil(feedback, "Should detect mild rejection: '\(input)'")
+            if let feedback = feedback {
+                XCTAssertEqual(feedback.severity, .mild,
+                    "'\(input)' should be classified as mild rejection")
+            }
+        }
+    }
+
+    func test_feedback_pureRejection_vsCorrection() async {
+        // Pure rejection (no correction value)
+        let pure = await feedbackDetector.isPureRejection("that's wrong")
+        XCTAssertTrue(pure, "'that's wrong' is a pure rejection")
+
+        // Correction (has new value)
+        let notPure = await feedbackDetector.isPureRejection("that's wrong, it's actually Sarah")
+        XCTAssertFalse(notPure, "'that's wrong, it's actually Sarah' is a correction, not pure rejection")
+    }
+
+    // MARK: - NegativeFeedbackDetector: Empty/Edge Cases
+
+    func test_feedback_emptyMessage_noDetection() async {
+        let feedback = await feedbackDetector.detect(in: "", recentFactKeys: [])
+        XCTAssertNil(feedback, "Empty message should return nil")
+    }
+
+    func test_feedback_whitespaceOnly_noDetection() async {
+        let feedback = await feedbackDetector.detect(in: "   \t\n  ", recentFactKeys: [])
+        XCTAssertNil(feedback, "Whitespace-only should return nil")
+    }
+
+    // MARK: - ContradictionDetector: Basic Detection
+
+    func test_contradiction_sameKeySameValue_noContradiction() async {
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "Christina",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        XCTAssertNil(result, "Same key + same value = not a contradiction")
+    }
+
+    func test_contradiction_sameKeyDifferentValue_detected() async {
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "Sarah",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        XCTAssertNotNil(result, "Same key + different value = contradiction")
+        XCTAssertEqual(result?.existingValue, "Christina")
+        XCTAssertEqual(result?.newValue, "Sarah")
+    }
+
+    func test_contradiction_autoResolve_higherConfidence() async {
+        // New fact has much higher confidence → auto-resolve to new
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "Sarah",
+            newConfidence: 0.95,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.5)]
+        )
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result?.resolution, .autoResolveNew,
+            "Much higher new confidence should auto-resolve to new")
+    }
+
+    func test_contradiction_autoResolve_existingHigher() async {
+        // Existing fact has much higher confidence → auto-resolve to existing
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "Sarah",
+            newConfidence: 0.3,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.9)]
+        )
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result?.resolution, .autoResolveExisting,
+            "Much higher existing confidence should auto-resolve to existing")
+    }
+
+    func test_contradiction_closeConfidence_needsUserResolution() async {
+        // Similar confidence → needs user resolution
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "Sarah",
+            newConfidence: 0.8,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.75)]
+        )
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result?.resolution, .needsUserResolution,
+            "Close confidence values should require user resolution")
+    }
+
+    // MARK: - ContradictionDetector: Key Normalization
+
+    func test_contradiction_keyNormalization_possessives() async {
+        let normalized = await contradictionDetector.normalizeKey("User's wife's name")
+        XCTAssertEqual(normalized, "wife name",
+            "Should strip possessives and 'User's' prefix")
+    }
+
+    func test_contradiction_keyNormalization_isSuffix() async {
+        let normalized = await contradictionDetector.normalizeKey("wife's name is")
+        XCTAssertEqual(normalized, "wife name",
+            "Should strip trailing ' is'")
+    }
+
+    func test_contradiction_synonymMatching_wifeSpouse() async {
+        // "wife's name" and "spouse's name" should match
+        let result = await contradictionDetector.detect(
+            newKey: "spouse's name",
+            newValue: "Sarah",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        XCTAssertNotNil(result, "wife/spouse should be recognized as synonyms")
+    }
+
+    // MARK: - ContradictionDetector: Injection in Keys
+
+    func test_contradiction_injectionInKey_treatedAsText() async {
+        let result = await contradictionDetector.detect(
+            newKey: "'; DROP TABLE facts; --",
+            newValue: "test",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        // SQL injection in key should just be treated as a non-matching string
+        XCTAssertNil(result, "Injection in key should not match legitimate keys")
+    }
+
+    func test_contradiction_emptyKey_noContradiction() async {
+        let result = await contradictionDetector.detect(
+            newKey: "",
+            newValue: "test",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        XCTAssertNil(result, "Empty key should not match anything")
+    }
+
+    func test_contradiction_emptyValue_noContradiction() async {
+        let result = await contradictionDetector.detect(
+            newKey: "wife's name",
+            newValue: "",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        XCTAssertNil(result, "Empty value should not trigger contradiction")
+    }
+
+    // MARK: - ContradictionDetector: Unicode Homoglyphs
+
+    func test_contradiction_unicodeHomoglyphKey_noFalseMatch() async {
+        // Cyrillic 'а' (U+0430) vs Latin 'a' (U+0061)
+        let cyrillicKey = "wife's n\u{0430}me" // Cyrillic 'а' in "name"
+        let result = await contradictionDetector.detect(
+            newKey: cyrillicKey,
+            newValue: "Sarah",
+            newConfidence: 0.9,
+            existingFacts: ["wife's name": (value: "Christina", confidence: 0.8)]
+        )
+        // This is a tricky case — the keys look the same but have different characters.
+        // Our normalizer uses lowercased() which doesn't collapse homoglyphs.
+        // This test documents the behavior (may or may not match depending on implementation).
+        // The important thing: it should NOT crash.
+        XCTAssertTrue(true, "Unicode homoglyph keys should not crash the detector")
+    }
+
+    // MARK: - ContradictionDetector: Batch Detection
+
+    func test_contradiction_batchDetection_multipleContradictions() async {
+        let newFacts: [(key: String, value: String, confidence: Double)] = [
+            ("wife's name", "Sarah", 0.9),
+            ("favorite color", "green", 0.7),
+            ("birthday", "January 1st", 0.8),
+        ]
+
+        let existingFacts: [String: (value: String, confidence: Double)] = [
+            "wife's name": (value: "Christina", confidence: 0.8),
+            "favorite color": (value: "blue", confidence: 0.6),
+            "birthday": (value: "January 1st", confidence: 0.9), // Same value
+        ]
+
+        let contradictions = await contradictionDetector.detectBatch(
+            newFacts: newFacts,
+            existingFacts: existingFacts
+        )
+
+        XCTAssertEqual(contradictions.count, 2,
+            "Should detect 2 contradictions (wife's name + favorite color). Birthday has same value.")
+    }
+}

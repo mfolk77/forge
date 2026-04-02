@@ -1,0 +1,231 @@
+import Foundation
+
+/// Feature flags for controlling feature availability
+/// V1 FOUNDATION: Core systems always on, optional features disabled until stable
+public struct FeatureFlags: Sendable {
+
+    // MARK: - V1 Core Systems (ALWAYS ENABLED - Don't Touch)
+
+    /// RTAI (Real-Time AI) - instant retrieval responses
+    /// THIS WORKS - DO NOT DISABLE
+    nonisolated(unsafe) public static var rtaiEnabled: Bool = true
+
+    /// Mitosis knowledge clustering
+    /// THIS WORKS - DO NOT DISABLE
+    nonisolated(unsafe) public static var mitosisEnabled: Bool = true
+
+    /// Conversation system
+    nonisolated(unsafe) public static var conversationEnabled: Bool = true
+
+    // MARK: - V1 Optional Features (DISABLED for stability)
+
+    /// Tool calling (calendar, files, apps)
+    /// V1.1: Intent-based detection (no prompt changes, memory safe)
+    nonisolated(unsafe) public static var toolCallingEnabled: Bool = true
+
+    /// Proactive engine (reminders, calendar alerts)
+    /// V1.1 feature - disabled for now
+    nonisolated(unsafe) public static var proactiveEngineEnabled: Bool = false
+
+    /// Web search integration
+    /// V1.2 feature - disabled for now
+    nonisolated(unsafe) public static var webSearchEnabled: Bool = false
+
+    /// Voice input feature
+    /// V1.1 feature - disabled for now
+    nonisolated(unsafe) public static var voiceEnabled: Bool = false
+
+    // MARK: - Experimental Features (DISABLED — not tested for v1.9.0)
+
+    /// Personality system — RelationshipTracker, ToneAnalyzer, ResponseStyle injection
+    /// Adds 0-40 tokens to system prompt per message. Disabled until tested.
+    nonisolated(unsafe) public static var personalityEnabled: Bool = false
+
+    /// Learning Coordinator (System 1) — processes LLM responses to build knowledge
+    /// Writes to SQLite on every message. Disabled until tested.
+    nonisolated(unsafe) public static var learningCoordinatorEnabled: Bool = false
+
+    /// Layer 2 Proactive Intelligence — ConfidenceMap, CuriosityEngine, ProactiveCoordinator
+    /// Feeds RTAI/LLM results into ProactiveIntegrationBridge. Disabled until tested.
+    nonisolated(unsafe) public static var proactiveIntelligenceEnabled: Bool = false
+
+    // MARK: - V2 Features (Future - Keep Disabled)
+
+    /// System 2: Domain Expansion - researches topics and builds knowledge
+    /// V1.2 feature
+    nonisolated(unsafe) public static var system2DomainExpansionEnabled: Bool = false
+
+    /// System 3: Style Adaptation - LoRA fine-tuning for user communication style
+    /// V1.3 feature
+    nonisolated(unsafe) public static var system3StyleAdaptationEnabled: Bool = false
+
+    /// Mitosis clustering — hierarchical knowledge organization
+    nonisolated(unsafe) public static var mitosisClusteringEnabled: Bool = false
+
+    /// Knowledge expansion feature - experimental
+    nonisolated(unsafe) public static var knowledgeExpansionEnabled: Bool = false
+
+    /// Screen intelligence (ScreenReader, AnticipatoryEngine context)
+    /// Disabled until screen agent ships
+    nonisolated(unsafe) public static var screenIntelligenceEnabled: Bool = false
+
+    // MARK: - Quick Action / Raycast Killer Features
+
+    /// Quick Action overlay (global hotkey, fast-path routing)
+    nonisolated(unsafe) public static var quickActionEnabled: Bool = false
+
+    /// Clipboard history manager
+    nonisolated(unsafe) public static var clipboardHistoryEnabled: Bool = false
+
+    /// Window snapping and tiling via AX API
+    nonisolated(unsafe) public static var windowManagementEnabled: Bool = false
+
+    /// Text expansion snippets
+    nonisolated(unsafe) public static var snippetsEnabled: Bool = false
+
+    /// Extended system commands (lock, trash, brightness, etc.)
+    nonisolated(unsafe) public static var systemCommandsExtendedEnabled: Bool = false
+
+    /// Spotlight-powered file search
+    nonisolated(unsafe) public static var fileSearchEnabled: Bool = false
+
+    /// Biometric authentication (Touch ID / device password)
+    /// Gates app launch auth and sensitive data access (VA health records)
+    nonisolated(unsafe) public static var biometricAuthEnabled: Bool = false
+
+    // MARK: - Onboarding
+
+    /// Legacy 8-page onboarding — disabled for v2, kept as rollback path
+    nonisolated(unsafe) public static var legacyOnboardingEnabled: Bool = false
+
+    // MARK: - UI Features (Keep Enabled)
+
+    /// Export feature - Pro only when enabled
+    nonisolated(unsafe) public static var exportEnabled: Bool = true
+
+    /// Custom themes feature - Pro only when enabled
+    nonisolated(unsafe) public static var themesEnabled: Bool = true
+
+    /// Advanced personalization (custom instructions, response styles)
+    nonisolated(unsafe) public static var advancedPersonalizationEnabled: Bool = true
+
+    // MARK: - Tier Configuration
+
+    /// Free tier conversation history limit (in days)
+    public static let freeHistoryDaysLimit: Int = 30
+
+    // MARK: - Debug Flags
+
+    #if DEBUG
+    /// Force Pro status for testing (DEBUG only)
+    nonisolated(unsafe) public static var debugForcePro: Bool = false
+
+    /// Show subscription debug info in UI
+    nonisolated(unsafe) public static var debugShowSubscriptionInfo: Bool = true
+
+    /// Enable verbose logging for debugging
+    nonisolated(unsafe) public static var debugVerboseLogging: Bool = true
+    #endif
+
+    // MARK: - Dev Build Overrides
+    //
+    // In DEBUG builds (Xcode Run), all experimental features are enabled.
+    // In RELEASE builds (bundle_xcode_build.sh / DMG), they stay off.
+    // Call this once at app startup (e.g., in SerenaNetApp.init or .onAppear).
+
+    public static func applyDevOverrides() {
+        #if DEBUG || FOLK_FAMILY
+        personalityEnabled = true
+        learningCoordinatorEnabled = true
+        proactiveIntelligenceEnabled = true
+        proactiveEngineEnabled = true
+        system2DomainExpansionEnabled = true
+        system3StyleAdaptationEnabled = true
+        mitosisClusteringEnabled = true
+        knowledgeExpansionEnabled = true
+        webSearchEnabled = true
+        // Quick Action / Raycast Killer
+        quickActionEnabled = true
+        clipboardHistoryEnabled = true
+        windowManagementEnabled = true
+        systemCommandsExtendedEnabled = true
+        fileSearchEnabled = true
+        // snippetsEnabled = false  // Ship later
+        #endif
+    }
+
+    // MARK: - v2.0 Release Defaults
+
+    /// v2.0 public release features — called in SerenaNetApp.init for Release builds
+    /// AKE features stay off until live-tested individually
+    public static func applyV2ReleaseDefaults() {
+        personalityEnabled = true
+        webSearchEnabled = true
+        proactiveEngineEnabled = true
+        screenIntelligenceEnabled = true
+        // Raycast Killer
+        quickActionEnabled = true
+        clipboardHistoryEnabled = true
+        windowManagementEnabled = true
+        systemCommandsExtendedEnabled = true
+        fileSearchEnabled = true
+        // Legacy onboarding stays off
+        legacyOnboardingEnabled = false
+    }
+
+    // MARK: - Folk Family Build
+
+    /// Digital Estate vault (dead man's switch, successor access)
+    /// Only available in Folk Family builds — never in public release
+    nonisolated(unsafe) public static var digitalEstateEnabled: Bool = false
+
+    /// Apply Folk Family overrides — all features + Digital Estate
+    /// Called from SerenaNetApp.init when FOLK_FAMILY flag is set
+    public static func applyFamilyOverrides() {
+        #if FOLK_FAMILY
+        // Everything from dev overrides
+        personalityEnabled = true
+        learningCoordinatorEnabled = true
+        proactiveIntelligenceEnabled = true
+        proactiveEngineEnabled = true
+        system2DomainExpansionEnabled = true
+        system3StyleAdaptationEnabled = true
+        mitosisClusteringEnabled = true
+        knowledgeExpansionEnabled = true
+        webSearchEnabled = true
+        screenIntelligenceEnabled = true
+        voiceEnabled = true
+        // Quick Action / Raycast Killer
+        quickActionEnabled = true
+        clipboardHistoryEnabled = true
+        windowManagementEnabled = true
+        systemCommandsExtendedEnabled = true
+        fileSearchEnabled = true
+        // Family-only features
+        digitalEstateEnabled = true
+        #endif
+    }
+}
+
+
+// MARK: - Feature Availability Helper
+
+public extension FeatureFlags {
+
+    /// Check if a feature should be shown (regardless of Pro status)
+    static func isFeatureVisible(_ feature: ProFeature) -> Bool {
+        switch feature {
+        case .unlimitedHistory:
+            return true // Always show, just gate access
+        case .advancedPersonalization:
+            return advancedPersonalizationEnabled
+        case .priorityRTAI:
+            return rtaiEnabled
+        }
+    }
+
+    /// Get the cutoff date for free tier conversation history
+    static func freeHistoryCutoffDate() -> Date {
+        return Calendar.current.date(byAdding: .day, value: -freeHistoryDaysLimit, to: Date()) ?? Date()
+    }
+}

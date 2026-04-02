@@ -1,0 +1,14 @@
+{
+  "name": "evolution-skill-builder",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/evolution/skill_builder.rs",
+  "line_count": 884,
+  "why": "Tool sequence pattern mining, significance scoring, skill template generation",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

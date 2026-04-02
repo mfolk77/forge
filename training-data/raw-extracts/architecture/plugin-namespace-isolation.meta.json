@@ -1,0 +1,12 @@
+{
+  "name": "plugin-namespace-isolation",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/catalog.rs",
+  "line_count": 495,
+  "why": "Plugin catalog with namespace isolation pattern",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

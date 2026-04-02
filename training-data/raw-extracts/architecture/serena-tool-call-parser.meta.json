@@ -1,0 +1,1 @@
+{"name": "serena-tool-call-parser", "category": "architecture", "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/ToolCallParser.swift", "line_count":      775, "why": "Serena service: ToolCallParser.swift", "distill_as": ["instruction", "conversation"]}

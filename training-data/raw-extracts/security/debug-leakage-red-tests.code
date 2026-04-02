@@ -1,0 +1,143 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Debug log leakage, credential exposure, and debug flag safety.
+/// These tests verify that debug logging is gated behind DebugSettings.fileLoggingEnabled,
+/// error messages don't expose internals, and debug flags are properly #if DEBUG guarded.
+///
+/// Targets:
+///   Sources/SerenaCore/Services/IntentDetector.swift
+///   Sources/SerenaCore/Services/ScreenIntelligence/ScreenReader.swift
+///   Sources/SerenaCore/Services/SwiftFTAIParser.swift
+///   Sources/SerenaCore/Configuration/FeatureFlags.swift
+///   Sources/SerenaCore/Config/DebugSettings.swift
+@MainActor
+final class DebugLeakageRedTests: XCTestCase {
+
+    // MARK: - RED: Debug Logging Must Be Gated
+
+    /// IntentDetector's safeDebugLog must check DebugSettings.fileLoggingEnabled.
+    /// Without the guard, it writes user input to ~/Documents/ in Release builds.
+    func test_debug_intentDetector_loggingGated() {
+        XCTAssertTrue(IntentDetector.debugLoggingIsGated,
+                      "IntentDetector.safeDebugLog must check DebugSettings.fileLoggingEnabled before writing")
+    }
+
+    /// ScreenReader's writeDebugLog must check DebugSettings.fileLoggingEnabled.
+    /// Without the guard, it writes screen content (app names, UI text) to ~/Documents/ in Release.
+    func test_debug_screenReader_loggingGated() {
+        XCTAssertTrue(ScreenReader.debugLoggingIsGated,
+                      "ScreenReader.writeDebugLog must check DebugSettings.fileLoggingEnabled before writing")
+    }
+
+    /// SwiftFTAIParser's inline debug writes must check DebugSettings.fileLoggingEnabled.
+    /// Without the guard, it writes fact keys and query data to ~/Documents/ in Release.
+    func test_debug_swiftFTAIParser_inlineLoggingGated() {
+        XCTAssertTrue(SwiftFTAIParser.inlineDebugLoggingIsGated,
+                      "SwiftFTAIParser inline debug writes must check DebugSettings.fileLoggingEnabled")
+    }
+
+    // MARK: - GREEN: Debug Settings Configuration
+
+    /// DebugSettings.fileLoggingEnabled should be true in DEBUG (test environment).
+    func test_debug_debugSettings_fileLogging_trueInDebug() {
+        #if DEBUG
+        XCTAssertTrue(DebugSettings.fileLoggingEnabled,
+                      "fileLoggingEnabled should be true in DEBUG builds")
+        #else
+        XCTAssertFalse(DebugSettings.fileLoggingEnabled,
+                       "fileLoggingEnabled must be false in Release builds")
+        #endif
+    }
+
+    /// FeatureFlags.debugForcePro should only exist in DEBUG builds.
+    func test_debug_featureFlags_debugForcePro_isDebugOnly() {
+        #if DEBUG
+        // In DEBUG, the flag exists — just verify it's accessible
+        let _ = FeatureFlags.debugForcePro
+        XCTAssertTrue(true, "debugForcePro expected in DEBUG builds")
+        #else
+        // In Release, this code shouldn't compile — if it does, that's a bug
+        XCTFail("debugForcePro must not exist in Release builds")
+        #endif
+    }
+
+    /// DebugSettings.enabled should be true in DEBUG, false in Release.
+    func test_debug_debugSettings_enabled_matchesBuildConfig() {
+        #if DEBUG
+        XCTAssertTrue(DebugSettings.enabled, "DebugSettings.enabled should be true in DEBUG")
+        #else
+        XCTAssertFalse(DebugSettings.enabled, "DebugSettings.enabled must be false in Release")
+        #endif
+    }
+
+    // MARK: - Error Message Safety
+
+    /// Tool handler error messages should not contain file paths or line numbers.
+    func test_debug_errorMessages_noInternalPaths() async {
+        // Test several handlers with invalid input
+        let memoryHandler = MemoryToolHandler()
+        let result = await memoryHandler.execute(action: "unknown_action", params: [:])
+        if let error = result.error {
+            XCTAssertFalse(error.contains("/Users/"), "Error should not contain file paths")
+            XCTAssertFalse(error.contains(".swift"), "Error should not contain source file names")
+            XCTAssertFalse(error.contains("line "), "Error should not contain line numbers")
+        }
+    }
+
+    /// Subscription error messages should not expose license keys.
+    func test_debug_subscriptionErrors_noKeyExposure() async {
+        let service = SubscriptionService.shared
+
+        // Try activating with an invalid key — should fail but not expose valid key patterns
+        do {
+            let _ = try await service.activateLicense("INVALID-KEY-12345")
+        } catch {
+            let errorMsg = error.localizedDescription
+            // Error should NOT contain valid key prefixes or patterns
+            XCTAssertFalse(errorMsg.contains("SERENA-MASTER"),
+                           "Error must not reveal valid key prefixes")
+            XCTAssertFalse(errorMsg.contains("DEV-FOLKTECH"),
+                           "Error must not reveal valid key patterns")
+        }
+    }
+
+    /// Handler error messages should describe what went wrong, not expose stack traces.
+    func test_debug_errorMessages_noStackTrace() async {
+        let systemHandler = SystemToolHandler()
+        let result = await systemHandler.execute(action: "nonexistent", params: [:])
+        if let error = result.error {
+            XCTAssertFalse(error.contains("Thread"), "Error should not contain thread info")
+            XCTAssertFalse(error.contains("0x"), "Error should not contain memory addresses")
+            XCTAssertFalse(error.contains("at "), "Error should not contain stack frame references")
+            XCTAssertTrue(error.contains("volume") || error.contains("Unknown"),
+                          "Error should list valid actions or describe the problem")
+        }
+    }
+
+    // MARK: - Log Content Safety
+
+    /// Debug log file paths should all be under ~/Documents/ (not system directories).
+    func test_debug_logPaths_allUnderDocuments() {
+        let knownLogPaths = [
+            "serena_rtai_debug.log",
+            "serena_rtai_bridge_debug.log",
+            "serena_ftai_parser_debug.log",
+            "serena_ftai_lookup.log",
+            "serena_screenreader_debug.log",
+            "serena_screen_debug.log",
+            "serena_screen_intent_debug.log",
+            "serena_briefing_debug.log",
+            "serena_recurrence_debug.log",
+            "serena_parse_debug.log",
+            "serena_capital_debug.log"
+        ]
+
+        // All log paths should be valid filenames (no path traversal)
+        for filename in knownLogPaths {
+            XCTAssertFalse(filename.contains(".."), "Log filename must not contain path traversal")
+            XCTAssertFalse(filename.contains("/"), "Log filename must not contain directory separators")
+            XCTAssertTrue(filename.hasSuffix(".log"), "Log files should have .log extension")
+        }
+    }
+}

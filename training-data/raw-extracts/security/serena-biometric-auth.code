@@ -1,0 +1,127 @@
+import LocalAuthentication
+import Foundation
+#if canImport(AppKit)
+import AppKit
+#endif
+
+@MainActor
+public final class BiometricAuthManager: ObservableObject {
+    public static let shared = BiometricAuthManager()
+
+    @Published public var isAuthenticated: Bool = false
+    @Published public var biometricType: LABiometryType = .none
+
+    private var lastAuthTime: Date?
+    private let sessionTimeout: TimeInterval = 900 // 15 minutes
+
+    private init() {
+        checkBiometricAvailability()
+        setupIdleMonitor()
+    }
+
+    // MARK: - Biometric Availability
+
+    /// Check what biometric hardware is available
+    public func checkBiometricAvailability() {
+        let context = LAContext()
+        var error: NSError?
+        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+            biometricType = context.biometryType
+        }
+    }
+
+    // MARK: - Authentication
+
+    /// Authenticate user — Touch ID with password fallback
+    public func authenticate(reason: String = "Authenticate to access Serena") async -> Bool {
+        guard FeatureFlags.biometricAuthEnabled else {
+            isAuthenticated = true
+            lastAuthTime = Date()
+            return true
+        }
+
+        let context = LAContext()
+        context.localizedFallbackTitle = "Use Password"
+
+        do {
+            let success = try await context.evaluatePolicy(
+                .deviceOwnerAuthentication, // Falls back to password if no biometrics
+                localizedReason: reason
+            )
+            isAuthenticated = success
+            if success { lastAuthTime = Date() }
+            return success
+        } catch {
+            isAuthenticated = false
+            return false
+        }
+    }
+
+    // MARK: - Session Management
+
+    /// Check if session is still valid (authenticated + within timeout)
+    public var isSessionValid: Bool {
+        guard isAuthenticated, let lastAuth = lastAuthTime else { return false }
+        return Date().timeIntervalSince(lastAuth) < sessionTimeout
+    }
+
+    /// Quick re-auth for sensitive data (VA health records)
+    /// Returns true immediately if session is still valid, otherwise prompts
+    public func authenticateForSensitiveData(reason: String = "Authenticate to access health data") async -> Bool {
+        guard FeatureFlags.biometricAuthEnabled else { return true }
+        if isSessionValid { return true }
+        return await authenticate(reason: reason)
+    }
+
+    /// Invalidate session (called on lock/sleep)
+    public func invalidateSession() {
+        isAuthenticated = false
+        lastAuthTime = nil
+    }
+
+    // MARK: - Testing Support
+
+    /// Reset all state for unit testing
+    public func resetForTesting() {
+        isAuthenticated = false
+        lastAuthTime = nil
+        biometricType = .none
+    }
+
+    /// Set lastAuthTime directly for testing session timeout logic
+    /// Only available for testing — not part of the public API contract
+    public func setLastAuthTimeForTesting(_ date: Date?) {
+        lastAuthTime = date
+    }
+
+    // MARK: - Idle Monitor
+
+    /// Monitor system sleep/screen lock to invalidate session
+    private func setupIdleMonitor() {
+        #if canImport(AppKit) && !targetEnvironment(simulator)
+        // Listen for screen sleep
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.invalidateSession() }
+        }
+
+        // Listen for session resign (fast user switching)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.invalidateSession() }
+        }
+
+        // Listen for screen lock via distributed notification
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screenIsLocked"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.invalidateSession() }
+        }
+        #endif
+    }
+}

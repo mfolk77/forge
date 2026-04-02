@@ -1,0 +1,13 @@
+{
+  "name": "plugin-manifest",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/manifest.rs",
+  "line_count": 409,
+  "why": "TOML manifest parsing, name sanitization, path traversal prevention",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

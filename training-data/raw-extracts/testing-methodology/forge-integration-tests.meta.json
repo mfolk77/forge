@@ -1,0 +1,13 @@
+{
+  "name": "forge-integration-tests",
+  "category": "testing-methodology",
+  "source_file": "/Users/michaelfolk/Developer/forge/tests/integration.rs",
+  "line_count": 2712,
+  "why": "Rules + tool integration, destructive command blocking",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

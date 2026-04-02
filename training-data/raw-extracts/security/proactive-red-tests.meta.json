@@ -1,0 +1,1 @@
+{"name": "proactive-red-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/ProactiveIntelligenceRedTests.swift", "line_count": 296, "why": "Serena red tests: ProactiveIntelligenceRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

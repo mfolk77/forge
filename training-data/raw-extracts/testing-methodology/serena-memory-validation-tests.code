@@ -1,0 +1,413 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Memory validation system — fact format consistency, extraction returns,
+/// correction detection, and LLM confirmation directive generation.
+///
+/// These tests verify that:
+/// 1. MemoryToolHandler.remember produces proper key/value pairs (not key=sentence, value="true")
+/// 2. PersonalFactExtractor.extractAndSave returns the actual stored facts
+/// 3. Correction detection identifies "no that's wrong" patterns
+/// 4. Fact confirmation directives are generated for LLM prompt injection
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/ToolHandlers/MemoryToolHandler.swift
+/// - Sources/SerenaCore/Services/PersonalFactExtractor.swift
+/// - Sources/SerenaCore/Services/ChatManager.swift
+/// - Sources/SerenaCore/Services/MLXEngine.swift
+@MainActor
+final class MemoryValidationRedTests: XCTestCase {
+
+    private var handler: MemoryToolHandler!
+
+    override func setUp() {
+        super.setUp()
+        handler = MemoryToolHandler()
+    }
+
+    // MARK: - Group 1: Format Consistency
+
+    /// MemoryToolHandler.remember must parse "my wife's name is Christina" into
+    /// key="wife's name", value="Christina" — NOT key="my wife's name is Christina", value="true"
+    func test_memoryToolRemember_parsesKeyValueCorrectly() async {
+        // Store a fact via the tool handler (LLM tool call path)
+        let _ = await handler.execute(
+            action: "remember",
+            params: ["fact": "my wife's name is Christina", "category": "personal"]
+        )
+
+        // Verify the stored fact has proper key/value format
+        let allFacts = await UserFTAIManager.shared.getAllFacts()
+        let wifeFact = allFacts.first { $0.key.lowercased().contains("wife") }
+
+        XCTAssertNotNil(wifeFact, "Should find a fact about wife")
+        if let fact = wifeFact {
+            XCTAssertEqual(fact.value.lowercased(), "christina",
+                           "Value should be 'Christina', not 'true'. Got key='\(fact.key)', value='\(fact.value)'")
+            XCTAssertFalse(fact.key.lowercased().contains("my wife's name is christina"),
+                           "Key should NOT be the entire sentence. Got key='\(fact.key)'")
+        }
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: wifeFact?.key ?? "wife's name", category: .personal)
+    }
+
+    /// Both write paths (MemoryToolHandler + PersonalFactExtractor) should produce
+    /// the same key/value format for identical input
+    func test_memoryToolRemember_matchesExtractorFormat() async {
+        let testFact = "my favorite color is blue"
+
+        // Path 1: Tool handler (LLM tool call)
+        let _ = await handler.execute(
+            action: "remember",
+            params: ["fact": testFact, "category": "preference"]
+        )
+
+        let factsAfterTool = await UserFTAIManager.shared.getAllFacts()
+        let toolFact = factsAfterTool.first { $0.key.lowercased().contains("color") || $0.key.lowercased().contains("favorite") }
+
+        // Path 2: PersonalFactExtractor (passive extraction)
+        let extracted = await PersonalFactExtractor.shared.extractAndSave(from: testFact)
+
+        let factsAfterExtractor = await UserFTAIManager.shared.getAllFacts()
+        let extractorFact = factsAfterExtractor.first { $0.key.lowercased().contains("color") || $0.key.lowercased().contains("favorite") }
+
+        XCTAssertNotNil(toolFact, "Tool handler should have stored a fact")
+        XCTAssertNotNil(extractorFact, "Extractor should have stored a fact")
+
+        if let tf = toolFact, let ef = extractorFact {
+            XCTAssertEqual(tf.key.lowercased(), ef.key.lowercased(),
+                           "Both paths must produce same key. Tool='\(tf.key)', Extractor='\(ef.key)'")
+        }
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "favorite color", category: .preference)
+    }
+
+    // MARK: - Group 2: Fact Extraction Returns Stored Facts
+
+    /// extractAndSave should return the actual ExtractedFact objects that were stored
+    func test_extractAndSave_returnsStoredFacts() async {
+        let storedFacts = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+
+        XCTAssertFalse(storedFacts.isEmpty,
+                       "Should return stored facts for high-priority relationship fact")
+
+        let wifeFact = storedFacts.first { $0.fact.lowercased().contains("wife") }
+        XCTAssertNotNil(wifeFact, "Returned facts should include wife's name fact")
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "wife's name", category: .personal)
+    }
+
+    /// extractAndSave should NOT return facts that are just being tracked (not yet stored)
+    func test_extractAndSave_doesNotReturnTrackedFacts() async {
+        // Reset mention tracking to ensure clean state
+        await PersonalFactExtractor.shared.resetMentionTracking()
+
+        // Low-priority fact (priority < 8) on first mention should be tracked, not stored
+        let storedFacts = await PersonalFactExtractor.shared.extractAndSave(from: "I enjoy hiking")
+
+        XCTAssertTrue(storedFacts.isEmpty,
+                      "First mention of a low-priority fact should be tracked, not stored. Got \(storedFacts.count) facts")
+    }
+
+    // MARK: - Group 3: Correction Detection
+
+    /// After storing a fact, "no that's wrong, her name is Sarah" should detect a correction
+    func test_detectCorrection_identifiesNegation() async {
+        // Store initial fact
+        let _ = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+
+        // Build the recent facts context
+        let recentFacts = [ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10)]
+
+        // Check for correction
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no that's wrong, her name is Sarah",
+            recentFacts: recentFacts
+        )
+
+        XCTAssertFalse(corrections.isEmpty, "Should detect correction when user says 'that's wrong'")
+        if let c = corrections.first {
+            XCTAssertTrue(c.correctedValue.lowercased().contains("sarah"),
+                          "Correction should contain the new value 'Sarah'. Got: '\(c.correctedValue)'")
+        }
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "wife's name", category: .personal)
+    }
+
+    /// Unrelated negation should NOT trigger correction
+    func test_detectCorrection_ignoresUnrelatedNegation() async {
+        let recentFacts = [ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10)]
+
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no I don't want pizza",
+            recentFacts: recentFacts
+        )
+
+        XCTAssertTrue(corrections.isEmpty, "Unrelated negation should NOT trigger correction")
+    }
+
+    // MARK: - Group 4: Confirmation Directive Generation
+
+    /// Given extracted facts, should generate a prompt fragment for the LLM
+    func test_factConfirmationDirective_generatesPromptFragment() {
+        let facts = [ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10)]
+
+        let directive = FactConfirmationDirective.generate(for: facts)
+
+        XCTAssertFalse(directive.isEmpty, "Should generate a non-empty directive")
+        XCTAssertTrue(directive.lowercased().contains("wife") || directive.lowercased().contains("christina"),
+                      "Directive should reference the learned fact. Got: '\(directive)'")
+        XCTAssertTrue(directive.lowercased().contains("remember") || directive.lowercased().contains("confirm") || directive.lowercased().contains("learned"),
+                      "Directive should instruct natural confirmation")
+    }
+
+    /// Empty facts array should produce no directive
+    func test_factConfirmationDirective_emptyForNoFacts() {
+        let directive = FactConfirmationDirective.generate(for: [])
+
+        XCTAssertTrue(directive.isEmpty, "No facts should produce empty directive")
+    }
+
+    // MARK: - Group 5: Correction Deletion Key Mismatch Fix
+
+    /// deleteExtractedFact should parse the fact string before deletion, matching stored keys
+    func test_correctionDeletion_usesParsedKey() async {
+        // Store via addExtractedFact (same path as real usage)
+        await UserFTAIManager.shared.addExtractedFact(
+            "User's wife's name is Christina", category: .personal, priority: 10
+        )
+
+        // Verify it's stored
+        let factsBefore = await UserFTAIManager.shared.getAllFacts()
+        let wifeFactBefore = factsBefore.first { $0.key.lowercased().contains("wife") }
+        XCTAssertNotNil(wifeFactBefore, "Wife fact should be stored before deletion")
+
+        // Delete using the full fact string (as ChatManager passes it)
+        let deleted = await UserFTAIManager.shared.deleteExtractedFact(
+            "User's wife's name is Christina", category: .personal
+        )
+
+        XCTAssertTrue(deleted, "deleteExtractedFact should successfully delete via parsed key")
+
+        let factsAfter = await UserFTAIManager.shared.getAllFacts()
+        let wifeFactAfter = factsAfter.first { $0.key.lowercased().contains("wife") }
+        XCTAssertNil(wifeFactAfter, "Wife fact should be gone after deleteExtractedFact")
+    }
+
+    /// Full correction flow: delete old fact, add corrected fact — no duplicates
+    func test_correctionDeletion_fullFlowDeletesOldFact() async {
+        // Store wife=Christina via extractAndSave
+        let _ = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+
+        // Simulate correction: delete old, add new
+        let _ = await UserFTAIManager.shared.deleteExtractedFact(
+            "User's wife's name is Christina", category: .personal
+        )
+        await UserFTAIManager.shared.addExtractedFact(
+            "User's wife's name is Sarah", category: .personal, priority: 10
+        )
+
+        let facts = await UserFTAIManager.shared.getAllFacts()
+        let wifeFacts = facts.filter { $0.key.lowercased().contains("wife") }
+
+        XCTAssertEqual(wifeFacts.count, 1, "Should have exactly 1 wife fact after correction, got \(wifeFacts.count)")
+        if let fact = wifeFacts.first {
+            XCTAssertEqual(fact.value, "Sarah", "Wife's name should be Sarah after correction, got '\(fact.value)'")
+        }
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "wife's name", category: .personal)
+    }
+
+    // MARK: - Group 6: Multi-Fact Correction
+
+    /// Broad negation ("that's all wrong") should return corrections for ALL recent facts
+    func test_detectCorrection_broadNegation_correctsAllFacts() async {
+        let recentFacts = [
+            ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10),
+            ExtractedFact(fact: "User's favorite color is blue", category: .preference, priority: 5)
+        ]
+
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no, that's all wrong",
+            recentFacts: recentFacts
+        )
+
+        XCTAssertEqual(corrections.count, 2,
+                        "Broad negation should return corrections for ALL \(recentFacts.count) facts, got \(corrections.count)")
+    }
+
+    /// Specific correction should only affect the matching fact
+    func test_detectCorrection_specificSubject_correctsOnlyMatching() async {
+        let recentFacts = [
+            ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10),
+            ExtractedFact(fact: "User's favorite color is blue", category: .preference, priority: 5)
+        ]
+
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no that's wrong, her name is Sarah",
+            recentFacts: recentFacts
+        )
+
+        XCTAssertEqual(corrections.count, 1,
+                        "Specific correction should only match the wife fact, got \(corrections.count)")
+        if let c = corrections.first {
+            XCTAssertTrue(c.originalFact.fact.lowercased().contains("wife"),
+                          "Should correct the wife fact, got: '\(c.originalFact.fact)'")
+        }
+    }
+
+    // MARK: - Group 7: Deduplication
+
+    /// Storing the same fact twice should result in only one entry
+    func test_storeSameFactTwice_noDuplicates() async {
+        // Store wife=Christina twice
+        let _ = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+        let _ = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+
+        let facts = await UserFTAIManager.shared.getAllFacts()
+        let wifeFacts = facts.filter { $0.key.lowercased().contains("wife") }
+
+        XCTAssertEqual(wifeFacts.count, 1,
+                        "Same fact stored twice should produce 1 entry, got \(wifeFacts.count)")
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "wife's name", category: .personal)
+    }
+
+    // MARK: - Group 8: Explicit Remember Fallback
+
+    /// "remember that my meeting is at 3pm" should store a fact even without pattern match
+    func test_explicitRemember_noPatternMatch_storesGenericFact() async {
+        let stored = await PersonalFactExtractor.shared.extractAndSave(
+            from: "remember that my meeting is at 3pm"
+        )
+
+        XCTAssertFalse(stored.isEmpty,
+                        "Explicit 'remember' with no pattern match should still store a generic fact")
+        if let fact = stored.first {
+            XCTAssertEqual(fact.category, .general,
+                           "Fallback fact should use .general category, got \(fact.category)")
+        }
+
+        // Cleanup
+        await UserFTAIManager.shared.deleteAllFacts()
+    }
+
+    /// "remember that my wife's name is Christina" should use structured extraction, not fallback
+    func test_explicitRemember_withPatternMatch_usesStructuredFact() async {
+        let stored = await PersonalFactExtractor.shared.extractAndSave(
+            from: "remember that my wife's name is Christina"
+        )
+
+        XCTAssertFalse(stored.isEmpty, "Should store at least one fact")
+        if let fact = stored.first {
+            XCTAssertEqual(fact.category, .personal,
+                           "Structured pattern should use .personal category, not .general. Got: \(fact.category)")
+            XCTAssertTrue(fact.fact.lowercased().contains("wife"),
+                          "Should extract structured wife fact, got: '\(fact.fact)'")
+        }
+
+        // Cleanup
+        let _ = await UserFTAIManager.shared.deleteFact(key: "wife's name", category: .personal)
+    }
+
+    // MARK: - Group 9: Live Correction Flow (Colon Format Bug)
+
+    /// BUG REPRO: ChatManager loads stored facts via getAllFacts() which returns key/value pairs.
+    /// It reconstructs them as "key: value" (colon format), but parseFact() expects "User's X is Y"
+    /// (natural language format). This causes both deletion and re-storage to silently fail.
+    ///
+    /// Live scenario: User says "my wife's name is Christina" → stored as wife's name=Christina.
+    /// User says "no that's wrong, her name is Sarah" → ChatManager loads "wife's name: Christina"
+    /// from getAllFacts() → detectCorrection finds it → deleteExtractedFact("wife's name: Christina")
+    /// calls parseFact() which returns ("", "") → deletion fails → old fact persists.
+    func test_correctionFlow_colonFormat_deletesOldFact() async {
+        // Step 1: Store wife=Christina (simulates initial learning)
+        let _ = await PersonalFactExtractor.shared.extractAndSave(from: "my wife's name is Christina")
+
+        // Step 2: Load facts exactly as ChatManager does (line 864-866)
+        // ChatManager reconstructs as "User's <key> is <value>" so parseFact() can handle it
+        let storedFacts = await UserFTAIManager.shared.getAllFacts()
+        let correctionTargets = storedFacts.map { fact in
+            ExtractedFact(fact: "User's \(fact.key) is \(fact.value)", category: fact.category, priority: 10)
+        }
+
+        // Verify we have the wife fact in natural language format
+        let wifeTarget = correctionTargets.first { $0.fact.lowercased().contains("wife") }
+        XCTAssertNotNil(wifeTarget, "Should have wife fact in correction targets")
+        XCTAssertTrue(wifeTarget?.fact.contains(" is ") ?? false,
+                      "Fact should be in 'User's X is Y' format. Got: '\(wifeTarget?.fact ?? "")'")
+
+        // Step 3: Detect correction (same as ChatManager line 870-873)
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no that's wrong, her name is Sarah",
+            recentFacts: correctionTargets
+        )
+        XCTAssertFalse(corrections.isEmpty, "Should detect correction")
+
+        if let correction = corrections.first {
+            // Step 4: Delete old fact (same as ChatManager line 878-881)
+            let deleted = await UserFTAIManager.shared.deleteExtractedFact(
+                correction.originalFact.fact,
+                category: correction.originalFact.category
+            )
+            XCTAssertTrue(deleted,
+                          "deleteExtractedFact must handle colon format '\(correction.originalFact.fact)'. Got false — parseFact returned empty key.")
+
+            // Step 5: Build corrected fact string (same as ChatManager line 884-885)
+            let correctedFact = correction.originalFact.fact
+                .replacingOccurrences(of: "is \\w+$", with: "is \(correction.correctedValue)", options: .regularExpression)
+
+            // BUG: If the fact is "wife's name: Christina", regex "is \w+$" won't match.
+            // The correctedFact will be IDENTICAL to the original — Sarah never gets stored.
+            XCTAssertTrue(correctedFact.lowercased().contains("sarah"),
+                          "Corrected fact must contain 'Sarah'. Got '\(correctedFact)' — regex failed on colon format.")
+
+            // Step 6: Store corrected fact
+            await UserFTAIManager.shared.addExtractedFact(
+                correctedFact,
+                category: correction.originalFact.category,
+                priority: correction.originalFact.priority
+            )
+        }
+
+        // Final verification: Sarah should be stored, Christina should be gone
+        let finalFacts = await UserFTAIManager.shared.getAllFacts()
+        let wifeFacts = finalFacts.filter { $0.key.lowercased().contains("wife") }
+
+        XCTAssertEqual(wifeFacts.count, 1,
+                        "Should have exactly 1 wife fact after correction, got \(wifeFacts.count)")
+        if let fact = wifeFacts.first {
+            XCTAssertEqual(fact.value, "Sarah",
+                           "Wife's name should be Sarah after correction. Got '\(fact.value)' — correction didn't persist.")
+        }
+
+        // Cleanup
+        await UserFTAIManager.shared.deleteAllFacts()
+    }
+
+    /// Verify deleteExtractedFact works with "User's X is Y" format (ChatManager's corrected format)
+    func test_deleteExtractedFact_handlesNaturalLanguageFormat() async {
+        // Store a fact first
+        await UserFTAIManager.shared.addExtractedFact(
+            "User's wife's name is Christina", category: .personal, priority: 10
+        )
+
+        // Delete with natural language format (as ChatManager now passes it)
+        let deleted = await UserFTAIManager.shared.deleteExtractedFact(
+            "User's wife's name is Christina", category: .personal
+        )
+
+        XCTAssertTrue(deleted,
+                      "deleteExtractedFact should handle 'User's wife's name is Christina' format")
+
+        let facts = await UserFTAIManager.shared.getAllFacts()
+        let wifeFact = facts.first { $0.key.lowercased().contains("wife") }
+        XCTAssertNil(wifeFact, "Wife fact should be deleted via natural language format path")
+    }
+}

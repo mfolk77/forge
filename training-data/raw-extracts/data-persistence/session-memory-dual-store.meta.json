@@ -1,0 +1,14 @@
+{
+  "name": "session-memory-dual-store",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/session/memory.rs",
+  "line_count": 834,
+  "why": "SQLite + vector embeddings, semantic search, confidence scoring",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

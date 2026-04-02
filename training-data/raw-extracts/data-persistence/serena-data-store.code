@@ -1,0 +1,358 @@
+import Foundation
+import SQLite
+import CryptoKit
+
+public class DataStore: DataStoreProtocol {
+    private var db: Connection?
+    private let encryption: EncryptionManager
+    
+    // Table definitions
+    private let conversations = Table("conversations")
+    private let messages = Table("messages")
+    private let userConfig = Table("user_config")
+    
+    // Conversation columns
+    private let convId = Expression<String>("id")
+    private let convTitle = Expression<Data>("title") // Encrypted
+    private let convCreatedAt = Expression<Date>("created_at")
+    private let convUpdatedAt = Expression<Date>("updated_at")
+    
+    // Message columns
+    private let msgId = Expression<String>("id")
+    private let msgConversationId = Expression<String>("conversation_id")
+    private let msgContent = Expression<Data>("content") // Encrypted
+    private let msgRole = Expression<String>("role")
+    private let msgTimestamp = Expression<Date>("timestamp")
+    
+    // User config columns
+    private let configKey = Expression<String>("key")
+    private let configValue = Expression<Data>("value") // Encrypted
+    
+    public init() throws {
+        self.encryption = try EncryptionManager()
+        try setupDatabase()
+    }
+
+    /// Ephemeral initializer — uses a session-only key, no Keychain dependency
+    /// Cannot fail. Used as last-resort fallback to prevent app crash.
+    private init(sessionEncryption: EncryptionManager) {
+        self.encryption = sessionEncryption
+        do {
+            self.db = try Connection(.inMemory)
+            try createTables()
+        } catch {
+            print("⚠️ DataStore: Even in-memory SQLite failed: \(error). App will run without storage.")
+            self.db = nil
+        }
+    }
+    
+    private func setupDatabase() throws {
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory,
+                                                   in: .userDomainMask).first else {
+            throw DataStoreError.databaseNotInitialized
+        }
+        let dbPath = documentsPath.appendingPathComponent("serenanet.db")
+        
+        db = try Connection(dbPath.path)
+        try createTables()
+    }
+    
+    private func createTables() throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        // Create conversations table
+        try db.run(conversations.create(ifNotExists: true) { t in
+            t.column(convId, primaryKey: true)
+            t.column(convTitle)
+            t.column(convCreatedAt)
+            t.column(convUpdatedAt)
+        })
+        
+        // Create messages table
+        try db.run(messages.create(ifNotExists: true) { t in
+            t.column(msgId, primaryKey: true)
+            t.column(msgConversationId)
+            t.column(msgContent)
+            t.column(msgRole)
+            t.column(msgTimestamp)
+            t.foreignKey(msgConversationId, references: conversations, convId, delete: .cascade)
+        })
+        
+        // Create user config table
+        try db.run(userConfig.create(ifNotExists: true) { t in
+            t.column(configKey, primaryKey: true)
+            t.column(configValue)
+        })
+        
+        // Create indexes for better performance
+        try db.run(messages.createIndex(msgConversationId, ifNotExists: true))
+        try db.run(messages.createIndex(msgTimestamp, ifNotExists: true))
+    }
+}
+
+// MARK: - Conversation Operations
+extension DataStore {
+    public func saveConversation(_ conversation: Conversation) async throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        let encryptedTitle = try encryption.encrypt(conversation.title)
+        
+        try db.run(conversations.insert(or: .replace,
+            convId <- conversation.id.uuidString,
+            convTitle <- encryptedTitle,
+            convCreatedAt <- conversation.createdAt,
+            convUpdatedAt <- conversation.updatedAt
+        ))
+        
+        // Save all messages for this conversation
+        for message in conversation.messages {
+            try await saveMessage(message, conversationId: conversation.id)
+        }
+    }
+    
+    public func loadConversations() async throws -> [Conversation] {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+
+        var loadedConversations: [Conversation] = []
+        var errorCount = 0
+        var corruptedConversationIds: [String] = []
+
+        // Log database path for debugging
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw DataStoreError.databaseNotInitialized
+        }
+        let dbPath = documentsPath.appendingPathComponent("serenanet.db").path
+        print("📂 DataStore: Loading from database at: \(dbPath)")
+
+        for row in try db.prepare(conversations.order(convUpdatedAt.desc)) {
+            let conversationId = row[convId]
+            do {
+                guard let id = UUID(uuidString: conversationId) else {
+                    print("⚠️ DataStore: Invalid UUID format for conversation: \(conversationId)")
+                    errorCount += 1
+                    corruptedConversationIds.append(conversationId)
+                    continue
+                }
+
+                let title = try encryption.decryptString(row[convTitle])
+                let createdAt = row[convCreatedAt]
+                let updatedAt = row[convUpdatedAt]
+
+                // Load messages with graceful error handling
+                let conversationMessages = try await loadMessages(for: id, skipCorrupted: true)
+
+                let conversation = Conversation(
+                    id: id,
+                    title: title,
+                    messages: conversationMessages,
+                    createdAt: createdAt,
+                    updatedAt: updatedAt
+                )
+
+                loadedConversations.append(conversation)
+            } catch {
+                errorCount += 1
+                corruptedConversationIds.append(conversationId)
+
+                // Log detailed error information
+                let shortId = String(conversationId.prefix(8))
+                print("⚠️ DataStore: Decryption failed for conversation \(shortId): \(error.localizedDescription)")
+                print("   - Full ID: \(conversationId)")
+                print("   - Error type: \(type(of: error))")
+
+                // Continue loading other conversations even if one fails
+                // This ensures the app doesn't crash from corrupted entries
+            }
+        }
+
+        if !corruptedConversationIds.isEmpty {
+            print("⚠️ DataStore: \(corruptedConversationIds.count) corrupted conversation(s) skipped:")
+            for id in corruptedConversationIds {
+                print("   - \(id)")
+            }
+        }
+
+        print("📂 DataStore: Loaded \(loadedConversations.count) conversations (\(errorCount) decryption errors)")
+        return loadedConversations
+    }
+    
+    public func deleteConversation(id: UUID) async throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        let conversation = conversations.filter(convId == id.uuidString)
+        try db.run(conversation.delete())
+    }
+    
+    private func saveMessage(_ message: Message, conversationId: UUID) async throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        let encryptedContent = try encryption.encrypt(message.content)
+        
+        try db.run(messages.insert(or: .replace,
+            msgId <- message.id.uuidString,
+            msgConversationId <- conversationId.uuidString,
+            msgContent <- encryptedContent,
+            msgRole <- message.role.rawValue,
+            msgTimestamp <- message.timestamp
+        ))
+    }
+    
+    private func loadMessages(for conversationId: UUID, skipCorrupted: Bool = false) async throws -> [Message] {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+
+        var loadedMessages: [Message] = []
+        var corruptedCount = 0
+
+        let query = messages
+            .filter(msgConversationId == conversationId.uuidString)
+            .order(msgTimestamp.asc)
+
+        for row in try db.prepare(query) {
+            do {
+                guard let id = UUID(uuidString: row[msgId]) else {
+                    if skipCorrupted {
+                        corruptedCount += 1
+                        continue
+                    }
+                    throw DataStoreError.invalidData
+                }
+
+                let content = try encryption.decryptString(row[msgContent])
+
+                guard let role = MessageRole(rawValue: row[msgRole]) else {
+                    if skipCorrupted {
+                        corruptedCount += 1
+                        continue
+                    }
+                    throw DataStoreError.invalidData
+                }
+
+                let timestamp = row[msgTimestamp]
+
+                let message = Message(
+                    id: id,
+                    content: content,
+                    role: role,
+                    timestamp: timestamp
+                )
+
+                loadedMessages.append(message)
+            } catch {
+                if skipCorrupted {
+                    corruptedCount += 1
+                    print("⚠️ DataStore: Skipped corrupted message in conversation \(conversationId.uuidString.prefix(8)): \(error.localizedDescription)")
+                    continue
+                }
+                throw error
+            }
+        }
+
+        if corruptedCount > 0 {
+            print("⚠️ DataStore: Skipped \(corruptedCount) corrupted message(s) in conversation \(conversationId.uuidString.prefix(8))")
+        }
+
+        return loadedMessages
+    }
+}
+
+// MARK: - User Config Operations
+extension DataStore {
+    public func saveUserConfig(_ config: UserConfig) async throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        let configData = try JSONEncoder().encode(config)
+        let encryptedData = try encryption.encrypt(configData)
+        
+        try db.run(userConfig.insert(or: .replace,
+            configKey <- "user_config",
+            configValue <- encryptedData
+        ))
+    }
+    
+    public func loadUserConfig() async throws -> UserConfig {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        let query = userConfig.filter(configKey == "user_config")
+        
+        if let row = try db.pluck(query) {
+            let decryptedData = try encryption.decryptData(row[configValue])
+            return try JSONDecoder().decode(UserConfig.self, from: decryptedData)
+        } else {
+            // Return default config if none exists
+            let defaultConfig = UserConfig.default
+            try await saveUserConfig(defaultConfig)
+            return defaultConfig
+        }
+    }
+}
+
+// MARK: - Utility Operations
+extension DataStore {
+    public func clearAllData() async throws {
+        guard let db = db else { throw DataStoreError.databaseNotInitialized }
+        
+        try db.run(messages.delete())
+        try db.run(conversations.delete())
+        try db.run(userConfig.delete())
+    }
+    
+    public func getDatabaseSize() throws -> Int64 {
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory,
+                                                   in: .userDomainMask).first else {
+            throw DataStoreError.databaseNotInitialized
+        }
+        let dbPath = documentsPath.appendingPathComponent("serenanet.db")
+        
+        let attributes = try FileManager.default.attributesOfItem(atPath: dbPath.path)
+        return attributes[.size] as? Int64 ?? 0
+    }
+}
+
+// MARK: - Fallback Factory
+extension DataStore {
+    /// Creates an in-memory fallback DataStore when persistent storage fails
+    /// This prevents app crashes but data will not persist between sessions
+    public static func createInMemoryFallback() -> DataStore {
+        do {
+            let fallback = try DataStore.createInMemoryInstance()
+            LoggingManager.shared.log("Using in-memory fallback DataStore - data will not persist", category: .general, level: .warning)
+            return fallback
+        } catch {
+            // Keychain and file-based key both failed — use ephemeral session key
+            LoggingManager.shared.log("DataStore: In-memory with encryption failed: \(error.localizedDescription). Using ephemeral session store.", category: .general, level: .error)
+            let sessionKey = SymmetricKey(size: .bits256)
+            return DataStore(sessionEncryption: EncryptionManager(sessionKey: sessionKey))
+        }
+    }
+
+    /// Private initializer for in-memory database
+    private static func createInMemoryInstance() throws -> DataStore {
+        let store = try DataStore.init()
+        // Override with in-memory connection
+        store.db = try Connection(.inMemory)
+        try store.createTables()
+        return store
+    }
+
+}
+
+// MARK: - Error Types
+public enum DataStoreError: LocalizedError {
+    case databaseNotInitialized
+    case encryptionFailed
+    case decryptionFailed
+    case invalidData
+
+    public var errorDescription: String? {
+        switch self {
+        case .databaseNotInitialized:
+            return "Database connection not initialized"
+        case .encryptionFailed:
+            return "Failed to encrypt data"
+        case .decryptionFailed:
+            return "Failed to decrypt data"
+        case .invalidData:
+            return "Invalid data format"
+        }
+    }
+}

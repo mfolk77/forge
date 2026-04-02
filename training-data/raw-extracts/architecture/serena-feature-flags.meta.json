@@ -1,0 +1,13 @@
+{
+  "name": "serena-feature-flags",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Configuration/FeatureFlags.swift",
+  "line_count": 231,
+  "why": "Three-tier feature flags: DEBUG \u2192 FOLK_FAMILY \u2192 Release",
+  "distill_as": [
+    "instruction",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

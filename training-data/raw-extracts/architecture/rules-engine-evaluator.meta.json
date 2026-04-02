@@ -1,0 +1,14 @@
+{
+  "name": "rules-engine-evaluator",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/rules/evaluator.rs",
+  "line_count": 705,
+  "why": "Scoped rules, context-aware evaluation, RuleAction enum",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

@@ -1,0 +1,241 @@
+@testable import SerenaCore
+import XCTest
+
+final class RateLimiterRedTests: XCTestCase {
+
+    private var sut: RateLimiter!
+
+    override func setUp() {
+        super.setUp()
+        sut = RateLimiter()
+        sut.resetAllUsage()
+    }
+
+    override func tearDown() {
+        sut.resetAllUsage()
+        sut = nil
+        super.tearDown()
+    }
+
+    // MARK: - LimitedFeature Enum
+
+    func test_limitedFeature_rawValues() {
+        XCTAssertEqual(RateLimiter.LimitedFeature.knowledgeExpansion.rawValue, "knowledge_expansion")
+        XCTAssertEqual(RateLimiter.LimitedFeature.imageGeneration.rawValue, "image_generation")
+        XCTAssertEqual(RateLimiter.LimitedFeature.thinkingModel.rawValue, "thinking_model")
+    }
+
+    func test_limitedFeature_displayNames() {
+        XCTAssertEqual(RateLimiter.LimitedFeature.knowledgeExpansion.displayName, "Knowledge Expansion")
+        XCTAssertEqual(RateLimiter.LimitedFeature.imageGeneration.displayName, "Image Generation")
+        XCTAssertEqual(RateLimiter.LimitedFeature.thinkingModel.displayName, "Thinking Model")
+    }
+
+    // MARK: - TimePeriod
+
+    func test_timePeriod_seconds() {
+        XCTAssertEqual(RateLimiter.TimePeriod.hourly.seconds, 3600)
+        XCTAssertEqual(RateLimiter.TimePeriod.daily.seconds, 86400)
+        XCTAssertEqual(RateLimiter.TimePeriod.monthly.seconds, 30 * 86400)
+    }
+
+    func test_timePeriod_keys() {
+        XCTAssertEqual(RateLimiter.TimePeriod.hourly.key, "hourly")
+        XCTAssertEqual(RateLimiter.TimePeriod.daily.key, "daily")
+        XCTAssertEqual(RateLimiter.TimePeriod.monthly.key, "monthly")
+    }
+
+    // MARK: - Check Limit
+
+    func test_checkLimit_nilLimitMeansUnlimited() async throws {
+        // nil limit = unlimited, should always return true
+        let allowed = try await sut.checkLimit(feature: .knowledgeExpansion, limit: nil, period: .daily)
+        XCTAssertTrue(allowed, "Nil limit should mean unlimited access")
+    }
+
+    func test_checkLimit_firstCallWithinLimit() async throws {
+        let allowed = try await sut.checkLimit(feature: .imageGeneration, limit: 3, period: .daily)
+        XCTAssertTrue(allowed, "First call should be within limit")
+    }
+
+    func test_checkLimit_exceedsLimit() async throws {
+        // Use up all 3 calls
+        for _ in 0..<3 {
+            _ = try await sut.checkLimit(feature: .imageGeneration, limit: 3, period: .daily)
+        }
+
+        // 4th call should be denied
+        let denied = try await sut.checkLimit(feature: .imageGeneration, limit: 3, period: .daily)
+        XCTAssertFalse(denied, "4th call should exceed limit of 3")
+    }
+
+    func test_checkLimit_limitOfOne() async throws {
+        let first = try await sut.checkLimit(feature: .thinkingModel, limit: 1, period: .hourly)
+        XCTAssertTrue(first)
+
+        let second = try await sut.checkLimit(feature: .thinkingModel, limit: 1, period: .hourly)
+        XCTAssertFalse(second, "Second call should exceed limit of 1")
+    }
+
+    func test_checkLimit_differentFeaturesIndependent() async throws {
+        // Use up imageGeneration
+        _ = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+
+        // knowledgeExpansion should still be available
+        let allowed = try await sut.checkLimit(feature: .knowledgeExpansion, limit: 1, period: .daily)
+        XCTAssertTrue(allowed, "Different features should have independent limits")
+    }
+
+    func test_checkLimit_differentPeriodsIndependent() async throws {
+        // Use up hourly limit
+        _ = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .hourly)
+        let hourlyDenied = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .hourly)
+        XCTAssertFalse(hourlyDenied)
+
+        // Daily limit should still be available
+        let dailyAllowed = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        XCTAssertTrue(dailyAllowed, "Different periods should have independent limits")
+    }
+
+    // MARK: - Remaining Quota
+
+    func test_getRemainingQuota_unlimitedReturnsNil() async {
+        let quota = await sut.getRemainingQuota(feature: .knowledgeExpansion, limit: nil, period: .daily)
+        XCTAssertNil(quota, "Unlimited features should return nil quota")
+    }
+
+    func test_getRemainingQuota_freshIsFullLimit() async {
+        let quota = await sut.getRemainingQuota(feature: .knowledgeExpansion, limit: 10, period: .daily)
+        XCTAssertEqual(quota, 10, "Fresh usage should show full limit remaining")
+    }
+
+    func test_getRemainingQuota_decreasesAfterUsage() async throws {
+        _ = try await sut.checkLimit(feature: .imageGeneration, limit: 5, period: .daily)
+        let remaining = await sut.getRemainingQuota(feature: .imageGeneration, limit: 5, period: .daily)
+        XCTAssertEqual(remaining, 4, "Remaining should decrease by 1 after one usage")
+    }
+
+    func test_getRemainingQuota_neverNegative() async throws {
+        // Exhaust all uses
+        for _ in 0..<5 {
+            _ = try await sut.checkLimit(feature: .imageGeneration, limit: 3, period: .daily)
+        }
+        let remaining = await sut.getRemainingQuota(feature: .imageGeneration, limit: 3, period: .daily)
+        XCTAssertGreaterThanOrEqual(remaining!, 0, "Remaining quota should never be negative")
+    }
+
+    // MARK: - Reset Time
+
+    func test_getResetTime_inTheFuture() {
+        let now = Date()
+        let hourlyReset = sut.getResetTime(for: .hourly)
+        let dailyReset = sut.getResetTime(for: .daily)
+        let monthlyReset = sut.getResetTime(for: .monthly)
+
+        XCTAssertGreaterThan(hourlyReset, now, "Hourly reset should be in the future")
+        XCTAssertGreaterThan(dailyReset, now, "Daily reset should be in the future")
+        XCTAssertGreaterThan(monthlyReset, now, "Monthly reset should be in the future")
+    }
+
+    func test_getResetTime_hourlyWithinTwoHours() {
+        let now = Date()
+        let reset = sut.getResetTime(for: .hourly)
+        let twoHoursFromNow = now.addingTimeInterval(7200)
+
+        XCTAssertLessThanOrEqual(reset, twoHoursFromNow, "Hourly reset should be within 2 hours")
+    }
+
+    func test_getResetTime_dailyWithin48Hours() {
+        let now = Date()
+        let reset = sut.getResetTime(for: .daily)
+        let twoDaysFromNow = now.addingTimeInterval(172800)
+
+        XCTAssertLessThanOrEqual(reset, twoDaysFromNow, "Daily reset should be within 48 hours")
+    }
+
+    // MARK: - Reset Usage
+
+    func test_resetUsage_clearsSpecificFeature() async throws {
+        _ = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        let denied = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        XCTAssertFalse(denied)
+
+        // Reset
+        sut.resetUsage(feature: .imageGeneration, period: .daily)
+
+        // Should be allowed again
+        let allowedAgain = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        XCTAssertTrue(allowedAgain, "After reset, usage should be allowed again")
+    }
+
+    func test_resetAllUsage_clearsEverything() async throws {
+        _ = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        _ = try await sut.checkLimit(feature: .knowledgeExpansion, limit: 1, period: .daily)
+
+        sut.resetAllUsage()
+
+        let img = try await sut.checkLimit(feature: .imageGeneration, limit: 1, period: .daily)
+        XCTAssertTrue(img, "After resetAll, imageGeneration should be allowed")
+        // Note: knowledgeExpansion already consumed its one use from resetAllUsage test isolation,
+        // but resetAll should clear it
+    }
+
+    // MARK: - Usage Statistics
+
+    func test_getUsageStatistics_returnsAllCombinations() async {
+        let stats = await sut.getUsageStatistics()
+        // 3 features x 3 periods = 9 combinations
+        XCTAssertEqual(stats.count, 9, "Should return stats for all feature/period combinations")
+    }
+
+    func test_getUsageStatistics_freshStatsAreZero() async {
+        let stats = await sut.getUsageStatistics()
+        for stat in stats {
+            XCTAssertEqual(stat.currentUsage, 0, "Fresh stats should have zero usage for \(stat.feature.rawValue)/\(stat.period.key)")
+        }
+    }
+
+    func test_featureUsageStatistic_percentUsed() async {
+        let stats = await sut.getUsageStatistics()
+        guard let first = stats.first else {
+            XCTFail("Expected at least one stat")
+            return
+        }
+        XCTAssertEqual(first.percentUsed, Double(first.currentUsage), "percentUsed should equal currentUsage as Double")
+    }
+
+    // MARK: - RateLimitExceeded Error
+
+    func test_rateLimitExceeded_errorDescription() {
+        let error = RateLimitExceeded(
+            feature: .imageGeneration,
+            limit: 3,
+            resetsAt: Date().addingTimeInterval(3600)
+        )
+
+        let desc = error.errorDescription!
+        XCTAssertTrue(desc.contains("Image Generation"), "Error should mention the feature name")
+        XCTAssertTrue(desc.contains("3"), "Error should mention the limit")
+    }
+
+    func test_rateLimitExceeded_containsResetTime() {
+        let resetDate = Date().addingTimeInterval(3600)
+        let error = RateLimitExceeded(
+            feature: .knowledgeExpansion,
+            limit: 10,
+            resetsAt: resetDate
+        )
+
+        let desc = error.errorDescription!
+        // Should contain a date/time string (varies by locale, but shouldn't be empty)
+        XCTAssertFalse(desc.isEmpty)
+        XCTAssertTrue(desc.contains("Knowledge Expansion"))
+    }
+
+    // MARK: - Zero Limit Edge Case
+
+    func test_checkLimit_zeroLimitDeniesImmediately() async throws {
+        let denied = try await sut.checkLimit(feature: .imageGeneration, limit: 0, period: .daily)
+        XCTAssertFalse(denied, "A limit of 0 should deny immediately")
+    }
+}

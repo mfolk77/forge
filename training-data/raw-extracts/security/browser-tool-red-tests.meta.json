@@ -1,0 +1,1 @@
+{"name": "browser-tool-red-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/BrowserToolHandlerRedTests.swift", "line_count": 228, "why": "Serena red tests: BrowserToolHandlerRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

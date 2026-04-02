@@ -1,0 +1,1 @@
+{"name": "token-sampler", "category": "inference", "source_file": "/Users/michaelfolk/Developer/forge/src/inference/sampler.rs", "line_count":      310, "why": "Forge inference/sampler.rs", "distill_as": ["instruction", "conversation"]}

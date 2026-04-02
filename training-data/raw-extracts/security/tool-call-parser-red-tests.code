@@ -1,0 +1,170 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Malformed input, empty names, duplicates, size limits, and null bytes in ToolCallParser.
+/// These tests verify that the parser rejects ghost tool calls, deduplicates, caps output,
+/// sanitizes null bytes, and guards against oversized input.
+///
+/// Target: Sources/SerenaCore/Services/ToolCallParser.swift
+@MainActor
+final class ToolCallParserRedTests: XCTestCase {
+
+    private var parser: ToolCallParser!
+
+    override func setUp() {
+        super.setUp()
+        parser = ToolCallParser.shared
+    }
+
+    // MARK: - RED: Empty/Invalid Tool Names
+
+    /// Empty "name" in JSON should NOT produce a valid tool call.
+    /// A ToolCall with tool="" is a ghost — it can't be routed to any handler.
+    func test_parser_emptyToolName_rejected() {
+        let response = """
+        <tool_call>{"name": "", "arguments": {"title": "Test"}}</tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertTrue(calls.isEmpty,
+                      "Empty tool name must be rejected — got \(calls.count) tool call(s) with tool='\(calls.first?.tool ?? "")'")
+    }
+
+    /// Whitespace-only "name" should also be rejected.
+    func test_parser_whitespaceToolName_rejected() {
+        let response = """
+        <tool_call>{"name": "   ", "arguments": {"title": "Test"}}</tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertTrue(calls.isEmpty,
+                      "Whitespace-only tool name must be rejected")
+    }
+
+    // MARK: - RED: Duplicate Deduplication
+
+    /// Identical tool calls in two proper <tool_call> blocks should be deduplicated.
+    /// Without dedup, the same action executes twice (e.g., creates two calendar events).
+    func test_parser_duplicateToolCalls_deduplicated() {
+        let response = """
+        <tool_call>{"name": "create_calendar_event", "arguments": {"title": "Standup", "date": "tomorrow"}}</tool_call>
+        <tool_call>{"name": "create_calendar_event", "arguments": {"title": "Standup", "date": "tomorrow"}}</tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertEqual(calls.count, 1,
+                       "Duplicate tool calls must be deduplicated — got \(calls.count)")
+    }
+
+    // MARK: - RED: Max Tool Calls Per Response
+
+    /// A response with many tool calls should be capped to prevent DoS.
+    /// An attacker-crafted LLM response with 100 tool calls could overwhelm the system.
+    func test_parser_maxToolCallsPerResponse_limited() {
+        var response = ""
+        for i in 0..<20 {
+            response += """
+            <tool_call>{"name": "launch_app", "arguments": {"app_name": "App\(i)"}}</tool_call>\n
+            """
+        }
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertLessThanOrEqual(calls.count, 10,
+                                 "Tool calls per response must be capped — got \(calls.count)")
+    }
+
+    // MARK: - RED: Null Bytes in Parameters
+
+    /// Null bytes in tool call parameters should be stripped.
+    /// Null bytes can cause issues in AppleScript, file paths, and other downstream processing.
+    func test_parser_nullBytesInParams_sanitized() {
+        let response = """
+        <tool_call>{"name": "create_note", "arguments": {"title": "Test\u{0000}Note", "content": "Hello\u{0000}World"}}</tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        // Should parse but with null bytes stripped from params
+        if let call = calls.first {
+            for (key, value) in call.params {
+                XCTAssertFalse(value.contains("\u{0000}"),
+                               "Null byte found in param '\(key)' — must be sanitized")
+            }
+        }
+    }
+
+    // MARK: - RED: Input Size Guard
+
+    /// Very large responses should be rejected or truncated before regex parsing.
+    /// Multiple regex passes on a 1MB string could cause performance issues.
+    func test_parser_veryLargeResponse_sizeGuard() {
+        // 500KB of filler text with a tool call buried at the end
+        let filler = String(repeating: "This is filler text for testing. ", count: 15_000)
+        let response = filler + """
+        <tool_call>{"name": "launch_app", "arguments": {"app_name": "Safari"}}</tool_call>
+        """
+
+        let start = Date()
+        let calls = parser.parseToolCalls(from: response)
+        let elapsed = Date().timeIntervalSince(start)
+
+        // Must complete in under 2 seconds — no regex catastrophic backtracking
+        XCTAssertLessThan(elapsed, 2.0,
+                          "Parser took \(elapsed)s on large input — must complete in <2s")
+        // Either parse it or reject it, but don't hang
+        XCTAssertTrue(true, "Parser completed without hanging")
+    }
+
+    // MARK: - GREEN: Sanity Checks (should already pass)
+
+    /// Completely invalid JSON between tags should not crash.
+    func test_parser_invalidJSON_noCrash() {
+        let response = "<tool_call>THIS IS NOT JSON AT ALL!!!</tool_call>"
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertTrue(calls.isEmpty, "Invalid JSON should produce no tool calls")
+    }
+
+    /// Unicode characters in parameters must be preserved through parsing.
+    func test_parser_unicodeParams_preserved() {
+        let response = """
+        <tool_call>{"name": "create_note", "arguments": {"title": "会议记录", "content": "Café résumé 🎉"}}</tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertEqual(calls.count, 1, "Should parse unicode tool call")
+        XCTAssertEqual(calls.first?.params["title"], "会议记录", "Chinese characters must be preserved")
+        XCTAssertEqual(calls.first?.params["content"], "Café résumé 🎉", "Accented chars and emoji must be preserved")
+    }
+
+    /// Empty string input should return empty array, not crash.
+    func test_parser_emptyResponse_returnsEmpty() {
+        let calls = parser.parseToolCalls(from: "")
+        XCTAssertTrue(calls.isEmpty, "Empty response should return empty array")
+    }
+
+    /// Unbalanced braces should not cause an infinite loop.
+    func test_parser_unbalancedBraces_noHang() {
+        let response = "<tool_call>{{{{{{</tool_call>"
+        let start = Date()
+        let calls = parser.parseToolCalls(from: response)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 1.0, "Unbalanced braces must not cause hang")
+        XCTAssertTrue(calls.isEmpty, "Unbalanced braces should produce no tool calls")
+    }
+
+    /// Nested <tool_call> tags should not produce garbage output.
+    func test_parser_nestedToolCallTags_noGarbageOutput() {
+        let response = """
+        <tool_call><tool_call>{"name": "launch_app", "arguments": {"app_name": "Safari"}}</tool_call></tool_call>
+        """
+        let calls = parser.parseToolCalls(from: response)
+        // Should either parse the inner call correctly or reject — not crash
+        for call in calls {
+            XCTAssertFalse(call.tool.isEmpty, "Parsed tool call should have non-empty tool name")
+        }
+    }
+
+    /// Missing closing tag should still parse the tool call.
+    func test_parser_missingClosingTag_stillParsed() {
+        let response = """
+        <tool_call>{"name": "launch_app", "arguments": {"app_name": "Safari"}}
+        """
+        let calls = parser.parseToolCalls(from: response)
+        XCTAssertEqual(calls.count, 1, "Missing closing tag should still parse")
+        XCTAssertEqual(calls.first?.tool, "app", "Should map launch_app to app tool")
+        XCTAssertEqual(calls.first?.action, "launch", "Should map launch_app to launch action")
+    }
+}

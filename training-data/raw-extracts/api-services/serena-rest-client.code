@@ -1,0 +1,418 @@
+import Foundation
+import os.log
+
+/// REST client for VA Lighthouse API endpoints
+/// Handles FHIR R4 JSON responses and maps them to VA model types
+public actor VAAPIClient {
+    private let logger = Logger(subsystem: "com.serenanet.va", category: "VAAPIClient")
+
+    // MARK: - Configuration
+
+    /// VA Lighthouse API base URLs (sandbox — swap for production after approval)
+    public struct Endpoints {
+        public static var benefitsBase = "https://sandbox-api.va.gov/services/claims/v2"
+        public static var healthBase = "https://sandbox-api.va.gov/services/fhir/v0/r4"
+        public static var veteranVerification = "https://sandbox-api.va.gov/services/veteran_verification/v2"
+
+        /// API key for VA Lighthouse — loaded from SERENA_VA_API_KEY env var or set directly
+        public static var apiKey: String = ProcessInfo.processInfo.environment["SERENA_VA_API_KEY"] ?? ""
+
+        public static func useProduction() {
+            benefitsBase = "https://api.va.gov/services/claims/v2"
+            healthBase = "https://api.va.gov/services/fhir/v0/r4"
+            veteranVerification = "https://api.va.gov/services/veteran_verification/v2"
+        }
+    }
+
+    private let session: URLSession
+    private let dateFormatter: ISO8601DateFormatter
+    private let fhirDateFormatter: DateFormatter
+
+    public init() {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        self.session = URLSession(configuration: config)
+
+        self.dateFormatter = ISO8601DateFormatter()
+        self.dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        self.fhirDateFormatter = DateFormatter()
+        self.fhirDateFormatter.dateFormat = "yyyy-MM-dd"
+    }
+
+    // MARK: - Benefits API
+
+    /// Fetch all claims for the authenticated veteran
+    public func fetchClaims(accessToken: String) async throws -> [VAClaim] {
+        let url = URL(string: "\(Endpoints.benefitsBase)/veterans/me/claims")!
+        let data = try await authenticatedRequest(url: url, accessToken: accessToken)
+
+        // VA Benefits API returns { data: [{ id, type, attributes }] }
+        let response = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let claimsArray = response?["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        return claimsArray.compactMap { parseClaim($0) }
+    }
+
+    /// Fetch disability rating
+    public func fetchDisabilityRating(accessToken: String) async throws -> VADisabilityRating {
+        let url = URL(string: "\(Endpoints.veteranVerification)/disability_rating")!
+        let data = try await authenticatedRequest(url: url, accessToken: accessToken)
+
+        let response = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let ratingData = response?["data"] as? [String: Any],
+              let attributes = ratingData["attributes"] as? [String: Any] else {
+            throw VAError.fhirParsingError("Invalid disability rating response")
+        }
+
+        let combined = attributes["combined_disability_rating"] as? Int ?? 0
+        let individualArray = attributes["individual_ratings"] as? [[String: Any]] ?? []
+
+        let ratings = individualArray.map { rating -> VADisabilityRating.IndividualRating in
+            VADisabilityRating.IndividualRating(
+                condition: rating["diagnostic_text"] as? String ?? "Unknown",
+                ratingPercentage: rating["rating_percentage"] as? Int ?? 0,
+                effectiveDate: parseDate(rating["effective_date"] as? String),
+                staticIndicator: rating["static_ind"] as? Bool ?? false
+            )
+        }
+
+        return VADisabilityRating(combinedRating: combined, individualRatings: ratings)
+    }
+
+    // MARK: - Health API (FHIR R4)
+
+    /// Fetch upcoming appointments
+    public func fetchAppointments(accessToken: String, from startDate: Date? = nil) async throws -> [VAAppointment] {
+        var urlComponents = URLComponents(string: "\(Endpoints.healthBase)/Appointment")!
+        var queryItems = [URLQueryItem(name: "patient", value: "me")]
+
+        if let start = startDate {
+            queryItems.append(URLQueryItem(name: "date", value: "ge\(fhirDateFormatter.string(from: start))"))
+        }
+        urlComponents.queryItems = queryItems
+
+        let data = try await authenticatedRequest(url: urlComponents.url!, accessToken: accessToken)
+        return try parseFHIRBundle(data: data, parser: parseAppointment)
+    }
+
+    /// Fetch active medications
+    public func fetchMedications(accessToken: String) async throws -> [VAMedication] {
+        var urlComponents = URLComponents(string: "\(Endpoints.healthBase)/MedicationRequest")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "patient", value: "me"),
+            URLQueryItem(name: "status", value: "active")
+        ]
+
+        let data = try await authenticatedRequest(url: urlComponents.url!, accessToken: accessToken)
+        return try parseFHIRBundle(data: data, parser: parseMedication)
+    }
+
+    /// Fetch lab results
+    public func fetchLabResults(accessToken: String, category: String = "laboratory") async throws -> [VALabResult] {
+        var urlComponents = URLComponents(string: "\(Endpoints.healthBase)/Observation")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "patient", value: "me"),
+            URLQueryItem(name: "category", value: category),
+            URLQueryItem(name: "_sort", value: "-date"),
+            URLQueryItem(name: "_count", value: "50")
+        ]
+
+        let data = try await authenticatedRequest(url: urlComponents.url!, accessToken: accessToken)
+        return try parseFHIRBundle(data: data, parser: parseLabResult)
+    }
+
+    /// Fetch health conditions
+    public func fetchConditions(accessToken: String) async throws -> [VACondition] {
+        var urlComponents = URLComponents(string: "\(Endpoints.healthBase)/Condition")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "patient", value: "me"),
+            URLQueryItem(name: "clinical-status", value: "active")
+        ]
+
+        let data = try await authenticatedRequest(url: urlComponents.url!, accessToken: accessToken)
+        return try parseFHIRBundle(data: data, parser: parseCondition)
+    }
+
+    /// Fetch allergies
+    public func fetchAllergies(accessToken: String) async throws -> [VAAllergy] {
+        var urlComponents = URLComponents(string: "\(Endpoints.healthBase)/AllergyIntolerance")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "patient", value: "me")
+        ]
+
+        let data = try await authenticatedRequest(url: urlComponents.url!, accessToken: accessToken)
+        return try parseFHIRBundle(data: data, parser: parseAllergy)
+    }
+
+    /// Verify veteran status
+    public func fetchVeteranStatus(accessToken: String) async throws -> VAVeteranStatus {
+        let url = URL(string: "\(Endpoints.veteranVerification)/status")!
+        let data = try await authenticatedRequest(url: url, accessToken: accessToken)
+
+        let response = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let statusData = response?["data"] as? [String: Any],
+              let attributes = statusData["attributes"] as? [String: Any] else {
+            throw VAError.fhirParsingError("Invalid veteran status response")
+        }
+
+        let isVeteran = (attributes["veteran_status"] as? String) == "confirmed"
+        let serviceArray = attributes["service_history"] as? [[String: Any]] ?? []
+
+        let history = serviceArray.map { service -> VAVeteranStatus.ServicePeriod in
+            VAVeteranStatus.ServicePeriod(
+                branchOfService: service["branch_of_service"] as? String ?? "Unknown",
+                startDate: parseDate(service["start_date"] as? String),
+                endDate: parseDate(service["end_date"] as? String),
+                dischargeStatus: service["discharge_status"] as? String
+            )
+        }
+
+        return VAVeteranStatus(isVeteran: isVeteran, serviceHistory: history)
+    }
+
+    // MARK: - HTTP
+
+    private func authenticatedRequest(url: URL, accessToken: String) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        // VA Lighthouse requires apikey header for sandbox (and production)
+        if !Endpoints.apiKey.isEmpty {
+            request.setValue(Endpoints.apiKey, forHTTPHeaderField: "apikey")
+        }
+
+        logger.info("VA API request: \(url.path)")
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw VAError.networkError("Invalid response from VA API")
+        }
+
+        switch httpResponse.statusCode {
+        case 200...299:
+            return data
+        case 401:
+            throw VAError.tokenExpired
+        case 403:
+            throw VAError.notAuthenticated
+        case 429:
+            let retryAfter = TimeInterval(httpResponse.value(forHTTPHeaderField: "Retry-After") ?? "60") ?? 60
+            throw VAError.rateLimited(retryAfter: retryAfter)
+        default:
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw VAError.apiError(statusCode: httpResponse.statusCode, message: message)
+        }
+    }
+
+    // MARK: - FHIR Bundle Parser
+
+    private func parseFHIRBundle<T>(data: Data, parser: ([String: Any]) -> T?) throws -> [T] {
+        guard let bundle = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = bundle["entry"] as? [[String: Any]] else {
+            return []
+        }
+
+        return entries.compactMap { entry -> T? in
+            guard let resource = entry["resource"] as? [String: Any] else { return nil }
+            return parser(resource)
+        }
+    }
+
+    // MARK: - FHIR Resource Parsers
+
+    private func parseClaim(_ data: [String: Any]) -> VAClaim? {
+        guard let id = data["id"] as? String else { return nil }
+        let attributes = data["attributes"] as? [String: Any] ?? data
+
+        return VAClaim(
+            id: id,
+            type: data["type"] as? String ?? "unknown",
+            status: VAClaim.ClaimStatus(rawValue: attributes["status"] as? String ?? "") ?? .unknown,
+            submittedDate: parseDate(attributes["date_filed"] as? String),
+            lastUpdated: parseDate(attributes["updated_at"] as? String),
+            description: attributes["contention_list"] as? String ?? attributes["claim_type"] as? String ?? "Compensation claim",
+            phase: attributes["phase"] as? Int,
+            documentsNeeded: attributes["documents_needed"] as? Bool ?? false,
+            decisionLetterSent: attributes["decision_letter_sent"] as? Bool ?? false
+        )
+    }
+
+    private func parseAppointment(_ resource: [String: Any]) -> VAAppointment? {
+        guard let id = resource["id"] as? String else { return nil }
+
+        let startString = resource["start"] as? String
+        guard let startDate = startString.flatMap({ dateFormatter.date(from: $0) ?? fhirDateFormatter.date(from: $0) }) else {
+            return nil
+        }
+
+        // Extract location from contained or referenced resources
+        var location: String?
+        if let participants = resource["participant"] as? [[String: Any]] {
+            for participant in participants {
+                if let actor = participant["actor"] as? [String: Any],
+                   let display = actor["display"] as? String,
+                   participant["type"] == nil { // Location entries typically don't have type
+                    location = display
+                }
+            }
+        }
+
+        // Check for video visit
+        let serviceType = resource["serviceType"] as? [[String: Any]]
+        let isVideo = serviceType?.contains { type in
+            (type["text"] as? String)?.lowercased().contains("video") ?? false
+        } ?? false
+
+        return VAAppointment(
+            id: id,
+            status: VAAppointment.AppointmentStatus(rawValue: resource["status"] as? String ?? "") ?? .unknown,
+            startDate: startDate,
+            endDate: (resource["end"] as? String).flatMap { dateFormatter.date(from: $0) },
+            location: location,
+            appointmentType: (resource["appointmentType"] as? [String: Any])?["text"] as? String,
+            isVideoVisit: isVideo
+        )
+    }
+
+    private func parseMedication(_ resource: [String: Any]) -> VAMedication? {
+        guard let id = resource["id"] as? String else { return nil }
+
+        let medicationCode = resource["medicationCodeableConcept"] as? [String: Any]
+        let name = medicationCode?["text"] as? String ?? "Unknown medication"
+
+        // Parse dosage instructions
+        var dosage: String?
+        var frequency: String?
+        var instructions: String?
+        if let dosageArray = resource["dosageInstruction"] as? [[String: Any]], let first = dosageArray.first {
+            instructions = first["text"] as? String
+            if let doseQuantity = (first["doseAndRate"] as? [[String: Any]])?.first?["doseQuantity"] as? [String: Any] {
+                let value = doseQuantity["value"] as? Double ?? 0
+                let unit = doseQuantity["unit"] as? String ?? ""
+                dosage = "\(Int(value)) \(unit)"
+            }
+            if let timing = first["timing"] as? [String: Any],
+               let code = timing["code"] as? [String: Any] {
+                frequency = code["text"] as? String
+            }
+        }
+
+        let requester = (resource["requester"] as? [String: Any])?["display"] as? String
+
+        return VAMedication(
+            id: id,
+            name: name,
+            dosage: dosage,
+            frequency: frequency,
+            prescriber: requester,
+            status: VAMedication.MedicationStatus(rawValue: resource["status"] as? String ?? "") ?? .unknown,
+            startDate: (resource["authoredOn"] as? String).flatMap { parseDate($0) },
+            instructions: instructions
+        )
+    }
+
+    private func parseLabResult(_ resource: [String: Any]) -> VALabResult? {
+        guard let id = resource["id"] as? String else { return nil }
+
+        let code = resource["code"] as? [String: Any]
+        let testName = code?["text"] as? String ?? "Unknown test"
+
+        // Parse value
+        var value = ""
+        var unit: String?
+        if let valueQuantity = resource["valueQuantity"] as? [String: Any] {
+            let numValue = valueQuantity["value"] as? Double ?? 0
+            unit = valueQuantity["unit"] as? String
+            value = "\(numValue)"
+        } else if let valueString = resource["valueString"] as? String {
+            value = valueString
+        } else if let valueConcept = resource["valueCodeableConcept"] as? [String: Any] {
+            value = valueConcept["text"] as? String ?? ""
+        }
+
+        // Parse reference range
+        var refRange: String?
+        if let ranges = resource["referenceRange"] as? [[String: Any]], let first = ranges.first {
+            let low = (first["low"] as? [String: Any])?["value"] as? Double
+            let high = (first["high"] as? [String: Any])?["value"] as? Double
+            if let l = low, let h = high {
+                refRange = "\(l) - \(h)"
+            }
+        }
+
+        // Check abnormal
+        let interpretation = resource["interpretation"] as? [[String: Any]]
+        let isAbnormal = interpretation?.contains { interp in
+            let coding = (interp["coding"] as? [[String: Any]])?.first
+            let code = coding?["code"] as? String ?? ""
+            return ["H", "L", "HH", "LL", "A"].contains(code)
+        } ?? false
+
+        let effectiveDateString = resource["effectiveDateTime"] as? String
+        guard let effectiveDate = effectiveDateString.flatMap({ dateFormatter.date(from: $0) ?? fhirDateFormatter.date(from: $0) }) else {
+            return nil
+        }
+
+        let category = (resource["category"] as? [[String: Any]])?.first?["text"] as? String
+
+        return VALabResult(
+            id: id,
+            testName: testName,
+            value: value,
+            unit: unit,
+            referenceRange: refRange,
+            status: VALabResult.ResultStatus(rawValue: resource["status"] as? String ?? "") ?? .unknown,
+            effectiveDate: effectiveDate,
+            isAbnormal: isAbnormal,
+            category: category
+        )
+    }
+
+    private func parseCondition(_ resource: [String: Any]) -> VACondition? {
+        guard let id = resource["id"] as? String else { return nil }
+
+        let code = resource["code"] as? [String: Any]
+        let name = code?["text"] as? String ?? "Unknown condition"
+
+        let clinicalStatus = ((resource["clinicalStatus"] as? [String: Any])?["coding"] as? [[String: Any]])?.first?["code"] as? String ?? "unknown"
+
+        let onsetDate = (resource["onsetDateTime"] as? String).flatMap { parseDate($0) }
+        let abatementDate = (resource["abatementDateTime"] as? String).flatMap { parseDate($0) }
+        let category = (resource["category"] as? [[String: Any]])?.first?["text"] as? String
+
+        return VACondition(id: id, name: name, clinicalStatus: clinicalStatus,
+                          onsetDate: onsetDate, abatementDate: abatementDate, category: category)
+    }
+
+    private func parseAllergy(_ resource: [String: Any]) -> VAAllergy? {
+        guard let id = resource["id"] as? String else { return nil }
+
+        let code = resource["code"] as? [String: Any]
+        let substance = code?["text"] as? String ?? "Unknown substance"
+
+        let reactions = resource["reaction"] as? [[String: Any]]
+        let reaction = reactions?.first.flatMap { r -> String? in
+            (r["manifestation"] as? [[String: Any]])?.first?["text"] as? String
+        }
+        let severity = reactions?.first?["severity"] as? String
+
+        let clinicalStatus = ((resource["clinicalStatus"] as? [String: Any])?["coding"] as? [[String: Any]])?.first?["code"] as? String ?? "active"
+        let recordedDate = (resource["recordedDate"] as? String).flatMap { parseDate($0) }
+
+        return VAAllergy(id: id, substance: substance, reaction: reaction,
+                        severity: severity, status: clinicalStatus, recordedDate: recordedDate)
+    }
+
+    // MARK: - Date Parsing
+
+    private func parseDate(_ string: String?) -> Date? {
+        guard let string = string else { return nil }
+        return dateFormatter.date(from: string) ?? fhirDateFormatter.date(from: string)
+    }
+}

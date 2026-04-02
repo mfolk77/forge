@@ -1,0 +1,218 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: RTAITrigger system — trigger registration, tag matching,
+/// pattern matching, keyword matching, priority ordering, and edge cases.
+///
+/// Target files:
+/// - Sources/SerenaCore/Mitosis/RTAITrigger.swift
+final class MitosisRTAITriggerRedTests: XCTestCase {
+
+    private var trigger: RTAITrigger!
+
+    override func setUp() {
+        super.setUp()
+        trigger = RTAITrigger()
+    }
+
+    // MARK: - Group 1: Default Triggers
+
+    /// RTAITrigger should have default triggers registered on init
+    func test_defaultTriggers_registered() {
+        let triggers = trigger.listTriggers()
+        XCTAssertFalse(triggers.isEmpty, "Should have default triggers registered")
+    }
+
+    /// Default triggers should include medication lookups
+    func test_defaultTriggers_includeMedications() {
+        let triggers = trigger.listTriggers()
+        let cellTypes = triggers.map { $0.cellType }
+        XCTAssertTrue(cellTypes.contains("medication_lookup_epinephrine"))
+        XCTAssertTrue(cellTypes.contains("medication_lookup_amiodarone"))
+    }
+
+    /// Default triggers should include emergency protocols
+    func test_defaultTriggers_includeProtocols() {
+        let triggers = trigger.listTriggers()
+        let cellTypes = triggers.map { $0.cellType }
+        XCTAssertTrue(cellTypes.contains("protocol_cardiac_arrest"))
+        XCTAssertTrue(cellTypes.contains("protocol_anaphylaxis"))
+    }
+
+    /// Triggers should be sorted by priority (highest first)
+    func test_triggers_sortedByPriority() {
+        let triggers = trigger.listTriggers()
+        for i in 0..<(triggers.count - 1) {
+            XCTAssertGreaterThanOrEqual(triggers[i].priority, triggers[i + 1].priority,
+                "Triggers should be sorted by priority descending")
+        }
+    }
+
+    // MARK: - Group 2: Tag Matching
+
+    /// @epinephrine tag should match medication lookup
+    func test_tagMatch_epinephrine() {
+        let result = trigger.match(input: "@epinephrine dose needed")
+        XCTAssertEqual(result, "medication_lookup_epinephrine")
+    }
+
+    /// @adrenaline tag should also match epinephrine (alias)
+    func test_tagMatch_adrenaline_aliasForEpinephrine() {
+        let result = trigger.match(input: "@adrenaline dose check")
+        XCTAssertEqual(result, "medication_lookup_epinephrine")
+    }
+
+    /// @cardiac_arrest tag should match protocol
+    func test_tagMatch_cardiacArrest() {
+        let result = trigger.match(input: "Initiate @cardiac_arrest protocol")
+        // cardiac_arrest has higher priority (20) than epinephrine (10)
+        XCTAssertEqual(result, "protocol_cardiac_arrest")
+    }
+
+    /// @amiodarone tag should match amiodarone lookup
+    func test_tagMatch_amiodarone() {
+        let result = trigger.match(input: "@amiodarone dosing")
+        XCTAssertEqual(result, "medication_lookup_amiodarone")
+    }
+
+    // MARK: - Group 3: Pattern Matching
+
+    /// "epinephrine" as a word should match via pattern
+    func test_patternMatch_epinephrine() {
+        let result = trigger.match(input: "What is the epinephrine dose?")
+        XCTAssertEqual(result, "medication_lookup_epinephrine")
+    }
+
+    /// "cardiac arrest" should match cardiac arrest protocol
+    func test_patternMatch_cardiacArrest() {
+        let result = trigger.match(input: "Patient in cardiac arrest")
+        XCTAssertEqual(result, "protocol_cardiac_arrest")
+    }
+
+    /// "code blue" should match cardiac arrest protocol
+    func test_patternMatch_codeBlue() {
+        let result = trigger.match(input: "We have a code blue in room 5")
+        XCTAssertEqual(result, "protocol_cardiac_arrest")
+    }
+
+    /// "anaphylaxis" should match anaphylaxis protocol
+    func test_patternMatch_anaphylaxis() {
+        let result = trigger.match(input: "Patient experiencing anaphylaxis")
+        XCTAssertEqual(result, "protocol_anaphylaxis")
+    }
+
+    /// "anaphylactic" variant should also match
+    func test_patternMatch_anaphylactic() {
+        let result = trigger.match(input: "Anaphylactic reaction noted")
+        XCTAssertEqual(result, "protocol_anaphylaxis")
+    }
+
+    // MARK: - Group 4: Keyword Matching
+
+    /// Input with >=50% keyword match should trigger
+    func test_keywordMatch_sufficientOverlap() {
+        // amiodarone keywords: amiodarone, dose, dosage, antiarrhythmic
+        // "dose of amiodarone" matches 2/4 = 50%
+        let result = trigger.match(input: "dose of amiodarone please")
+        XCTAssertNotNil(result, "Should match with >=50% keyword overlap")
+    }
+
+    // MARK: - Group 5: No Match
+
+    /// Unrelated input should return nil
+    func test_noMatch_unrelatedInput() {
+        let result = trigger.match(input: "What's the weather today?")
+        XCTAssertNil(result, "Weather query should not match any trigger")
+    }
+
+    /// Empty input should return nil
+    func test_noMatch_emptyInput() {
+        let result = trigger.match(input: "")
+        XCTAssertNil(result)
+    }
+
+    /// Single common word should not trigger
+    func test_noMatch_singleCommonWord() {
+        let result = trigger.match(input: "hello")
+        XCTAssertNil(result)
+    }
+
+    // MARK: - Group 6: Case Insensitivity
+
+    /// Matching should be case-insensitive
+    func test_caseInsensitive_uppercase() {
+        let result = trigger.match(input: "EPINEPHRINE DOSE")
+        XCTAssertNotNil(result, "Should match regardless of case")
+    }
+
+    /// Mixed case should match
+    func test_caseInsensitive_mixedCase() {
+        let result = trigger.match(input: "Cardiac Arrest Protocol")
+        XCTAssertNotNil(result)
+    }
+
+    // MARK: - Group 7: Custom Trigger Registration
+
+    /// Registering a custom trigger should work
+    func test_registerCustomTrigger() {
+        let initialCount = trigger.listTriggers().count
+
+        trigger.registerTrigger(TriggerSchema(
+            cellType: "custom_test",
+            tags: ["@custom"],
+            keywords: ["custom", "test"],
+            priority: 50
+        ))
+
+        let newCount = trigger.listTriggers().count
+        XCTAssertEqual(newCount, initialCount + 1)
+    }
+
+    /// Custom trigger with high priority should be checked first
+    func test_customTrigger_highPriority_matchesFirst() {
+        trigger.registerTrigger(TriggerSchema(
+            cellType: "high_priority_custom",
+            tags: ["@urgent"],
+            keywords: [],
+            priority: 100
+        ))
+
+        let result = trigger.match(input: "@urgent situation")
+        XCTAssertEqual(result, "high_priority_custom")
+    }
+
+    // MARK: - Group 8: TriggerSchema
+
+    /// TriggerSchema should compile valid regex patterns
+    func test_triggerSchema_compilesPatterns() {
+        let schema = TriggerSchema(
+            cellType: "test",
+            patterns: ["\\btest\\b", "hello\\s+world"],
+            priority: 1
+        )
+
+        XCTAssertEqual(schema.compiledPatterns.count, 2, "Both patterns should compile")
+    }
+
+    /// TriggerSchema should skip invalid regex patterns
+    func test_triggerSchema_skipsInvalidPatterns() {
+        let schema = TriggerSchema(
+            cellType: "test",
+            patterns: ["[invalid", "\\bvalid\\b"],
+            priority: 1
+        )
+
+        XCTAssertEqual(schema.compiledPatterns.count, 1, "Invalid pattern should be skipped")
+    }
+
+    /// TriggerSchema defaults
+    func test_triggerSchema_defaults() {
+        let schema = TriggerSchema(cellType: "minimal")
+
+        XCTAssertEqual(schema.cellType, "minimal")
+        XCTAssertTrue(schema.tags.isEmpty)
+        XCTAssertTrue(schema.keywords.isEmpty)
+        XCTAssertTrue(schema.patterns.isEmpty)
+        XCTAssertEqual(schema.priority, 0)
+    }
+}

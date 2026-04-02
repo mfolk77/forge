@@ -1,0 +1,13 @@
+{
+  "name": "subscription-bypass-red-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/SubscriptionBypassRedTests.swift",
+  "line_count": 220,
+  "why": "Subscription bypass attempts",
+  "distill_as": [
+    "instruction",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

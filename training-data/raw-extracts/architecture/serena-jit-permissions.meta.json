@@ -1,0 +1,14 @@
+{
+  "name": "serena-jit-permissions",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/RealToolExecutor.swift",
+  "line_count": 396,
+  "why": "JIT permission model \u2014 conversational dialogs instead of hard walls",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

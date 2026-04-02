@@ -1,0 +1,441 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: AKE System 2 (Domain Expansion) — GapDetector logic, model types,
+/// priority sorting, excluded topics, confidence thresholds, research jobs,
+/// and DomainExpansionCoordinator enable/disable/stats.
+///
+/// Note: GapDetector.detectGaps() requires DataStore (SQLite) and is not tested here.
+/// These tests focus on the testable surface: addGap, priority, stats, resolve, reset.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/GapDetector.swift
+/// - Sources/SerenaCore/Services/KnowledgeSynthesizer.swift
+/// - Sources/SerenaCore/Services/DomainExpansionCoordinator.swift
+/// - Sources/SerenaCore/Models/KnowledgeModels.swift
+final class AKESystem2RedTests: XCTestCase {
+
+    // MARK: - Group 1: KnowledgeGap Model
+
+    /// KnowledgeGap should store topic, frequency, and confidence
+    func test_knowledgeGap_creation() {
+        let gap = KnowledgeGap(
+            topic: "quantum computing",
+            frequency: 3,
+            avgConfidence: 0.4,
+            messageIDs: ["msg1", "msg2", "msg3"]
+        )
+
+        XCTAssertEqual(gap.topic, "quantum computing")
+        XCTAssertEqual(gap.frequency, 3)
+        XCTAssertEqual(gap.avgConfidence, 0.4)
+        XCTAssertEqual(gap.messageIDs.count, 3)
+    }
+
+    /// KnowledgeGap should generate unique IDs by default
+    func test_knowledgeGap_uniqueIDs() {
+        let gap1 = KnowledgeGap(topic: "topic1", frequency: 1, avgConfidence: 0.5, messageIDs: [])
+        let gap2 = KnowledgeGap(topic: "topic2", frequency: 1, avgConfidence: 0.5, messageIDs: [])
+        XCTAssertNotEqual(gap1.id, gap2.id)
+    }
+
+    /// KnowledgeGap should be Codable
+    func test_knowledgeGap_codable() throws {
+        let gap = KnowledgeGap(
+            topic: "machine learning",
+            frequency: 5,
+            avgConfidence: 0.35,
+            messageIDs: ["a", "b"]
+        )
+
+        let data = try JSONEncoder().encode(gap)
+        let decoded = try JSONDecoder().decode(KnowledgeGap.self, from: data)
+
+        XCTAssertEqual(decoded.topic, "machine learning")
+        XCTAssertEqual(decoded.frequency, 5)
+        XCTAssertEqual(decoded.avgConfidence, 0.35, accuracy: 0.001)
+        XCTAssertEqual(decoded.messageIDs, ["a", "b"])
+    }
+
+    // MARK: - Group 2: GapDetector In-Memory Operations
+
+    /// addGap should store a gap and it should be retrievable
+    func test_gapDetector_addGap_stores() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        let gap = KnowledgeGap(topic: "Swift concurrency", frequency: 1, avgConfidence: 0.4, messageIDs: ["m1"])
+        await detector.addGap(gap)
+
+        let allGaps = await detector.getAllGaps()
+        XCTAssertEqual(allGaps.count, 1)
+        XCTAssertEqual(allGaps.first?.topic, "Swift concurrency")
+    }
+
+    /// addGap with same topic should increment frequency
+    func test_gapDetector_addGap_incrementsFrequency() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        let gap1 = KnowledgeGap(topic: "neural networks", frequency: 1, avgConfidence: 0.5, messageIDs: ["m1"])
+        let gap2 = KnowledgeGap(topic: "Neural Networks", frequency: 1, avgConfidence: 0.3, messageIDs: ["m2"])
+
+        await detector.addGap(gap1)
+        await detector.addGap(gap2)
+
+        let allGaps = await detector.getAllGaps()
+        XCTAssertEqual(allGaps.count, 1, "Same topic (case-insensitive) should merge")
+        XCTAssertEqual(allGaps.first?.frequency, 2, "Frequency should be incremented")
+    }
+
+    /// addGap should calculate weighted average confidence
+    func test_gapDetector_addGap_averagesConfidence() async throws {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        let gap1 = KnowledgeGap(topic: "transformers", frequency: 1, avgConfidence: 0.6, messageIDs: ["m1"])
+        let gap2 = KnowledgeGap(topic: "Transformers", frequency: 1, avgConfidence: 0.4, messageIDs: ["m2"])
+
+        await detector.addGap(gap1)
+        await detector.addGap(gap2)
+
+        let allGaps = await detector.getAllGaps()
+        // Weighted avg: (0.6 * 1 + 0.4) / 2 = 0.5
+        let avgConf = try XCTUnwrap(allGaps.first?.avgConfidence)
+        XCTAssertEqual(avgConf, 0.5, accuracy: 0.01)
+    }
+
+    /// addGap with excluded topic (password, ssn, etc.) should be silently skipped
+    func test_gapDetector_addGap_excludesSensitiveTopics() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        let sensitiveTopics = [
+            "my password reset",
+            "credit card numbers",
+            "social security number",
+            "private information"
+        ]
+
+        for topic in sensitiveTopics {
+            let gap = KnowledgeGap(topic: topic, frequency: 1, avgConfidence: 0.3, messageIDs: [])
+            await detector.addGap(gap)
+        }
+
+        let allGaps = await detector.getAllGaps()
+        XCTAssertEqual(allGaps.count, 0, "Sensitive topics should be excluded")
+    }
+
+    /// getGapsByPriority should sort by frequency * (1 - confidence)
+    func test_gapDetector_getGapsByPriority_sortedCorrectly() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        // Gap 1: priority = 2 * (1 - 0.3) = 1.4
+        await detector.addGap(KnowledgeGap(topic: "topic_high", frequency: 2, avgConfidence: 0.3, messageIDs: []))
+        // Gap 2: priority = 1 * (1 - 0.5) = 0.5
+        await detector.addGap(KnowledgeGap(topic: "topic_low", frequency: 1, avgConfidence: 0.5, messageIDs: []))
+        // Gap 3: priority = 3 * (1 - 0.2) = 2.4
+        await detector.addGap(KnowledgeGap(topic: "topic_highest", frequency: 3, avgConfidence: 0.2, messageIDs: []))
+
+        let sorted = await detector.getGapsByPriority()
+        XCTAssertEqual(sorted.count, 3)
+        XCTAssertEqual(sorted[0].topic, "topic_highest", "Highest priority first")
+        XCTAssertEqual(sorted[1].topic, "topic_high")
+        XCTAssertEqual(sorted[2].topic, "topic_low", "Lowest priority last")
+    }
+
+    /// resolveGap should remove the gap
+    func test_gapDetector_resolveGap_removes() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        await detector.addGap(KnowledgeGap(topic: "removable", frequency: 1, avgConfidence: 0.5, messageIDs: []))
+        let beforeResolve = await detector.getAllGaps()
+        XCTAssertEqual(beforeResolve.count, 1)
+
+        await detector.resolveGap(topic: "Removable") // Case-insensitive
+        let afterResolve = await detector.getAllGaps()
+        XCTAssertEqual(afterResolve.count, 0)
+    }
+
+    /// getStatistics should report correct counts
+    func test_gapDetector_getStatistics() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        await detector.addGap(KnowledgeGap(topic: "topic1", frequency: 3, avgConfidence: 0.3, messageIDs: []))
+        await detector.addGap(KnowledgeGap(topic: "topic2", frequency: 1, avgConfidence: 0.7, messageIDs: []))
+
+        let stats = await detector.getStatistics()
+        XCTAssertEqual(stats.total, 2)
+        XCTAssertEqual(stats.highPriority, 1, "topic1 with freq>=3 should be high priority")
+    }
+
+    /// reset should clear all state
+    func test_gapDetector_reset_clearsAll() async {
+        let dataStore = try! DataStore()
+        let detector = GapDetector(dataStore: dataStore)
+
+        await detector.addGap(KnowledgeGap(topic: "topic1", frequency: 1, avgConfidence: 0.5, messageIDs: []))
+        await detector.addGap(KnowledgeGap(topic: "topic2", frequency: 1, avgConfidence: 0.5, messageIDs: []))
+
+        await detector.reset()
+
+        let allGaps = await detector.getAllGaps()
+        XCTAssertEqual(allGaps.count, 0, "Reset should clear all gaps")
+
+        let stats = await detector.getStatistics()
+        XCTAssertEqual(stats.total, 0)
+    }
+
+    // MARK: - Group 3: ResearchJob Model
+
+    /// ResearchJob defaults to pending status
+    func test_researchJob_defaultsPending() {
+        let gap = KnowledgeGap(topic: "test", frequency: 1, avgConfidence: 0.5, messageIDs: [])
+        let job = ResearchJob(gap: gap, priority: 1)
+
+        XCTAssertEqual(job.status, .pending)
+        XCTAssertNil(job.completedAt)
+    }
+
+    /// ResearchJob Codable roundtrip
+    func test_researchJob_codable() throws {
+        let gap = KnowledgeGap(topic: "codable test", frequency: 2, avgConfidence: 0.6, messageIDs: ["x"])
+        let job = ResearchJob(gap: gap, priority: 3, status: .completed, completedAt: Date())
+
+        let data = try JSONEncoder().encode(job)
+        let decoded = try JSONDecoder().decode(ResearchJob.self, from: data)
+
+        XCTAssertEqual(decoded.gap.topic, "codable test")
+        XCTAssertEqual(decoded.priority, 3)
+        XCTAssertEqual(decoded.status, .completed)
+        XCTAssertNotNil(decoded.completedAt)
+    }
+
+    // MARK: - Group 4: ResearchStatus
+
+    /// All research statuses should be representable
+    func test_researchStatus_allCases() {
+        let statuses: [ResearchStatus] = [.pending, .inProgress, .completed, .failed]
+        XCTAssertEqual(statuses.count, 4)
+    }
+
+    /// ResearchStatus should be Codable
+    func test_researchStatus_codable() throws {
+        for status in [ResearchStatus.pending, .inProgress, .completed, .failed] {
+            let data = try JSONEncoder().encode(status)
+            let decoded = try JSONDecoder().decode(ResearchStatus.self, from: data)
+            XCTAssertEqual(decoded, status)
+        }
+    }
+
+    // MARK: - Group 5: DomainKnowledge Model
+
+    /// DomainKnowledge should store all fields correctly
+    func test_domainKnowledge_creation() {
+        let knowledge = DomainKnowledge(
+            entity: "quantum computing",
+            entityType: "concept",
+            summary: "Quantum computing uses quantum mechanics for computation.",
+            keyFacts: ["Uses qubits", "Leverages superposition"],
+            sources: [],
+            credibilityScore: 0.85,
+            confidence: 0.75,
+            category: "scientific",
+            needsReview: false
+        )
+
+        XCTAssertEqual(knowledge.entity, "quantum computing")
+        XCTAssertEqual(knowledge.entityType, "concept")
+        XCTAssertEqual(knowledge.keyFacts.count, 2)
+        XCTAssertEqual(knowledge.credibilityScore, 0.85)
+        XCTAssertFalse(knowledge.needsReview)
+    }
+
+    /// DomainKnowledge should be Codable
+    func test_domainKnowledge_codable() throws {
+        let source = SearchResult(
+            title: "Test Source",
+            url: URL(string: "https://example.com")!,
+            snippet: "Test snippet content here.",
+            domain: "example.com"
+        )
+
+        let knowledge = DomainKnowledge(
+            entity: "test entity",
+            entityType: "topic",
+            summary: "Test summary",
+            keyFacts: ["Fact 1"],
+            sources: [source],
+            credibilityScore: 0.8,
+            confidence: 0.7,
+            category: "general",
+            needsReview: true
+        )
+
+        let data = try JSONEncoder().encode(knowledge)
+        let decoded = try JSONDecoder().decode(DomainKnowledge.self, from: data)
+
+        XCTAssertEqual(decoded.entity, "test entity")
+        XCTAssertEqual(decoded.sources.count, 1)
+        XCTAssertEqual(decoded.sources.first?.domain, "example.com")
+        XCTAssertTrue(decoded.needsReview)
+    }
+
+    // MARK: - Group 6: DomainExpansionStatistics
+
+    /// Statistics should store all fields
+    func test_expansionStatistics_creation() {
+        let stats = DomainExpansionStatistics(
+            gapsDetected: 10,
+            gapsResearched: 8,
+            knowledgeCreated: 5,
+            averageCredibility: 0.75,
+            lastExpansionRun: Date(),
+            pendingJobs: 2
+        )
+
+        XCTAssertEqual(stats.gapsDetected, 10)
+        XCTAssertEqual(stats.gapsResearched, 8)
+        XCTAssertEqual(stats.knowledgeCreated, 5)
+        XCTAssertEqual(stats.pendingJobs, 2)
+    }
+
+    // MARK: - Group 7: ConfidenceThresholds
+
+    /// ConfidenceThresholds constants should be consistent
+    func test_confidenceThresholds_values() {
+        XCTAssertEqual(ConfidenceThresholds.minimum, 0.5)
+        XCTAssertEqual(ConfidenceThresholds.autoCreate, 0.7)
+        XCTAssertTrue(ConfidenceThresholds.minimum < ConfidenceThresholds.autoCreate,
+                      "minimum should be less than autoCreate")
+    }
+
+    /// shouldDiscard should return true below minimum
+    func test_confidenceThresholds_shouldDiscard() {
+        XCTAssertTrue(ConfidenceThresholds.shouldDiscard(0.3))
+        XCTAssertTrue(ConfidenceThresholds.shouldDiscard(0.49))
+        XCTAssertFalse(ConfidenceThresholds.shouldDiscard(0.5))
+        XCTAssertFalse(ConfidenceThresholds.shouldDiscard(0.8))
+    }
+
+    // MARK: - Group 8: SearchResult Model
+
+    /// SearchResult should store URL as URL type, not String
+    func test_searchResult_usesURLType() {
+        let result = SearchResult(
+            title: "Test",
+            url: URL(string: "https://example.com/page")!,
+            snippet: "Content",
+            domain: "example.com"
+        )
+
+        XCTAssertEqual(result.url.absoluteString, "https://example.com/page")
+        XCTAssertEqual(result.domain, "example.com")
+    }
+
+    /// SearchResult should be Codable
+    func test_searchResult_codable() throws {
+        let result = SearchResult(
+            title: "Wikipedia: Swift",
+            url: URL(string: "https://en.wikipedia.org/wiki/Swift")!,
+            snippet: "Swift is a programming language.",
+            domain: "en.wikipedia.org"
+        )
+
+        let data = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(SearchResult.self, from: data)
+
+        XCTAssertEqual(decoded.title, "Wikipedia: Swift")
+        XCTAssertEqual(decoded.url.host, "en.wikipedia.org")
+    }
+
+    // MARK: - Group 9: DomainExpansionCoordinator
+
+    /// Coordinator should start with zero stats
+    func test_coordinator_initialStats() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        let stats = await coordinator.getStatistics()
+        XCTAssertEqual(stats.gapsDetected, 0)
+        XCTAssertEqual(stats.gapsResearched, 0)
+        XCTAssertEqual(stats.knowledgeCreated, 0)
+        XCTAssertNil(stats.lastExpansionRun)
+    }
+
+    /// Coordinator enable/disable should work
+    func test_coordinator_enableDisable() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        var enabled = await coordinator.isExpansionEnabled()
+        XCTAssertTrue(enabled)
+
+        await coordinator.setEnabled(false)
+        enabled = await coordinator.isExpansionEnabled()
+        XCTAssertFalse(enabled)
+
+        await coordinator.setEnabled(true)
+        enabled = await coordinator.isExpansionEnabled()
+        XCTAssertTrue(enabled)
+    }
+
+    /// Coordinator should have no pending jobs initially
+    func test_coordinator_noPendingJobsInitially() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        let pending = await coordinator.getPendingJobs()
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    /// Coordinator reset should clear all state
+    func test_coordinator_reset() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        // Log a query to change state
+        await coordinator.logLowConfidenceQuery(query: "what is dark matter", response: "I think...", confidence: 0.3)
+
+        // Reset
+        await coordinator.reset()
+
+        let stats = await coordinator.getStatistics()
+        XCTAssertEqual(stats.gapsDetected, 0)
+        XCTAssertNil(stats.lastExpansionRun)
+    }
+
+    /// logLowConfidenceQuery should increment gap count
+    func test_coordinator_logLowConfidenceQuery_incrementsGaps() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        await coordinator.logLowConfidenceQuery(
+            query: "explain quantum entanglement",
+            response: "I'm not sure...",
+            confidence: 0.3
+        )
+
+        let stats = await coordinator.getStatistics()
+        XCTAssertEqual(stats.gapsDetected, 1)
+    }
+
+    /// logLowConfidenceQuery when disabled should be a no-op
+    func test_coordinator_logLowConfidenceQuery_disabledNoop() async {
+        let dataStore = try! DataStore()
+        let coordinator = DomainExpansionCoordinator(dataStore: dataStore, llmEngine: nil)
+
+        await coordinator.setEnabled(false)
+        await coordinator.logLowConfidenceQuery(
+            query: "what is dark energy",
+            response: "Unknown",
+            confidence: 0.2
+        )
+
+        let stats = await coordinator.getStatistics()
+        XCTAssertEqual(stats.gapsDetected, 0, "Should not log when disabled")
+    }
+}

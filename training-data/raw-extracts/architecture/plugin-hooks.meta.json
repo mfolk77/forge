@@ -1,0 +1,12 @@
+{
+  "name": "plugin-hooks",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/plugins/hooks.rs",
+  "line_count": 212,
+  "why": "Event dispatch, hook execution with timeout",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

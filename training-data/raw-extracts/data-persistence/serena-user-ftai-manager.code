@@ -1,0 +1,587 @@
+import Foundation
+import os.log
+
+/// Manages user facts in the RTAI library (.ftai files)
+/// Unified storage for user personal info and preferences alongside static knowledge
+public actor UserFTAIManager {
+    public static let shared = UserFTAIManager()
+
+    private let logger = Logger(subsystem: "com.serenanet.rtai", category: "UserFTAIManager")
+
+    /// Path to the rtai-library directory (READ-ONLY, bundled static knowledge)
+    private var bundledRtaiLibraryPath: String {
+        if let bundleResourcesURL = Bundle.main.resourceURL {
+            let bundledPath = bundleResourcesURL.appendingPathComponent("rtai-library").path
+            if FileManager.default.fileExists(atPath: bundledPath) {
+                return bundledPath
+            }
+        }
+        // Fall back to project root for development
+        let projectRoot = ProcessInfo.processInfo.environment["SERENA_PROJECT_ROOT"]
+            ?? FileManager.default.currentDirectoryPath
+        return "\(projectRoot)/rtai-library"
+    }
+
+    /// Path to WRITABLE user data directory (Application Support)
+    /// User facts are stored here, separate from bundled static knowledge
+    private var userDataPath: String {
+        let fileManager = FileManager.default
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            // Fallback to project root for development
+            let projectRoot = ProcessInfo.processInfo.environment["SERENA_PROJECT_ROOT"]
+                ?? fileManager.currentDirectoryPath
+            return "\(projectRoot)/rtai-library"
+        }
+        let serenaDataPath = appSupport.appendingPathComponent("Serena/rtai-user-data").path
+        return serenaDataPath
+    }
+
+    private var userPersonalPath: String { "\(userDataPath)/user_personal.ftai" }
+    private var userPreferencesPath: String { "\(userDataPath)/user_preferences.ftai" }
+
+    /// In-memory cache for getAllFacts() to avoid repeated file I/O
+    private var cachedFacts: [(key: String, value: String, category: MemoryCategory)]?
+    private var cacheTimestamp: Date?
+    private let cacheTTL: TimeInterval = 30  // 30 seconds
+
+    private var isCacheValid: Bool {
+        guard cachedFacts != nil, let timestamp = cacheTimestamp else { return false }
+        return Date().timeIntervalSince(timestamp) < cacheTTL
+    }
+
+    private func invalidateCache() {
+        cachedFacts = nil
+        cacheTimestamp = nil
+    }
+
+    private init() {
+        // Ensure user .ftai files exist on initialization
+        ensureUserFilesExistSync()
+    }
+
+    /// Synchronous version for init - creates user .ftai files if they don't exist
+    /// Uses Application Support for writable user data
+    private nonisolated func ensureUserFilesExistSync() {
+        let fileManager = FileManager.default
+
+        // Determine writable user data path (Application Support)
+        var userDataDir: String
+        if let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            userDataDir = appSupport.appendingPathComponent("Serena/rtai-user-data").path
+        } else {
+            // Fallback for development
+            let projectRoot = ProcessInfo.processInfo.environment["SERENA_PROJECT_ROOT"]
+                ?? fileManager.currentDirectoryPath
+            userDataDir = "\(projectRoot)/rtai-library"
+        }
+
+        // Create directory if needed
+        if !fileManager.fileExists(atPath: userDataDir) {
+            do {
+                try fileManager.createDirectory(atPath: userDataDir, withIntermediateDirectories: true)
+                print("📁 Created user data directory: \(userDataDir)")
+            } catch {
+                print("❌ Failed to create user data directory: \(error)")
+            }
+        }
+
+        // Create user_personal.ftai if needed
+        let personalPath = "\(userDataDir)/user_personal.ftai"
+        if !fileManager.fileExists(atPath: personalPath) {
+            let template = createTemplateSync(title: "User Personal Information", factType: "user_personal")
+            do {
+                try template.write(toFile: personalPath, atomically: true, encoding: .utf8)
+                print("📝 Created user_personal.ftai at: \(personalPath)")
+            } catch {
+                print("❌ Failed to create user_personal.ftai: \(error)")
+            }
+        }
+
+        // Create user_preferences.ftai if needed
+        let prefsPath = "\(userDataDir)/user_preferences.ftai"
+        if !fileManager.fileExists(atPath: prefsPath) {
+            let template = createTemplateSync(title: "User Preferences", factType: "user_preferences")
+            do {
+                try template.write(toFile: prefsPath, atomically: true, encoding: .utf8)
+                print("📝 Created user_preferences.ftai at: \(prefsPath)")
+            } catch {
+                print("❌ Failed to create user_preferences.ftai: \(error)")
+            }
+        }
+    }
+
+    private nonisolated func createTemplateSync(title: String, factType: String) -> String {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        let today = dateFormatter.string(from: Date())
+
+        return """
+        @ftai v2.0
+
+        @document
+        title: "\(title)"
+        author: "FolkTech AI RTAI System"
+        category: "user"
+        schema: "user_facts"
+        @end
+
+        @facts
+        type: "\(factType)"
+        confidence: 0.95
+        source: "user_provided"
+        last_updated: "\(today)"
+        @end
+
+        ---
+
+
+        ---
+
+        @query_patterns
+        - "my {relation} name"
+        - "what is my {relation}"
+        - "my favorite {thing}"
+        @end
+
+        @aliases
+        wife: spouse, partner
+        husband: spouse, partner
+        color: colour
+        @end
+        """
+    }
+
+    // MARK: - Public API
+
+    /// Add a user fact to the appropriate .ftai file
+    /// - Parameters:
+    ///   - fact: The fact key (e.g., "wife's name")
+    ///   - value: The fact value (e.g., "Christina")
+    ///   - category: The memory category
+    ///   - priority: The fact priority (higher = more important)
+    public func addFact(key: String, value: String, category: MemoryCategory, priority: Int) async {
+        let filePath = category == .preference ? userPreferencesPath : userPersonalPath
+
+        logger.info("📝 Adding user fact to RTAI: \(key): \(value) (category: \(category.rawValue), priority: \(priority))")
+
+        // Read existing file
+        guard var content = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            logger.error("❌ Failed to read \(filePath)")
+            return
+        }
+
+        // Parse and update the facts section
+        let normalizedKey = normalizeKey(key)
+
+        // Check if this fact already exists (update if so)
+        if content.contains("\(normalizedKey):") {
+            // Update existing fact
+            let lines = content.components(separatedBy: "\n")
+            var updatedLines: [String] = []
+            var updated = false
+
+            for line in lines {
+                if line.lowercased().hasPrefix(normalizedKey.lowercased() + ":") {
+                    updatedLines.append("\(normalizedKey): \(value)")
+                    updated = true
+                } else {
+                    updatedLines.append(line)
+                }
+            }
+
+            if updated {
+                content = updatedLines.joined(separator: "\n")
+                logger.info("✅ Updated existing fact: \(normalizedKey)")
+            }
+        } else {
+            // Add new fact - insert before the second "---" separator
+            let parts = content.components(separatedBy: "---")
+            if parts.count >= 2 {
+                // Insert the fact in the data section (between first and second ---)
+                var factSection = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                factSection += "\n\(normalizedKey): \(value)"
+
+                var newContent = parts[0] + "---\n\n" + factSection + "\n\n---"
+                if parts.count > 2 {
+                    // Preserve query_patterns and aliases sections
+                    newContent += parts[2...].joined(separator: "---")
+                }
+                content = newContent
+                logger.info("✅ Added new fact: \(normalizedKey): \(value)")
+            }
+        }
+
+        // Update the last_updated timestamp
+        content = updateLastUpdated(content)
+
+        // Write back to file
+        do {
+            try content.write(toFile: filePath, atomically: true, encoding: .utf8)
+            invalidateCache()
+            logger.info("💾 Saved user fact to \(filePath)")
+        } catch {
+            logger.error("❌ Failed to write \(filePath): \(error)")
+        }
+    }
+
+    /// Add a full fact string (from PersonalFactExtractor format)
+    /// Parses strings like "User's wife's name is Christina"
+    public func addExtractedFact(_ fact: String, category: MemoryCategory, priority: Int) async {
+        let (key, value) = parseFact(fact)
+        if !key.isEmpty && !value.isEmpty {
+            await addFact(key: key, value: value, category: category, priority: priority)
+            return
+        }
+
+        // Fallback for generic facts that don't match structured patterns (e.g. "my meeting at 3pm")
+        let trimmed = fact.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            logger.warning("⚠️ Could not parse fact: \(fact)")
+            return
+        }
+        // Store the whole string as the value under a sanitized key
+        let sanitizedKey = normalizeKey(trimmed).prefix(50)
+        await addFact(key: String(sanitizedKey), value: trimmed, category: category, priority: priority)
+    }
+
+    /// Get all user facts (cached with 30s TTL to avoid repeated file I/O)
+    public func getAllFacts() async -> [(key: String, value: String, category: MemoryCategory)] {
+        if isCacheValid, let cached = cachedFacts {
+            return cached
+        }
+
+        var facts: [(String, String, MemoryCategory)] = []
+
+        // Read personal facts
+        facts.append(contentsOf: await readFacts(from: userPersonalPath, category: .personal))
+
+        // Read preference facts
+        facts.append(contentsOf: await readFacts(from: userPreferencesPath, category: .preference))
+
+        cachedFacts = facts
+        cacheTimestamp = Date()
+        return facts
+    }
+
+    /// Delete a fact using a full extracted-fact string (e.g. "User's wife's name is Christina").
+    /// Mirrors addExtractedFact: parses the string first, then delegates to deleteFact(key:).
+    public func deleteExtractedFact(_ fact: String, category: MemoryCategory) async -> Bool {
+        let (key, _) = parseFact(fact)
+        guard !key.isEmpty else { return false }
+        return await deleteFact(key: key, category: category)
+    }
+
+    /// Delete a user fact
+    public func deleteFact(key: String, category: MemoryCategory) async -> Bool {
+        let filePath = category == .preference ? userPreferencesPath : userPersonalPath
+        let normalizedKey = normalizeKey(key)
+
+        guard var content = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            return false
+        }
+
+        let lines = content.components(separatedBy: "\n")
+        var updatedLines: [String] = []
+        var deleted = false
+
+        for line in lines {
+            if line.lowercased().hasPrefix(normalizedKey.lowercased() + ":") {
+                deleted = true
+                continue
+            }
+            updatedLines.append(line)
+        }
+
+        if deleted {
+            content = updatedLines.joined(separator: "\n")
+            content = updateLastUpdated(content)
+
+            do {
+                try content.write(toFile: filePath, atomically: true, encoding: .utf8)
+                invalidateCache()
+                logger.info("🗑️ Deleted fact: \(normalizedKey)")
+                return true
+            } catch {
+                logger.error("❌ Failed to write after delete: \(error)")
+            }
+        }
+
+        return false
+    }
+
+    /// Delete all user facts from both personal and preferences files
+    public func deleteAllFacts() async {
+        logger.info("🗑️ Deleting all user facts from RTAI")
+
+        // Reset personal facts file
+        await resetFactsFile(at: userPersonalPath, title: "User Personal Information", factType: "user_personal")
+
+        // Reset preferences facts file
+        await resetFactsFile(at: userPreferencesPath, title: "User Preferences", factType: "user_preferences")
+
+        invalidateCache()
+        logger.info("✅ All user facts deleted")
+    }
+
+    /// Delete facts matching a query string
+    /// - Parameter query: Text to match against fact keys and values
+    /// - Returns: Number of facts deleted
+    @discardableResult
+    public func deleteByQuery(_ query: String) async -> Int {
+        let queryLower = query.lowercased()
+        let queryWords = Set(queryLower.split(separator: " ").map(String.init))
+
+        let allFacts = await getAllFacts()
+        var deletedCount = 0
+
+        for fact in allFacts {
+            let keyLower = fact.key.lowercased()
+            let valueLower = fact.value.lowercased()
+
+            var shouldDelete = false
+
+            // Exact match in key or value
+            if keyLower.contains(queryLower) || valueLower.contains(queryLower) {
+                shouldDelete = true
+            }
+
+            // Word match - if most query words are present
+            if !shouldDelete {
+                let factWords = Set((keyLower + " " + valueLower).split(separator: " ").map(String.init))
+                let matchingWords = queryWords.intersection(factWords)
+                let matchRatio = Double(matchingWords.count) / Double(max(queryWords.count, 1))
+                if matchRatio >= 0.5 {
+                    shouldDelete = true
+                }
+            }
+
+            if shouldDelete {
+                let deleted = await deleteFact(key: fact.key, category: fact.category)
+                if deleted {
+                    deletedCount += 1
+                }
+            }
+        }
+
+        if deletedCount > 0 {
+            logger.info("🗑️ Deleted \(deletedCount) facts matching: \(query)")
+        }
+
+        return deletedCount
+    }
+
+    /// Get total count of facts
+    public func factCount() async -> Int {
+        let facts = await getAllFacts()
+        return facts.count
+    }
+
+    /// Reset a facts file to empty template
+    private func resetFactsFile(at path: String, title: String, factType: String) async {
+        let template = createTemplateSync(title: title, factType: factType)
+        do {
+            try template.write(toFile: path, atomically: true, encoding: .utf8)
+            logger.info("📝 Reset facts file: \(path)")
+        } catch {
+            logger.error("❌ Failed to reset facts file \(path): \(error)")
+        }
+    }
+
+    /// Get facts formatted for LLM prompt injection.
+    /// Capped at 20 facts / 2000 chars to keep the system prompt lean for the 4B model.
+    public func getFactsForPrompt() async -> String {
+        let facts = await getAllFacts()
+        guard !facts.isEmpty else { return "" }
+
+        // Cap at 20 most recent facts to avoid bloating the prompt
+        let maxFacts = 20
+        let maxChars = 2000
+        let capped = facts.suffix(maxFacts)
+
+        var factLines: [String] = []
+        var totalChars = 0
+        for fact in capped {
+            let line = "- \(fact.key): \(fact.value)"
+            if totalChars + line.count > maxChars { break }
+            factLines.append(line)
+            totalChars += line.count
+        }
+
+        guard !factLines.isEmpty else { return "" }
+
+        return """
+
+        REMEMBERED FACTS ABOUT THE USER (from RTAI library):
+        \(factLines.joined(separator: "\n"))
+
+        Use these facts to personalize your responses.
+        """
+    }
+
+    // MARK: - Private Helpers
+
+    private func updateLastUpdated(_ content: String) -> String {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        let today = dateFormatter.string(from: Date())
+
+        // Replace the last_updated line
+        let pattern = #"last_updated: \"[^\"]+\""#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let range = NSRange(content.startIndex..., in: content)
+            return regex.stringByReplacingMatches(in: content, range: range, withTemplate: "last_updated: \"\(today)\"")
+        }
+        return content
+    }
+
+    private func normalizeKey(_ key: String) -> String {
+        // Normalize keys like "wife's name" to "wife's name"
+        return key.lowercased()
+            .replacingOccurrences(of: "user's ", with: "")
+            .replacingOccurrences(of: "my ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Parse a fact string like "User's wife's name is Christina" into (key, value)
+    func parseFact(_ fact: String) -> (key: String, value: String) {
+        let lower = fact.lowercased()
+
+        // Pattern: "User's X's name is Y" or "User's X is Y"
+        if lower.contains("'s name is ") {
+            let parts = fact.components(separatedBy: "'s name is ")
+            if parts.count >= 2 {
+                // Extract the relation (wife, husband, son, etc.)
+                let beforeName = parts[0].lowercased()
+                var relation = ""
+
+                for keyword in ["wife", "husband", "spouse", "partner", "son", "daughter", "child", "dog", "cat", "pet", "mom", "mother", "dad", "father", "brother", "sister"] {
+                    if beforeName.contains(keyword) {
+                        relation = keyword
+                        break
+                    }
+                }
+
+                if !relation.isEmpty {
+                    return ("\(relation)'s name", parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+
+        // Pattern: "User's favorite X is Y"
+        if lower.contains("favorite") && lower.contains(" is ") {
+            if let favoriteRange = lower.range(of: "favorite "),
+               let isRange = lower.range(of: " is ", range: favoriteRange.upperBound..<lower.endIndex) {
+                let thing = String(lower[favoriteRange.upperBound..<isRange.lowerBound])
+                let value = String(fact[fact.index(fact.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: isRange.upperBound))...])
+                return ("favorite \(thing)", value.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+
+        // Pattern: "User likes/dislikes X"
+        if lower.contains("user likes ") {
+            let value = fact.replacingOccurrences(of: "User likes ", with: "", options: .caseInsensitive)
+            return ("likes", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        if lower.contains("user dislikes ") {
+            let value = fact.replacingOccurrences(of: "User dislikes ", with: "", options: .caseInsensitive)
+            return ("dislikes", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "User's birthday is X"
+        if lower.contains("birthday") && lower.contains(" is ") {
+            if let isRange = lower.range(of: " is ") {
+                let value = String(fact[fact.index(fact.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: isRange.upperBound))...])
+
+                // Check for family member's birthday
+                for keyword in ["wife", "husband", "son", "daughter", "child"] {
+                    if lower.contains(keyword) {
+                        return ("\(keyword)'s birthday", value.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+                }
+
+                return ("birthday", value.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+
+        // Pattern: "User lives in X"
+        if lower.contains("lives in ") {
+            let value = fact.replacingOccurrences(of: "User lives in ", with: "", options: .caseInsensitive)
+            return ("location", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "User works at/as X"
+        if lower.contains("works at") || lower.contains("works as") {
+            let value = fact.replacingOccurrences(of: "User works at/as ", with: "", options: .caseInsensitive)
+                .replacingOccurrences(of: "User works at ", with: "", options: .caseInsensitive)
+                .replacingOccurrences(of: "User works as ", with: "", options: .caseInsensitive)
+            return ("occupation", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "User is allergic to X"
+        if lower.contains("allergic to ") {
+            let value = fact.replacingOccurrences(of: "User is allergic to ", with: "", options: .caseInsensitive)
+            return ("allergy", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "User has X" (health condition)
+        if lower.hasPrefix("user has ") {
+            let value = fact.replacingOccurrences(of: "User has ", with: "", options: .caseInsensitive)
+            return ("health condition", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "User takes X" (medication)
+        if lower.hasPrefix("user takes ") {
+            let value = fact.replacingOccurrences(of: "User takes ", with: "", options: .caseInsensitive)
+            return ("medication", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Pattern: "Health info: X" (legacy format — parse correctly)
+        if lower.hasPrefix("health info: ") {
+            let value = String(fact.dropFirst("Health info: ".count))
+            return ("health info", value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // Generic fallback - try to split on " is "
+        if let isRange = lower.range(of: " is ") {
+            let key = String(fact[..<fact.index(fact.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: isRange.lowerBound))])
+                .replacingOccurrences(of: "User's ", with: "", options: .caseInsensitive)
+                .replacingOccurrences(of: "User ", with: "", options: .caseInsensitive)
+            let value = String(fact[fact.index(fact.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: isRange.upperBound))...])
+            return (key.trimmingCharacters(in: .whitespacesAndNewlines), value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return ("", "")
+    }
+
+    private func readFacts(from path: String, category: MemoryCategory) async -> [(String, String, MemoryCategory)] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return []
+        }
+
+        var facts: [(String, String, MemoryCategory)] = []
+
+        // Find the data section between --- markers
+        let parts = content.components(separatedBy: "---")
+        guard parts.count >= 2 else { return [] }
+
+        let dataSection = parts[1]
+        let lines = dataSection.components(separatedBy: "\n")
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, trimmed.contains(": ") else { continue }
+
+            // Split on first ": " (colon-space) to handle keys containing colons
+            guard let separatorRange = trimmed.range(of: ": ") else { continue }
+            let key = String(trimmed[..<separatorRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let value = String(trimmed[separatorRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+
+            if !key.isEmpty && !value.isEmpty {
+                facts.append((key, value, category))
+            }
+        }
+
+        return facts
+    }
+}

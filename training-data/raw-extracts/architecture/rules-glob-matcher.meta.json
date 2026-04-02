@@ -1,0 +1,12 @@
+{
+  "name": "rules-glob-matcher",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/rules/glob_matcher.rs",
+  "line_count": 440,
+  "why": "Glob-to-regex compilation, wildcard support",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

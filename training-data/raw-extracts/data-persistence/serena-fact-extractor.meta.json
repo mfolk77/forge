@@ -1,0 +1,14 @@
+{
+  "name": "serena-fact-extractor",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/Serena/Sources/SerenaCore/Services/PersonalFactExtractor.swift",
+  "line_count": 923,
+  "why": "Pre-LLM regex extraction, correction detection, delete \u2192 add flow",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

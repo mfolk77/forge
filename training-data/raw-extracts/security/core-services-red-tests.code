@@ -1,0 +1,763 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: Core service files — IntentDetector, RateLimiter, SessionTracker,
+/// ToolRegistry, SwiftFTAIParser, PersonalFactExtractor, FeatureFlagManager,
+/// NetworkConnectivityManager, CrashReporter, ThinkingMode/QueryComplexityDetector.
+///
+/// Target files:
+/// - Sources/SerenaCore/Services/IntentDetector.swift
+/// - Sources/SerenaCore/Services/RateLimiter.swift
+/// - Sources/SerenaCore/Services/SessionTracker.swift
+/// - Sources/SerenaCore/Services/ToolRegistry.swift
+/// - Sources/SerenaCore/Services/SwiftFTAIParser.swift
+/// - Sources/SerenaCore/Services/PersonalFactExtractor.swift
+/// - Sources/SerenaCore/Services/Inference/FeatureFlagManager.swift
+/// - Sources/SerenaCore/Services/NetworkConnectivityManager.swift
+/// - Sources/SerenaCore/Services/CrashReporter.swift
+/// - Sources/SerenaCore/Services/ThinkingMode.swift
+@MainActor
+final class CoreServicesRedTests: XCTestCase {
+
+    // MARK: - Group 1: IntentDetector — Intent Pattern Matching
+
+    /// IntentDetector.shared must be accessible as a singleton
+    func test_intentDetector_singletonExists() {
+        let detector = IntentDetector.shared
+        XCTAssertNotNil(detector)
+    }
+
+    /// Debug logging flag should be gated
+    func test_intentDetector_debugLoggingIsGated() {
+        XCTAssertTrue(IntentDetector.debugLoggingIsGated)
+    }
+
+    /// "open safari" should detect app launch intent
+    func test_intentDetector_detectsAppLaunch() {
+        let intent = IntentDetector.shared.detectIntent(from: "open Safari")
+        XCTAssertNotNil(intent)
+        if case .launchApp(let appName) = intent {
+            let lower = appName.lowercased()
+            XCTAssertTrue(lower.contains("safari"), "Expected safari but got: \(appName)")
+        } else {
+            XCTFail("Expected launchApp intent, got: \(String(describing: intent))")
+        }
+    }
+
+    /// "good morning" should detect morning briefing intent
+    func test_intentDetector_detectsMorningBriefing() {
+        let intent = IntentDetector.shared.detectIntent(from: "good morning")
+        XCTAssertNotNil(intent)
+        if case .morningBriefing = intent {
+            // Pass
+        } else {
+            XCTFail("Expected morningBriefing intent, got: \(String(describing: intent))")
+        }
+    }
+
+    /// "pause the music" should detect music control intent
+    func test_intentDetector_detectsMusicPause() {
+        let intent = IntentDetector.shared.detectIntent(from: "pause the music")
+        XCTAssertNotNil(intent)
+        if case .controlMusic(let action, _) = intent {
+            XCTAssertEqual(action, .pause)
+        } else {
+            XCTFail("Expected controlMusic(pause) intent, got: \(String(describing: intent))")
+        }
+    }
+
+    /// "what's on my screen" should detect screen context intent
+    func test_intentDetector_detectsScreenContext() {
+        let intent = IntentDetector.shared.detectIntent(from: "what's on my screen")
+        XCTAssertNotNil(intent)
+        if case .screenContext = intent {
+            // Pass
+        } else {
+            XCTFail("Expected screenContext intent, got: \(String(describing: intent))")
+        }
+    }
+
+    /// Pure conversational text should return nil (no actionable intent)
+    func test_intentDetector_conversationalReturnsNil() {
+        let intent = IntentDetector.shared.detectIntent(from: "tell me a joke about cats")
+        // This should either be nil or .conversation — no tool action
+        if let intent = intent {
+            if case .conversation = intent {
+                // Acceptable
+            } else if case .webSearch = intent {
+                // Also acceptable — some patterns route general queries to web search
+            } else {
+                // Any non-action intent is fine
+                XCTAssertNotNil(intent)
+            }
+        }
+        // nil is also fine — means no intent detected
+    }
+
+    /// "search for weather in Tokyo" should detect web search intent
+    func test_intentDetector_detectsWebSearch() {
+        let intent = IntentDetector.shared.detectIntent(from: "search for weather in Tokyo")
+        XCTAssertNotNil(intent)
+        if case .webSearch(let query) = intent {
+            XCTAssertFalse(query.isEmpty)
+        } else {
+            XCTFail("Expected webSearch intent, got: \(String(describing: intent))")
+        }
+    }
+
+    /// Intent.description should return non-empty strings
+    func test_intentDetector_intentDescription() {
+        let intent = IntentDetector.Intent.launchApp(appName: "Safari")
+        let desc = intent.description
+        XCTAssertTrue(desc.contains("Safari"))
+    }
+
+    /// MusicAction raw values should be lowercase strings
+    func test_intentDetector_musicActionRawValues() {
+        XCTAssertEqual(IntentDetector.MusicAction.play.rawValue, "play")
+        XCTAssertEqual(IntentDetector.MusicAction.pause.rawValue, "pause")
+        XCTAssertEqual(IntentDetector.MusicAction.next.rawValue, "next")
+        XCTAssertEqual(IntentDetector.MusicAction.previous.rawValue, "previous")
+        XCTAssertEqual(IntentDetector.MusicAction.stop.rawValue, "stop")
+    }
+
+    // MARK: - Group 2: RateLimiter — Rate Limiting Logic
+
+    /// RateLimiter should allow usage when limit is nil (unlimited)
+    func test_rateLimiter_nilLimitReturnsTrue() async throws {
+        let limiter = RateLimiter()
+        let allowed = try await limiter.checkLimit(feature: .knowledgeExpansion, limit: nil, period: .daily)
+        XCTAssertTrue(allowed)
+    }
+
+    /// RateLimiter should return nil remaining quota when limit is nil
+    func test_rateLimiter_nilLimitReturnsNilQuota() async {
+        let limiter = RateLimiter()
+        let remaining = await limiter.getRemainingQuota(feature: .imageGeneration, limit: nil, period: .daily)
+        XCTAssertNil(remaining)
+    }
+
+    /// RateLimiter reset time should be in the future
+    func test_rateLimiter_resetTimeInFuture() {
+        let limiter = RateLimiter()
+        let now = Date()
+        let hourlyReset = limiter.getResetTime(for: .hourly)
+        let dailyReset = limiter.getResetTime(for: .daily)
+        let monthlyReset = limiter.getResetTime(for: .monthly)
+
+        XCTAssertGreaterThan(hourlyReset, now)
+        XCTAssertGreaterThan(dailyReset, now)
+        XCTAssertGreaterThan(monthlyReset, now)
+    }
+
+    /// RateLimiter should allow first usage within limit
+    func test_rateLimiter_firstUsageAllowed() async throws {
+        let limiter = RateLimiter()
+        // Reset first to ensure clean state
+        limiter.resetUsage(feature: .thinkingModel, period: .hourly)
+        let allowed = try await limiter.checkLimit(feature: .thinkingModel, limit: 5, period: .hourly)
+        XCTAssertTrue(allowed)
+        // Clean up
+        limiter.resetUsage(feature: .thinkingModel, period: .hourly)
+    }
+
+    /// RateLimiter should block usage when limit is exceeded
+    func test_rateLimiter_blocksWhenLimitExceeded() async throws {
+        let limiter = RateLimiter()
+        limiter.resetUsage(feature: .imageGeneration, period: .hourly)
+
+        // Use up the limit (limit of 2)
+        let first = try await limiter.checkLimit(feature: .imageGeneration, limit: 2, period: .hourly)
+        XCTAssertTrue(first)
+        let second = try await limiter.checkLimit(feature: .imageGeneration, limit: 2, period: .hourly)
+        XCTAssertTrue(second)
+        let third = try await limiter.checkLimit(feature: .imageGeneration, limit: 2, period: .hourly)
+        XCTAssertFalse(third)
+
+        // Clean up
+        limiter.resetUsage(feature: .imageGeneration, period: .hourly)
+    }
+
+    /// RateLimiter.resetAllUsage should clear all counters
+    func test_rateLimiter_resetAllUsage() async throws {
+        let limiter = RateLimiter()
+        // Consume some quota
+        _ = try await limiter.checkLimit(feature: .knowledgeExpansion, limit: 10, period: .daily)
+        limiter.resetAllUsage()
+        let remaining = await limiter.getRemainingQuota(feature: .knowledgeExpansion, limit: 10, period: .daily)
+        XCTAssertEqual(remaining, 10)
+    }
+
+    /// LimitedFeature display names should be non-empty
+    func test_rateLimiter_featureDisplayNames() {
+        XCTAssertFalse(RateLimiter.LimitedFeature.knowledgeExpansion.displayName.isEmpty)
+        XCTAssertFalse(RateLimiter.LimitedFeature.imageGeneration.displayName.isEmpty)
+        XCTAssertFalse(RateLimiter.LimitedFeature.thinkingModel.displayName.isEmpty)
+    }
+
+    /// TimePeriod seconds should be correct
+    func test_rateLimiter_timePeriodSeconds() {
+        XCTAssertEqual(RateLimiter.TimePeriod.hourly.seconds, 3600)
+        XCTAssertEqual(RateLimiter.TimePeriod.daily.seconds, 86400)
+        XCTAssertEqual(RateLimiter.TimePeriod.monthly.seconds, 30 * 86400)
+    }
+
+    /// RateLimitExceeded error should have a description
+    func test_rateLimiter_errorDescription() {
+        let error = RateLimitExceeded(
+            feature: .imageGeneration,
+            limit: 5,
+            resetsAt: Date().addingTimeInterval(3600)
+        )
+        let desc = error.errorDescription
+        XCTAssertNotNil(desc)
+        XCTAssertTrue(desc!.contains("Image Generation"))
+    }
+
+    /// getUsageStatistics should return 9 entries (3 features x 3 periods)
+    func test_rateLimiter_usageStatisticsCount() async {
+        let limiter = RateLimiter()
+        limiter.resetAllUsage()
+        let stats = await limiter.getUsageStatistics()
+        XCTAssertEqual(stats.count, 9)
+    }
+
+    // MARK: - Group 3: SessionTracker — Session Tracking
+
+    /// SessionTracker.shared must exist
+    func test_sessionTracker_singletonExists() {
+        let tracker = SessionTracker.shared
+        XCTAssertNotNil(tracker)
+    }
+
+    /// Initial captureContext should have default values
+    func test_sessionTracker_initialContext() {
+        let context = SessionTracker.shared.captureContext()
+        let currentView = context["current_view"] as? String
+        XCTAssertNotNil(currentView)
+        let activeTool = context["active_tool"] as? String
+        XCTAssertNotNil(activeTool)
+    }
+
+    /// setCurrentView should update the captured context
+    func test_sessionTracker_setCurrentView() {
+        SessionTracker.shared.setCurrentView("settings")
+        let context = SessionTracker.shared.captureContext()
+        let view = context["current_view"] as? String
+        XCTAssertEqual(view, "settings")
+        // Reset
+        SessionTracker.shared.setCurrentView("launch")
+    }
+
+    /// setLastUserAction should update the captured context
+    func test_sessionTracker_setLastUserAction() {
+        SessionTracker.shared.setLastUserAction("sent_message")
+        let context = SessionTracker.shared.captureContext()
+        let action = context["last_user_action"] as? String
+        XCTAssertEqual(action, "sent_message")
+        // Reset
+        SessionTracker.shared.setLastUserAction("app_opened")
+    }
+
+    /// setLastUserMessage should truncate to 100 characters
+    func test_sessionTracker_messageIsTruncated() {
+        let longMessage = String(repeating: "a", count: 200)
+        SessionTracker.shared.setLastUserMessage(longMessage)
+        let context = SessionTracker.shared.captureContext()
+        let message = context["last_user_message"] as? String ?? ""
+        XCTAssertLessThanOrEqual(message.count, 100)
+        // Reset
+        SessionTracker.shared.setLastUserMessage("")
+    }
+
+    /// setConversationState should update both id and message count
+    func test_sessionTracker_setConversationState() {
+        SessionTracker.shared.setConversationState(id: "conv-123", messageCount: 42)
+        let context = SessionTracker.shared.captureContext()
+        let convId = context["conversation_id"] as? String
+        let convLen = context["conversation_length"] as? Int
+        XCTAssertEqual(convId, "conv-123")
+        XCTAssertEqual(convLen, 42)
+        // Reset
+        SessionTracker.shared.setConversationState(id: "", messageCount: 0)
+    }
+
+    /// setActiveTool and clearActiveTool should work
+    func test_sessionTracker_activeToolLifecycle() {
+        SessionTracker.shared.setActiveTool("calendar")
+        var context = SessionTracker.shared.captureContext()
+        XCTAssertEqual(context["active_tool"] as? String, "calendar")
+
+        SessionTracker.shared.clearActiveTool()
+        context = SessionTracker.shared.captureContext()
+        XCTAssertEqual(context["active_tool"] as? String, "none")
+    }
+
+    /// captureContext should include session_duration_seconds >= 0
+    func test_sessionTracker_sessionDuration() {
+        let context = SessionTracker.shared.captureContext()
+        let duration = context["session_duration_seconds"] as? Int
+        XCTAssertNotNil(duration)
+        XCTAssertGreaterThanOrEqual(duration ?? -1, 0)
+    }
+
+    // MARK: - Group 4: ToolRegistry — Tool Registration & Validation
+
+    /// Built-in tools set should contain known tools
+    func test_toolRegistry_builtInToolsExist() {
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("calendar"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("file"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("app"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("memory"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("web_search"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("screen"))
+        XCTAssertTrue(ToolRegistry.builtInTools.contains("briefing"))
+    }
+
+    /// isValid should return true for built-in tools
+    func test_toolRegistry_isValidForBuiltIn() {
+        XCTAssertTrue(ToolRegistry.isValid("calendar"))
+        XCTAssertTrue(ToolRegistry.isValid("Calendar")) // case-insensitive
+    }
+
+    /// isValid should return false for non-existent tools
+    func test_toolRegistry_isInvalidForNonExistent() {
+        XCTAssertFalse(ToolRegistry.isValid("nonexistent_tool_xyz"))
+    }
+
+    /// MCP tool registration and validation
+    func test_toolRegistry_mcpToolRegistration() {
+        // Clean up first
+        ToolRegistry.unregisterAllMCPTools()
+
+        ToolRegistry.registerMCPTool(name: "test_mcp_tool", description: "A test tool")
+        XCTAssertTrue(ToolRegistry.isValid("test_mcp_tool"))
+        XCTAssertTrue(ToolRegistry.isMCPTool("test_mcp_tool"))
+        XCTAssertTrue(ToolRegistry.registeredMCPTools.contains("test_mcp_tool"))
+
+        // Clean up
+        ToolRegistry.unregisterMCPTool(name: "test_mcp_tool")
+        XCTAssertFalse(ToolRegistry.isValid("test_mcp_tool"))
+    }
+
+    /// registerMCPTools (bulk) should add all tools
+    func test_toolRegistry_bulkMCPRegistration() {
+        ToolRegistry.unregisterAllMCPTools()
+
+        let tools: [(name: String, description: String?)] = [
+            ("mcp_a", "Tool A"),
+            ("mcp_b", "Tool B"),
+            ("mcp_c", nil)
+        ]
+        ToolRegistry.registerMCPTools(tools)
+
+        XCTAssertTrue(ToolRegistry.isValid("mcp_a"))
+        XCTAssertTrue(ToolRegistry.isValid("mcp_b"))
+        XCTAssertTrue(ToolRegistry.isValid("mcp_c"))
+        XCTAssertEqual(ToolRegistry.registeredMCPTools.count, 3)
+
+        ToolRegistry.unregisterAllMCPTools()
+    }
+
+    /// unregisterAllMCPTools should clear all MCP tools
+    func test_toolRegistry_unregisterAll() {
+        ToolRegistry.registerMCPTool(name: "temp_tool")
+        ToolRegistry.unregisterAllMCPTools()
+        XCTAssertFalse(ToolRegistry.isMCPTool("temp_tool"))
+        XCTAssertEqual(ToolRegistry.registeredMCPTools.count, 0)
+    }
+
+    /// validateOrError should return helpful message for invalid tools
+    func test_toolRegistry_validateOrError() {
+        let result = ToolRegistry.validateOrError("fake_tool_999")
+        XCTAssertFalse(result.valid)
+        XCTAssertNotNil(result.error)
+        XCTAssertTrue(result.error!.contains("fake_tool_999"))
+        XCTAssertTrue(result.error!.contains("Available tools"))
+    }
+
+    /// validateOrError should return valid=true for built-in tools
+    func test_toolRegistry_validateOrErrorValid() {
+        let result = ToolRegistry.validateOrError("calendar")
+        XCTAssertTrue(result.valid)
+        XCTAssertNil(result.error)
+    }
+
+    /// getAvailableList should return a comma-separated string
+    func test_toolRegistry_getAvailableList() {
+        let list = ToolRegistry.getAvailableList()
+        XCTAssertTrue(list.contains("calendar"))
+        XCTAssertTrue(list.contains(","))
+    }
+
+    /// getToolDescriptions should include built-in descriptions
+    func test_toolRegistry_getToolDescriptions() {
+        let descriptions = ToolRegistry.getToolDescriptions()
+        XCTAssertNotNil(descriptions["calendar"])
+        XCTAssertNotNil(descriptions["file"])
+        XCTAssertNotNil(descriptions["memory"])
+    }
+
+    /// MCP tool case insensitivity — registering "MyTool" should match "mytool"
+    func test_toolRegistry_mcpCaseInsensitive() {
+        ToolRegistry.unregisterAllMCPTools()
+        ToolRegistry.registerMCPTool(name: "MyMCPTool", description: "Test")
+        XCTAssertTrue(ToolRegistry.isValid("mymcptool"))
+        XCTAssertTrue(ToolRegistry.isMCPTool("MYMCPTOOL"))
+        ToolRegistry.unregisterAllMCPTools()
+    }
+
+    // MARK: - Group 5: SwiftFTAIParser — FTAI Parsing
+
+    /// SwiftFTAIParser.shared must exist
+    func test_swiftFTAIParser_singletonExists() {
+        let parser = SwiftFTAIParser.shared
+        XCTAssertNotNil(parser)
+    }
+
+    /// inlineDebugLoggingIsGated should be true
+    func test_swiftFTAIParser_debugLoggingGated() {
+        XCTAssertTrue(SwiftFTAIParser.inlineDebugLoggingIsGated)
+    }
+
+    /// lookupExact with non-existent key should return nil
+    func test_swiftFTAIParser_lookupExactMiss() {
+        let result = SwiftFTAIParser.shared.lookupExact("completely_nonexistent_key_xyz_123")
+        XCTAssertNil(result)
+    }
+
+    /// getAllKeys should return an array (may be empty if not initialized with data)
+    func test_swiftFTAIParser_getAllKeys() {
+        let keys = SwiftFTAIParser.shared.getAllKeys()
+        XCTAssertNotNil(keys)
+        // keys may be empty in test environment — that is fine
+    }
+
+    /// searchKeys with garbage substring should return empty array
+    func test_swiftFTAIParser_searchKeysNoMatch() {
+        let results = SwiftFTAIParser.shared.searchKeys(containing: "zzz_nonexistent_zzz")
+        XCTAssertTrue(results.isEmpty)
+    }
+
+    /// lookupQuery with a help indicator should return nil (rejected)
+    func test_swiftFTAIParser_lookupQueryRejectsHelp() {
+        let result = SwiftFTAIParser.shared.lookupQuery("help me build a website")
+        XCTAssertNil(result)
+    }
+
+    // MARK: - Group 6: PersonalFactExtractor — Fact Extraction
+
+    /// PersonalFactExtractor.shared must exist
+    func test_personalFactExtractor_singletonExists() async {
+        let extractor = PersonalFactExtractor.shared
+        XCTAssertNotNil(extractor)
+    }
+
+    /// Questions should not be extracted as facts
+    func test_personalFactExtractor_skipsQuestions() async {
+        let facts = await PersonalFactExtractor.shared.extractFacts(from: "What is my wife's name?")
+        XCTAssertTrue(facts.isEmpty, "Questions should not produce extracted facts")
+    }
+
+    /// "my wife's name is Christina" should extract a personal fact
+    func test_personalFactExtractor_extractsWifeName() async {
+        let facts = await PersonalFactExtractor.shared.extractFacts(from: "my wife's name is Christina")
+        XCTAssertFalse(facts.isEmpty, "Should extract wife name fact")
+        let hasPersnoalFact = facts.contains { $0.category == .personal }
+        XCTAssertTrue(hasPersnoalFact, "Should be a personal category fact")
+    }
+
+    /// Explicit "remember" command should be detected
+    func test_personalFactExtractor_detectsRememberCommand() async {
+        // The extractAndSave method uses detectExplicitRememberCommand internally
+        // We test via extractFacts + the fact that remember commands produce facts
+        let facts = await PersonalFactExtractor.shared.extractFacts(from: "remember that my dog's name is Buddy")
+        // Even if the pattern matches or not, the remember prefix stripping is tested indirectly
+        // The key thing: the extractor should not crash and should return some result
+        XCTAssertNotNil(facts)
+    }
+
+    /// ExtractedFact equality is case-insensitive on the fact string
+    func test_personalFactExtractor_factEqualityCaseInsensitive() {
+        let fact1 = ExtractedFact(fact: "User's wife is Christina", category: .personal, priority: 10)
+        let fact2 = ExtractedFact(fact: "user's wife is christina", category: .personal, priority: 5)
+        XCTAssertEqual(fact1, fact2, "Facts with same text (case-insensitive) should be equal")
+    }
+
+    /// ExtractedFact hash should be case-insensitive
+    func test_personalFactExtractor_factHashConsistency() {
+        let fact1 = ExtractedFact(fact: "Test Fact", category: .personal, priority: 10)
+        let fact2 = ExtractedFact(fact: "test fact", category: .personal, priority: 5)
+        XCTAssertEqual(fact1.hashValue, fact2.hashValue)
+    }
+
+    /// Correction detection should return empty when no correction signal present
+    func test_personalFactExtractor_noCorrectionSignal() async {
+        let recentFacts = [ExtractedFact(fact: "User's wife is Christina", category: .personal, priority: 10)]
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "thanks for remembering",
+            recentFacts: recentFacts
+        )
+        XCTAssertTrue(corrections.isEmpty)
+    }
+
+    /// Correction detection should detect "no that's wrong" as a correction
+    func test_personalFactExtractor_detectsCorrection() async {
+        let recentFacts = [ExtractedFact(fact: "User's wife's name is Christina", category: .personal, priority: 10)]
+        let corrections = await PersonalFactExtractor.shared.detectCorrection(
+            in: "no that's wrong, her name is Sarah",
+            recentFacts: recentFacts
+        )
+        XCTAssertFalse(corrections.isEmpty, "Should detect correction")
+    }
+
+    /// FactConfirmationDirective.generate should return empty string for no facts
+    func test_personalFactExtractor_directiveEmptyForNoFacts() {
+        let directive = FactConfirmationDirective.generate(for: [])
+        XCTAssertTrue(directive.isEmpty)
+    }
+
+    /// FactConfirmationDirective.generate should include fact text
+    func test_personalFactExtractor_directiveIncludesFact() {
+        let facts = [ExtractedFact(fact: "User's dog is Rex", category: .personal, priority: 9)]
+        let directive = FactConfirmationDirective.generate(for: facts)
+        XCTAssertTrue(directive.contains("Rex"))
+    }
+
+    /// resetMentionTracking should not crash
+    func test_personalFactExtractor_resetMentionTracking() async {
+        await PersonalFactExtractor.shared.resetMentionTracking()
+        // No crash = pass
+    }
+
+    // MARK: - Group 7: FeatureFlagManager — Feature Flags
+
+    /// FeatureFlagManager.shared must exist
+    func test_featureFlagManager_singletonExists() {
+        let manager = FeatureFlagManager.shared
+        XCTAssertNotNil(manager)
+    }
+
+    /// Default backend should be .mlx
+    func test_featureFlagManager_defaultBackend() {
+        FeatureFlagManager.shared.resetToDefaults()
+        let backend = FeatureFlagManager.shared.selectedBackend
+        XCTAssertEqual(backend, .mlx)
+    }
+
+    /// Setting backend should persist
+    func test_featureFlagManager_setBackend() {
+        let original = FeatureFlagManager.shared.selectedBackend
+        FeatureFlagManager.shared.selectedBackend = .auto
+        XCTAssertEqual(FeatureFlagManager.shared.selectedBackend, .auto)
+        // Restore
+        FeatureFlagManager.shared.selectedBackend = original
+    }
+
+    /// InferenceBackend display names should be non-empty
+    func test_featureFlagManager_backendDisplayNames() {
+        for backend in InferenceBackend.allCases {
+            XCTAssertFalse(backend.displayName.isEmpty, "\(backend) has empty displayName")
+            XCTAssertFalse(backend.description.isEmpty, "\(backend) has empty description")
+        }
+    }
+
+    /// resolveBackend with .mlx should always return .mlx
+    func test_featureFlagManager_resolveMLX() {
+        FeatureFlagManager.shared.selectedBackend = .mlx
+        let resolved = FeatureFlagManager.shared.resolveBackend()
+        XCTAssertEqual(resolved, .mlx)
+    }
+
+    /// resolveBackend with .coreML but ANE disabled should fall back to .mlx
+    func test_featureFlagManager_coreMLFallsBackWithoutANE() {
+        FeatureFlagManager.shared.selectedBackend = .coreML
+        FeatureFlagManager.shared.isANEEnabled = false
+        let resolved = FeatureFlagManager.shared.resolveBackend()
+        XCTAssertEqual(resolved, .mlx)
+        // Restore
+        FeatureFlagManager.shared.resetToDefaults()
+    }
+
+    /// enableANEForTesting should set ANE enabled, backend to coreML, and benchmark on
+    func test_featureFlagManager_enableANEForTesting() {
+        FeatureFlagManager.shared.enableANEForTesting()
+        XCTAssertTrue(FeatureFlagManager.shared.isANEEnabled)
+        XCTAssertEqual(FeatureFlagManager.shared.selectedBackend, .coreML)
+        XCTAssertTrue(FeatureFlagManager.shared.isBenchmarkMode)
+        // Restore
+        FeatureFlagManager.shared.resetToDefaults()
+    }
+
+    /// getCurrentConfiguration should return expected keys
+    func test_featureFlagManager_getCurrentConfiguration() {
+        let config = FeatureFlagManager.shared.getCurrentConfiguration()
+        XCTAssertNotNil(config["backend"])
+        XCTAssertNotNil(config["aneEnabled"])
+        XCTAssertNotNil(config["abTestGroup"])
+        XCTAssertNotNil(config["benchmarkMode"])
+        XCTAssertNotNil(config["hasNeuralEngine"])
+        XCTAssertNotNil(config["resolvedBackend"])
+    }
+
+    /// hasNeuralEngine on Apple Silicon should return true
+    func test_featureFlagManager_hasNeuralEngine() {
+        // On arm64 (Apple Silicon), this should return true
+        #if arch(arm64)
+        XCTAssertTrue(FeatureFlagManager.shared.hasNeuralEngine())
+        #else
+        XCTAssertFalse(FeatureFlagManager.shared.hasNeuralEngine())
+        #endif
+    }
+
+    /// Notification name for backend changes should be defined
+    func test_featureFlagManager_notificationName() {
+        let name = Notification.Name.inferenceBackendChanged
+        XCTAssertEqual(name.rawValue, "SerenaInferenceBackendChanged")
+    }
+
+    // MARK: - Group 8: NetworkConnectivityManager — Connectivity
+
+    /// NetworkConnectivityManager should initialize without crashing
+    func test_networkConnectivity_initialState() {
+        let manager = NetworkConnectivityManager()
+        // Default should be connected (true until NWPathMonitor reports otherwise)
+        XCTAssertTrue(manager.isConnected)
+        XCTAssertTrue(manager.offlineModeEnabled)
+        XCTAssertEqual(manager.offlineCapabilities.description, "All features available")
+    }
+
+    /// getStatusMessage should return a non-empty string
+    func test_networkConnectivity_statusMessage() {
+        let manager = NetworkConnectivityManager()
+        let message = manager.getStatusMessage()
+        XCTAssertFalse(message.isEmpty)
+    }
+
+    /// getOfflineModeGuidance should return a non-empty string
+    func test_networkConnectivity_offlineGuidance() {
+        let manager = NetworkConnectivityManager()
+        let guidance = manager.getOfflineModeGuidance()
+        XCTAssertFalse(guidance.isEmpty)
+    }
+
+    /// validateOfflineOperation for aiInference should not throw
+    func test_networkConnectivity_validateAIInference() {
+        let manager = NetworkConnectivityManager()
+        XCTAssertNoThrow(try manager.validateOfflineOperation(.aiInference))
+    }
+
+    /// validateOfflineOperation for voiceRecognition should not throw
+    func test_networkConnectivity_validateVoiceRecognition() {
+        let manager = NetworkConnectivityManager()
+        XCTAssertNoThrow(try manager.validateOfflineOperation(.voiceRecognition))
+    }
+
+    /// validateOfflineOperation for dataStorage should not throw
+    func test_networkConnectivity_validateDataStorage() {
+        let manager = NetworkConnectivityManager()
+        XCTAssertNoThrow(try manager.validateOfflineOperation(.dataStorage))
+    }
+
+    /// OfflineCapabilities description should be defined for all cases
+    func test_networkConnectivity_offlineCapabilitiesDescriptions() {
+        XCTAssertEqual(OfflineCapabilities.full.description, "All features available")
+        XCTAssertEqual(OfflineCapabilities.limited.description, "Some features unavailable")
+        XCTAssertEqual(OfflineCapabilities.minimal.description, "Basic features only")
+    }
+
+    /// NetworkQuality should have correct descriptions
+    func test_networkConnectivity_networkQualityDescriptions() {
+        XCTAssertEqual(NetworkQuality.offline.description, "Offline")
+        XCTAssertEqual(NetworkQuality.poor.description, "Poor connection")
+        XCTAssertEqual(NetworkQuality.excellent.description, "Excellent connection")
+    }
+
+    /// NetworkQuality systemImageName should be non-empty
+    func test_networkConnectivity_qualitySystemImages() {
+        for quality in [NetworkQuality.offline, .poor, .limited, .good, .excellent, .unknown] {
+            XCTAssertFalse(quality.systemImageName.isEmpty, "\(quality) has empty systemImageName")
+        }
+    }
+
+    // MARK: - Group 9: CrashReporter — Crash Reporting
+
+    /// CrashReporter.shared must exist
+    func test_crashReporter_singletonExists() {
+        let reporter = CrashReporter.shared
+        XCTAssertNotNil(reporter)
+    }
+
+    // MARK: - Group 10: ThinkingMode / QueryComplexityDetector
+
+    /// ThinkingMode should have 3 cases
+    func test_thinkingMode_allCases() {
+        XCTAssertEqual(ThinkingMode.allCases.count, 3)
+        XCTAssertTrue(ThinkingMode.allCases.contains(.auto))
+        XCTAssertTrue(ThinkingMode.allCases.contains(.instant))
+        XCTAssertTrue(ThinkingMode.allCases.contains(.deep))
+    }
+
+    /// ThinkingMode raw values
+    func test_thinkingMode_rawValues() {
+        XCTAssertEqual(ThinkingMode.auto.rawValue, "auto")
+        XCTAssertEqual(ThinkingMode.instant.rawValue, "instant")
+        XCTAssertEqual(ThinkingMode.deep.rawValue, "deep")
+    }
+
+    /// ThinkingMode display names should be non-empty
+    func test_thinkingMode_displayNames() {
+        for mode in ThinkingMode.allCases {
+            XCTAssertFalse(mode.displayName.isEmpty, "\(mode) has empty displayName")
+            XCTAssertFalse(mode.description.isEmpty, "\(mode) has empty description")
+            XCTAssertFalse(mode.icon.isEmpty, "\(mode) has empty icon")
+        }
+    }
+
+    /// ThinkingMode should be Codable
+    func test_thinkingMode_codable() throws {
+        let original = ThinkingMode.deep
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(ThinkingMode.self, from: data)
+        XCTAssertEqual(decoded, original)
+    }
+
+    /// Short queries should not require reasoning
+    func test_queryComplexity_shortQueryNoReasoning() {
+        let result = QueryComplexityDetector.requiresReasoning("hi")
+        XCTAssertFalse(result)
+    }
+
+    /// Greetings should not require reasoning
+    func test_queryComplexity_greetingsNoReasoning() {
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("hello"))
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("good morning"))
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("thanks"))
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("bye"))
+    }
+
+    /// Complex queries with planning keywords should require reasoning
+    func test_queryComplexity_planningRequiresReasoning() {
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning("help me plan a vacation to Japan with my family"))
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning("compare React vs Vue for a new web project"))
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning("explain how neural networks learn from data"))
+    }
+
+    /// Code-related queries should require reasoning
+    func test_queryComplexity_codeRequiresReasoning() {
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning("review this code and find any bugs in the implementation"))
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning("debug this function that keeps crashing"))
+    }
+
+    /// Long queries (12+ words) should require reasoning
+    func test_queryComplexity_longQueriesRequireReasoning() {
+        let longQuery = "I need help understanding how to implement a binary search tree in Swift with proper balancing"
+        XCTAssertTrue(QueryComplexityDetector.requiresReasoning(longQuery))
+    }
+
+    /// Simple fact queries should not require reasoning
+    func test_queryComplexity_simpleFactsNoReasoning() {
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("what time is it"))
+        XCTAssertFalse(QueryComplexityDetector.requiresReasoning("what's 2+2"))
+    }
+}

@@ -1,0 +1,1446 @@
+import Foundation
+import SwiftUI
+import CryptoKit
+#if os(macOS)
+import AppKit
+import IOKit
+#endif
+
+/// Central subscription management service for Serena
+/// Single source of truth for all subscription state, license validation, and tool gating.
+@MainActor
+public class SubscriptionService: ObservableObject {
+    public static let shared = SubscriptionService()
+
+    /// Current subscription status
+    @Published public private(set) var currentStatus: SubscriptionStatus
+
+    /// Whether a verification is in progress
+    @Published public private(set) var isVerifying: Bool = false
+
+    /// Last verification error (if any)
+    @Published public private(set) var lastError: SubscriptionError?
+
+    // MARK: - Derived Properties (for SwiftUI bindings)
+
+    /// Whether the user has an active Pro/Plus/Business subscription
+    @Published public private(set) var isPro: Bool = false
+
+    /// Whether we're currently loading/processing a license operation
+    @Published public private(set) var isLoading: Bool = false
+
+    /// Last error message string (for UI display)
+    @Published public private(set) var errorMessage: String?
+
+    /// Subscription expiration date (if subscribed)
+    @Published public private(set) var expirationDate: Date?
+
+    /// Current license key (if any)
+    @Published public private(set) var licenseKey: String?
+
+    /// License status for UI display
+    @Published public private(set) var licenseStatus: LicenseStatus = .none
+
+    /// Price string for display
+    public var monthlyPriceString: String { "$20.00" }
+
+    // MARK: - Stripe Checkout
+
+    /// Stripe Payment Link for Pro subscription (monthly)
+    public static let stripePaymentLink = "https://checkout.folktechai.com/b/7sY14p9lw6yW89H9ES57W02"
+
+    /// Stripe Payment Link for Pro subscription (yearly)
+    public static let stripeYearlyPaymentLink = "https://checkout.folktechai.com/b/5kQ28tfJU3mK4Xv18m57W03"
+
+    /// Timer for polling license server after Stripe checkout
+    private var autoActivationTimer: Timer?
+    private var pollAttempts = 0
+    private let maxPollAttempts = 60 // Poll for 5 minutes (every 5 seconds)
+
+    private let keychainService: KeychainService
+    private let apiClient: SubscriptionAPIClient
+    private let deviceId: String
+
+    private init() {
+        self.keychainService = KeychainService()
+        self.apiClient = SubscriptionAPIClient()
+        self.deviceId = Self.getDeviceId()
+
+        // Load cached status from Keychain
+        if let cached = keychainService.getSubscriptionStatus() {
+            self.currentStatus = cached
+        } else {
+            // No status found - create expired status
+            self.currentStatus = .expired(deviceId: deviceId)
+        }
+
+        // Derive SwiftUI-friendly properties from loaded status
+        updateDerivedProperties()
+    }
+
+    // MARK: - Derived Property Sync
+
+    /// Update all derived @Published properties from currentStatus.
+    /// Called whenever currentStatus changes.
+    private func updateDerivedProperties() {
+        let active = currentStatus.isActive && (currentStatus.tier == .plus || currentStatus.tier == .business)
+
+        #if DEBUG
+        if FeatureFlags.debugForcePro {
+            isPro = true
+            licenseStatus = .valid
+        } else {
+            isPro = active
+        }
+        #else
+        isPro = active
+        #endif
+
+        expirationDate = active ? currentStatus.expiresAt : nil
+        licenseKey = currentStatus.licenseKey
+
+        if currentStatus.licenseKey != nil {
+            if active {
+                licenseStatus = .valid
+            } else if currentStatus.expiresAt < Date() {
+                licenseStatus = .expired
+            } else {
+                licenseStatus = .invalid
+            }
+        } else {
+            licenseStatus = .none
+        }
+    }
+
+    // MARK: - Special Keys (Offline Validation — Obfuscated)
+
+    /// Whether keys are stored in obfuscated form (for security audit verification)
+    public static let usesObfuscatedKeys = true
+
+    /// XOR key for obfuscation (compile-time constant)
+    private static let xorKey: UInt8 = 0x5A
+
+    /// Deobfuscate a byte array back to a string
+    private static func deobfuscate(_ bytes: [UInt8]) -> String {
+        String(bytes.map { Character(UnicodeScalar($0 ^ xorKey)) })
+    }
+
+    /// Obfuscated master keys (XOR'd with 0x5A at compile time)
+    private var masterKeys: Set<String> {
+        Set([
+            // "SERENA-MASTER-CES2025-MFOLK"
+            Self.deobfuscate([0x09, 0x1f, 0x08, 0x1f, 0x14, 0x1b, 0x77, 0x17, 0x1b, 0x09, 0x0e, 0x1f, 0x08, 0x77, 0x19, 0x1f, 0x09, 0x68, 0x6a, 0x68, 0x6f, 0x77, 0x17, 0x1c, 0x15, 0x16, 0x11]),
+            // "SERENA-MASTER-DEV-FOLKTECH"
+            Self.deobfuscate([0x09, 0x1f, 0x08, 0x1f, 0x14, 0x1b, 0x77, 0x17, 0x1b, 0x09, 0x0e, 0x1f, 0x08, 0x77, 0x1e, 0x1f, 0x0c, 0x77, 0x1c, 0x15, 0x16, 0x11, 0x0e, 0x1f, 0x19, 0x12])
+        ])
+    }
+
+    /// Obfuscated beta key prefix + suffixes
+    private var betaKeys: [String: Date] {
+        // "SERENA-BETA-2025-"
+        let prefix = Self.deobfuscate([0x09, 0x1f, 0x08, 0x1f, 0x14, 0x1b, 0x77, 0x18, 0x1f, 0x0e, 0x1b, 0x77, 0x68, 0x6a, 0x68, 0x6f, 0x77])
+        let oneYear = Calendar.current.date(byAdding: .year, value: 1, to: Date())!
+        let suffixes = ["ALPHA01", "ALPHA02", "ALPHA03", "ALPHA04", "ALPHA05",
+                        "TESTER1", "TESTER2", "TESTER3"]
+        var keys: [String: Date] = [:]
+        for suffix in suffixes {
+            keys[prefix + suffix] = oneYear
+        }
+        return keys
+    }
+
+    // MARK: - Stripe Checkout & Auto-Activation
+
+    /// Open Stripe checkout in browser with device ID for auto-activation
+    public func openStripeCheckout() {
+        let checkoutURL = "\(Self.stripePaymentLink)?client_reference_id=\(deviceId)"
+
+        guard let url = URL(string: checkoutURL) else {
+            errorMessage = "Invalid payment link"
+            return
+        }
+
+        #if os(macOS)
+        NSWorkspace.shared.open(url)
+        #endif
+
+        LoggingManager.shared.log("Opened Stripe checkout with device ID: \(deviceId)", level: .info)
+        startAutoActivationPolling()
+    }
+
+    /// Open Stripe checkout for yearly plan
+    public func openStripeYearlyCheckout() {
+        let checkoutURL = "\(Self.stripeYearlyPaymentLink)?client_reference_id=\(deviceId)"
+
+        guard let url = URL(string: checkoutURL) else {
+            errorMessage = "Invalid payment link"
+            return
+        }
+
+        #if os(macOS)
+        NSWorkspace.shared.open(url)
+        #endif
+
+        LoggingManager.shared.log("Opened Stripe yearly checkout with device ID: \(deviceId)", level: .info)
+        startAutoActivationPolling()
+    }
+
+    /// Start polling the server for license activation after Stripe payment
+    public func startAutoActivationPolling() {
+        pollAttempts = 0
+        autoActivationTimer?.invalidate()
+
+        autoActivationTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.checkForAutoActivation()
+            }
+        }
+
+        LoggingManager.shared.log("Started auto-activation polling", level: .info)
+    }
+
+    /// Stop auto-activation polling
+    public func stopAutoActivationPolling() {
+        autoActivationTimer?.invalidate()
+        autoActivationTimer = nil
+        pollAttempts = 0
+    }
+
+    /// Check if license has been activated for this device (called by polling timer)
+    private func checkForAutoActivation() async {
+        pollAttempts += 1
+
+        if pollAttempts >= maxPollAttempts {
+            stopAutoActivationPolling()
+            LoggingManager.shared.log("Auto-activation polling timed out", level: .info)
+            return
+        }
+
+        let serverURL = "https://web-production-95ba1.up.railway.app"
+        guard let url = URL(string: "\(serverURL)/check_device?device_id=\(deviceId)") else { return }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else { return }
+
+            if let result = try? JSONDecoder().decode(DeviceLicenseResponse.self, from: data),
+               result.licensed,
+               let key = result.licenseKey {
+                // Activate FIRST, stop polling only on success
+                do {
+                    try await activateLicense(key)
+                    stopAutoActivationPolling()
+                    LoggingManager.shared.log("Auto-activated license: \(key)", level: .info)
+                } catch {
+                    LoggingManager.shared.log("Auto-activation failed: \(error.localizedDescription), will retry", level: .warning)
+                }
+            }
+        } catch {
+            // Silent failure - will retry on next poll
+        }
+    }
+
+    // MARK: - License Management
+
+    /// Activate a license key
+    /// - Returns: True if activation succeeded (for callers that need Bool result)
+    @discardableResult
+    public func activateLicense(_ licenseKey: String) async throws -> Bool {
+        isLoading = true
+        isVerifying = true
+        errorMessage = nil
+        defer {
+            isLoading = false
+            isVerifying = false
+        }
+
+        let normalizedKey = licenseKey.uppercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Check master keys first (offline, never expires)
+        if masterKeys.contains(normalizedKey) {
+            let masterStatus = SubscriptionStatus(
+                tier: .business,
+                expiresAt: Calendar.current.date(byAdding: .year, value: 100, to: Date())!, // Never expires
+                lastVerified: Date(),
+                gracePeriodEndsAt: nil,
+                isInGracePeriod: false,
+                licenseKey: normalizedKey,
+                deviceId: deviceId
+            )
+
+            try keychainService.saveLicenseKey(normalizedKey)
+            try keychainService.saveSubscriptionStatus(masterStatus)
+            currentStatus = masterStatus
+            lastError = nil
+            updateDerivedProperties()
+
+            LoggingManager.shared.log("Master license activated: Business tier (unlimited)", level: .info)
+            trackActivationAnalytics(normalizedKey)
+            return true
+        }
+
+        // Check beta keys (offline, 1 year from activation)
+        if let expiresAt = betaKeys[normalizedKey] {
+            let betaStatus = SubscriptionStatus(
+                tier: .plus,
+                expiresAt: expiresAt,
+                lastVerified: Date(),
+                gracePeriodEndsAt: nil,
+                isInGracePeriod: false,
+                licenseKey: normalizedKey,
+                deviceId: deviceId
+            )
+
+            try keychainService.saveLicenseKey(normalizedKey)
+            try keychainService.saveSubscriptionStatus(betaStatus)
+            currentStatus = betaStatus
+            lastError = nil
+            updateDerivedProperties()
+
+            LoggingManager.shared.log("Beta license activated: Plus tier (1 year)", level: .info)
+            trackActivationAnalytics(normalizedKey)
+            return true
+        }
+
+        do {
+            // Call license server to activate (for regular keys)
+            let response = try await apiClient.activate(
+                licenseKey: licenseKey,
+                deviceId: deviceId,
+                deviceName: Self.getDeviceName()
+            )
+
+            // Save license key to Keychain
+            try keychainService.saveLicenseKey(licenseKey)
+
+            // Update status
+            let newStatus = SubscriptionStatus(
+                tier: response.tier,
+                expiresAt: response.expiresAt,
+                lastVerified: Date(),
+                gracePeriodEndsAt: response.gracePeriodEndsAt,
+                isInGracePeriod: response.isInGracePeriod,
+                licenseKey: licenseKey,
+                deviceId: deviceId
+            )
+
+            try keychainService.saveSubscriptionStatus(newStatus)
+            currentStatus = newStatus
+            lastError = nil
+            updateDerivedProperties()
+
+            LoggingManager.shared.log(
+                "License activated: \(response.tier.displayName)",
+                level: .info
+            )
+            trackActivationAnalytics(licenseKey)
+            return true
+
+        } catch {
+            lastError = .verificationFailed(error)
+            errorMessage = "Invalid license key. Please check and try again."
+            throw error
+        }
+    }
+
+    /// Track analytics for license activation
+    private func trackActivationAnalytics(_ key: String) {
+        let source = key.contains("MASTER") || key.contains("BETA") ? "beta_key" : "stripe_payment"
+        AnalyticsManager.shared.trackSubscriptionStarted(source: source)
+        AnalyticsManager.shared.trackPaywallConverted(feature: "subscription")
+    }
+
+    /// Deactivate current license on this device
+    public func deactivateLicense() async throws {
+        guard let storedKey = keychainService.getLicenseKey() else {
+            // No key in keychain — just reset local state
+            let expiredStatus = SubscriptionStatus.expired(deviceId: deviceId)
+            try keychainService.saveSubscriptionStatus(expiredStatus)
+            currentStatus = expiredStatus
+            updateDerivedProperties()
+            return
+        }
+
+        isLoading = true
+        isVerifying = true
+        defer {
+            isLoading = false
+            isVerifying = false
+        }
+
+        do {
+            try await apiClient.deactivate(
+                licenseKey: storedKey,
+                deviceId: deviceId
+            )
+        } catch {
+            // Server deactivation failed — still clear local state
+            LoggingManager.shared.log("Server deactivation failed: \(error.localizedDescription), clearing local state anyway", level: .warning)
+        }
+
+        // Clear local data regardless of server result
+        try keychainService.deleteLicenseKey()
+        let expiredStatus = SubscriptionStatus.expired(deviceId: deviceId)
+        try keychainService.saveSubscriptionStatus(expiredStatus)
+        currentStatus = expiredStatus
+        updateDerivedProperties()
+
+        LoggingManager.shared.log("License deactivated", level: .info)
+        AnalyticsManager.shared.trackSubscriptionCancelled()
+    }
+
+    /// Deactivate license (synchronous fire-and-forget version for SwiftUI)
+    public func deactivateLicenseSync() {
+        Task {
+            try? await deactivateLicense()
+        }
+    }
+
+    /// Open Stripe Customer Portal for subscription management (cancel, update payment, etc.)
+    public func openCustomerPortal() async throws {
+        let portalURL = try await apiClient.getCustomerPortalURL(deviceId: deviceId)
+
+        // Open in default browser
+        #if os(macOS)
+        await MainActor.run {
+            NSWorkspace.shared.open(portalURL)
+        }
+        #endif
+
+        LoggingManager.shared.log("Opened customer portal", level: .info)
+    }
+
+    /// Get the device ID (for external use)
+    public var currentDeviceId: String {
+        return deviceId
+    }
+
+    // MARK: - Verification
+
+    /// Verify subscription with license server
+    public func verifySubscription(force: Bool = false) async throws -> SubscriptionStatus {
+        // Check if verification needed
+        if !force && !currentStatus.requiresVerification {
+            return currentStatus
+        }
+
+        guard let licenseKey = keychainService.getLicenseKey() else {
+            throw SubscriptionError.noLicenseKey
+        }
+
+        let normalizedKey = licenseKey.uppercased()
+
+        // Master keys don't need server verification - always valid
+        if masterKeys.contains(normalizedKey) {
+            LoggingManager.shared.log("Master key verified (offline)", level: .info)
+            return currentStatus
+        }
+
+        // Beta keys don't need server verification - check expiration only
+        if betaKeys.keys.contains(normalizedKey) {
+            if Date() < currentStatus.expiresAt {
+                LoggingManager.shared.log("Beta key verified (offline)", level: .info)
+                return currentStatus
+            } else {
+                throw SubscriptionError.licenseExpired
+            }
+        }
+
+        isVerifying = true
+        defer { isVerifying = false }
+
+        do {
+            let response = try await apiClient.verify(
+                licenseKey: licenseKey,
+                deviceId: deviceId,
+                appVersion: Self.getAppVersion()
+            )
+
+            let newStatus = SubscriptionStatus(
+                tier: response.tier,
+                expiresAt: response.expiresAt,
+                lastVerified: Date(),
+                gracePeriodEndsAt: response.gracePeriodEndsAt,
+                isInGracePeriod: response.isInGracePeriod,
+                licenseKey: licenseKey,
+                deviceId: deviceId
+            )
+
+            try keychainService.saveSubscriptionStatus(newStatus)
+            currentStatus = newStatus
+            lastError = nil
+            updateDerivedProperties()
+
+            LoggingManager.shared.log(
+                "Subscription verified: \(response.tier.displayName)",
+                level: .info
+            )
+
+            return newStatus
+
+        } catch {
+            lastError = .verificationFailed(error)
+            throw error
+        }
+    }
+
+    /// Key for tracking whether trial has been used on this device
+    private static let trialUsedKey = "SerenaTrialUsed"
+
+    /// Keys for daily tool call tracking
+    private static let dailyToolCallCountKey = "SerenaDailyToolCallCount"
+    private static let dailyToolCallDateKey = "SerenaDailyToolCallDate"
+
+    /// Maximum free tool calls per day
+    public static let freeToolCallLimit = 3
+
+    // MARK: - Daily Tool Call Limit
+
+    /// Tools that count against the daily limit for free users
+    public static let gatedTools: Set<String> = [
+        "calendar",
+        "notes",
+        "media",
+        "browser",
+        "app",
+        "briefing"
+    ]
+
+    /// Tools that are always free (unlimited)
+    public static let ungatedTools: Set<String> = [
+        "memory",      // Free for 30 days
+        "system",      // System info
+        "file",        // File operations
+        "web_search",  // Web search
+        "websearch",   // Alias
+        "executive",   // Internal routing
+        "screen"       // Screen reading
+    ]
+
+    /// Get today's date string for tracking
+    private var todayDateString: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
+    /// Current daily tool call count (resets at midnight).
+    /// Checks Keychain-backed HMAC'd count first, falls back to UserDefaults.
+    public var dailyToolCallCount: Int {
+        // Check Keychain-backed count (tamper-resistant)
+        if let keychainRecord = keychainService.loadDailyCount() {
+            if keychainRecord.date == todayDateString {
+                // Repair UserDefaults if tampered
+                let udCount = UserDefaults.standard.integer(forKey: Self.dailyToolCallCountKey)
+                let udDate = UserDefaults.standard.string(forKey: Self.dailyToolCallDateKey) ?? ""
+                if udCount != keychainRecord.count || udDate != keychainRecord.date {
+                    UserDefaults.standard.set(keychainRecord.count, forKey: Self.dailyToolCallCountKey)
+                    UserDefaults.standard.set(keychainRecord.date, forKey: Self.dailyToolCallDateKey)
+                }
+                return keychainRecord.count
+            }
+            // Different day in Keychain — it's a legitimate new day, return 0
+        }
+
+        // Fall back to UserDefaults (for pre-existing installs without Keychain data)
+        let storedDate = UserDefaults.standard.string(forKey: Self.dailyToolCallDateKey) ?? ""
+        if storedDate != todayDateString {
+            return 0
+        }
+        return UserDefaults.standard.integer(forKey: Self.dailyToolCallCountKey)
+    }
+
+    /// Remaining free tool calls for today
+    public var remainingFreeToolCalls: Int {
+        return max(0, Self.freeToolCallLimit - dailyToolCallCount)
+    }
+
+    /// Check if user can execute a gated tool
+    /// Returns: (canExecute: Bool, reason: String?)
+    public func canExecuteGatedTool(_ toolName: String) -> (canExecute: Bool, reason: String?) {
+        // Pro users: always allowed (check SubscriptionService status)
+        if currentStatus.isActive && (currentStatus.tier == .plus || currentStatus.tier == .business) {
+            return (true, nil)
+        }
+
+        // Check if tool is gated
+        let normalizedTool = toolName.lowercased()
+        guard Self.gatedTools.contains(normalizedTool) else {
+            // Ungated tool - always allowed
+            return (true, nil)
+        }
+
+        // Free user: check daily limit
+        if dailyToolCallCount >= Self.freeToolCallLimit {
+            return (false, "You've used your \(Self.freeToolCallLimit) free tool calls today. Upgrade to Serena Plus for unlimited access.")
+        }
+
+        return (true, nil)
+    }
+
+    /// Record a tool call (increment daily counter)
+    /// Call this AFTER successful tool execution
+    public func recordToolCall(_ toolName: String) {
+        // Only count gated tools
+        let normalizedTool = toolName.lowercased()
+        guard Self.gatedTools.contains(normalizedTool) else { return }
+
+        // Pro users don't need tracking
+        if currentStatus.isActive && (currentStatus.tier == .plus || currentStatus.tier == .business) {
+            return
+        }
+
+        // Use Keychain-backed count as source of truth
+        let currentCount: Int
+        if let keychainRecord = keychainService.loadDailyCount(), keychainRecord.date == todayDateString {
+            currentCount = keychainRecord.count
+        } else {
+            // New day or no Keychain data — start fresh
+            currentCount = 0
+        }
+
+        let newCount = currentCount + 1
+
+        // Write to both stores
+        UserDefaults.standard.set(newCount, forKey: Self.dailyToolCallCountKey)
+        UserDefaults.standard.set(todayDateString, forKey: Self.dailyToolCallDateKey)
+        keychainService.saveDailyCount(newCount, date: todayDateString)
+
+        LoggingManager.shared.log("Tool call recorded: \(toolName). Daily count: \(newCount)/\(Self.freeToolCallLimit)", level: .info)
+    }
+
+    // MARK: - Message Rate Limit (Rolling 24h Window)
+
+    /// Maximum messages per rolling 24-hour window for free users
+    public static let freeMessageLimit = 20
+
+    /// Rolling window duration in seconds (24 hours)
+    private static let rollingWindowSeconds: TimeInterval = 24 * 60 * 60
+
+    /// Published property for UI to show message limit reached
+    @Published public var messageLimitReached: Bool = false
+
+    /// Number of messages sent in the current rolling window
+    public var messagesInWindow: Int {
+        let timestamps = loadMessageTimestamps()
+        let cutoff = Date().timeIntervalSince1970 - Self.rollingWindowSeconds
+        return timestamps.filter { $0 > cutoff }.count
+    }
+
+    /// Remaining free messages in the current rolling window
+    public var remainingFreeMessages: Int {
+        return max(0, Self.freeMessageLimit - messagesInWindow)
+    }
+
+    /// Time until the oldest message in the window expires (seconds), or nil if not at limit
+    public var timeUntilMessageSlotOpens: TimeInterval? {
+        let timestamps = loadMessageTimestamps()
+        let cutoff = Date().timeIntervalSince1970 - Self.rollingWindowSeconds
+        let windowTimestamps = timestamps.filter { $0 > cutoff }.sorted()
+        guard windowTimestamps.count >= Self.freeMessageLimit,
+              let oldest = windowTimestamps.first else { return nil }
+        let opensAt = oldest + Self.rollingWindowSeconds
+        let remaining = opensAt - Date().timeIntervalSince1970
+        return remaining > 0 ? remaining : nil
+    }
+
+    /// Check if a free user can send a message
+    public func canSendMessage() -> (allowed: Bool, reason: String?) {
+        // Pro/trial users: always allowed
+        if isPro {
+            return (true, nil)
+        }
+
+        let count = messagesInWindow
+        if count >= Self.freeMessageLimit {
+            let timeStr: String
+            if let wait = timeUntilMessageSlotOpens {
+                let hours = Int(wait) / 3600
+                let minutes = (Int(wait) % 3600) / 60
+                if hours > 0 {
+                    timeStr = "Try again in \(hours)h \(minutes)m."
+                } else {
+                    timeStr = "Try again in \(minutes)m."
+                }
+            } else {
+                timeStr = "Try again later."
+            }
+            messageLimitReached = true
+            return (false, "You've used your \(Self.freeMessageLimit) free messages today. \(timeStr) Upgrade to Serena Plus for unlimited messages.")
+        }
+
+        messageLimitReached = false
+        return (true, nil)
+    }
+
+    /// Record a message sent (add timestamp to rolling window)
+    public func recordMessageSent() {
+        // Pro users don't need tracking
+        if isPro { return }
+
+        var timestamps = loadMessageTimestamps()
+        let now = Date().timeIntervalSince1970
+
+        // Add current timestamp
+        timestamps.append(now)
+
+        // Prune timestamps older than 24h to keep storage bounded
+        let cutoff = now - Self.rollingWindowSeconds
+        timestamps = timestamps.filter { $0 > cutoff }
+
+        saveMessageTimestamps(timestamps)
+
+        let remaining = max(0, Self.freeMessageLimit - timestamps.count)
+        LoggingManager.shared.log("Message recorded. \(timestamps.count)/\(Self.freeMessageLimit) in window. \(remaining) remaining.", level: .info)
+
+        if remaining == 0 {
+            messageLimitReached = true
+        }
+    }
+
+    /// Load message timestamps from Keychain (HMAC-verified)
+    private func loadMessageTimestamps() -> [TimeInterval] {
+        return keychainService.loadMessageTimestamps() ?? []
+    }
+
+    /// Save message timestamps to Keychain (HMAC-protected)
+    private func saveMessageTimestamps(_ timestamps: [TimeInterval]) {
+        keychainService.saveMessageTimestamps(timestamps)
+    }
+
+    /// Check if user has already used their free trial.
+    /// Uses both UserDefaults AND Keychain — tamper-resistant.
+    public var hasUsedTrial: Bool {
+        // Check Keychain first (tamper-resistant)
+        if keychainService.getTrialUsedFlag() {
+            // Repair UserDefaults if it was tampered
+            if !UserDefaults.standard.bool(forKey: Self.trialUsedKey) {
+                UserDefaults.standard.set(true, forKey: Self.trialUsedKey)
+            }
+            return true
+        }
+        // Fall back to UserDefaults (for pre-existing installs)
+        return UserDefaults.standard.bool(forKey: Self.trialUsedKey)
+    }
+
+    /// Start a 7-day free trial for new users
+    /// Returns true if trial was started, false if user already has subscription or used trial
+    public func startFreeTrial() -> Bool {
+        // Check if user already has an active subscription
+        guard currentStatus.tier == .expired || currentStatus.tier == .core else {
+            LoggingManager.shared.log("User already has subscription - skipping trial", level: .info)
+            return false
+        }
+
+        // Check if trial was already used on this device (prevent abuse)
+        guard !hasUsedTrial else {
+            LoggingManager.shared.log("Trial already used on this device - cannot start another", level: .info)
+            return false
+        }
+
+        // Create trial status (7 days of Plus features)
+        let trialStatus = SubscriptionStatus.trial(deviceId: deviceId)
+
+        do {
+            try keychainService.saveSubscriptionStatus(trialStatus)
+            currentStatus = trialStatus
+            updateDerivedProperties()
+
+            // Mark trial as used on this device (permanent — both stores)
+            UserDefaults.standard.set(true, forKey: Self.trialUsedKey)
+            keychainService.setTrialUsedFlag(true)
+
+            // Track trial start date for day-by-day tracking
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "SerenaTrialStartDate")
+
+            LoggingManager.shared.log("🎁 7-day free trial activated", level: .info)
+
+            // Track trial started for analytics
+            AnalyticsManager.shared.trackTrialStarted()
+
+            // Notify the app that subscription was upgraded
+            NotificationCenter.default.post(name: .subscriptionUpgraded, object: nil)
+            return true
+        } catch {
+            LoggingManager.shared.logError(error, context: "Failed to activate trial")
+            return false
+        }
+    }
+
+    // MARK: - Trial Day Tracking
+
+    /// Track which day of the trial the user is on (called on app launch)
+    public func trackTrialDayProgress() {
+        // Only track if user is in trial
+        guard currentStatus.tier == .plus,
+              let trialStartTimestamp = UserDefaults.standard.object(forKey: "SerenaTrialStartDate") as? Double else {
+            return
+        }
+
+        let trialStartDate = Date(timeIntervalSince1970: trialStartTimestamp)
+        let calendar = Calendar.current
+        let dayOfTrial = calendar.dateComponents([.day], from: trialStartDate, to: Date()).day ?? 0
+
+        // Only track days 1-7
+        guard dayOfTrial >= 0 && dayOfTrial <= 7 else { return }
+
+        // Check if we already tracked this day
+        let lastTrackedDayKey = "SerenaTrialLastTrackedDay"
+        let lastTrackedDay = UserDefaults.standard.integer(forKey: lastTrackedDayKey)
+
+        if dayOfTrial > lastTrackedDay {
+            // Get usage stats for analytics
+            let toolCalls = dailyToolCallCount
+            let conversations = UserDefaults.standard.integer(forKey: "SerenaConversationCount")
+
+            // Track this trial day
+            AnalyticsManager.shared.trackTrialDay(dayOfTrial, toolCalls: toolCalls, conversations: conversations)
+
+            // Update last tracked day
+            UserDefaults.standard.set(dayOfTrial, forKey: lastTrackedDayKey)
+
+            LoggingManager.shared.log("📊 Trial day \(dayOfTrial) tracked", level: .info)
+        }
+
+        // Check if trial just expired (day 8+)
+        if dayOfTrial > 7 {
+            // Check if we already tracked expiration
+            let expiredTrackedKey = "SerenaTrialExpiredTracked"
+            if !UserDefaults.standard.bool(forKey: expiredTrackedKey) {
+                // Track trial expiration
+                let converted = currentStatus.isActive && currentStatus.tier == .plus
+                AnalyticsManager.shared.trackTrialExpired(converted: converted)
+                UserDefaults.standard.set(true, forKey: expiredTrackedKey)
+                LoggingManager.shared.log("📊 Trial expired tracked (converted: \(converted))", level: .info)
+            }
+        }
+    }
+
+    /// Background verification (called on app launch)
+    public func performBackgroundVerification() async {
+        // Track trial day progress
+        trackTrialDayProgress()
+
+        guard currentStatus.requiresVerification else { return }
+
+        do {
+            _ = try await verifySubscription()
+        } catch {
+            // If verification fails, check if in grace period
+            if let gracePeriodEnds = currentStatus.gracePeriodEndsAt,
+               Date() < gracePeriodEnds {
+                // Still in grace period, allow usage
+                LoggingManager.shared.log(
+                    "⚠️ Subscription verification failed, using grace period",
+                    level: .warning
+                )
+            } else {
+                // Grace period expired, disable features
+                await handleExpiredSubscription()
+            }
+        }
+    }
+
+    private func handleExpiredSubscription() async {
+        let expiredStatus = SubscriptionStatus.expired(deviceId: deviceId)
+
+        do {
+            try keychainService.saveSubscriptionStatus(expiredStatus)
+            currentStatus = expiredStatus
+            updateDerivedProperties()
+
+            // Post notification for UI to show renewal prompt
+            NotificationCenter.default.post(
+                name: .subscriptionExpired,
+                object: nil,
+                userInfo: ["previousTier": currentStatus.tier]
+            )
+
+            LoggingManager.shared.log(
+                "Subscription expired",
+                level: .warning
+            )
+        } catch {
+            LoggingManager.shared.logError(
+                error,
+                context: "Failed to update expired subscription status"
+            )
+        }
+    }
+
+    // MARK: - Feature Access (ProFeature - legacy compatibility)
+
+    /// Check if a legacy ProFeature is available (delegates to isPro)
+    public func canAccess(_ feature: ProFeature) -> Bool {
+        #if DEBUG
+        if FeatureFlags.debugForcePro { return true }
+        #endif
+        return isPro
+    }
+
+    // MARK: - Feature Access (PremiumFeature)
+
+    /// Check if a specific feature is available
+    public func hasAccess(to feature: PremiumFeature) -> Bool {
+        guard currentStatus.isActive else { return false }
+
+        switch feature {
+        case .knowledgeExpansion:
+            return currentStatus.tier.allowsKnowledgeExpansion
+        case .advancedModels:
+            return currentStatus.tier.allowsAdvancedModels
+        case .thinkingModels:
+            return currentStatus.tier.allowsThinkingModels
+        case .proactiveAI:
+            return currentStatus.tier.allowsProactiveAI
+        case .jakeIntegration:
+            return currentStatus.tier == .business
+        case .teamManagement:
+            return currentStatus.tier == .business
+        case .prioritySupport:
+            return currentStatus.tier == .business
+        }
+    }
+
+    /// Get required tier for a feature
+    public func requiredTier(for feature: PremiumFeature) -> SubscriptionTier {
+        switch feature {
+        case .knowledgeExpansion, .advancedModels, .proactiveAI:
+            return .plus
+        case .thinkingModels, .jakeIntegration, .teamManagement, .prioritySupport:
+            return .business
+        }
+    }
+
+    // MARK: - Helper Methods
+
+    private static func getDeviceId() -> String {
+        // Use a persistent identifier based on hardware UUID
+        // This survives app reinstalls but is unique per device
+        #if os(macOS)
+        if let service = IOServiceMatching("IOPlatformExpertDevice") {
+            let platformExpert = IOServiceGetMatchingService(kIOMainPortDefault, service)
+            guard platformExpert != 0 else {
+                // Fall through to fallback
+                if let existingId = UserDefaults.standard.string(forKey: "com.serenanet.deviceId") {
+                    return existingId
+                }
+                let newId = UUID().uuidString
+                UserDefaults.standard.set(newId, forKey: "com.serenanet.deviceId")
+                return newId
+            }
+            defer { IOObjectRelease(platformExpert) }
+
+            if let serialNumber = IORegistryEntryCreateCFProperty(
+                platformExpert,
+                kIOPlatformUUIDKey as CFString,
+                kCFAllocatorDefault,
+                0
+            )?.takeRetainedValue() as? String {
+                return serialNumber
+            }
+        }
+        #endif
+
+        // Fallback to stored identifier
+        let key = "SerenaDeviceIdentifier"
+        if let stored = UserDefaults.standard.string(forKey: key) {
+            return stored
+        }
+
+        let newId = UUID().uuidString
+        UserDefaults.standard.set(newId, forKey: key)
+        return newId
+    }
+
+    private static func getDeviceName() -> String {
+        #if os(macOS)
+        return Host.current().localizedName ?? "Mac"
+        #else
+        return UIDevice.current.name
+        #endif
+    }
+
+    private static func getAppVersion() -> String {
+        return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+    }
+}
+
+// MARK: - Premium Features
+
+/// Features that require premium subscription
+public enum PremiumFeature: Sendable {
+    case knowledgeExpansion
+    case advancedModels
+    case thinkingModels
+    case proactiveAI          // TCA - Serena reaches out to you
+    case jakeIntegration
+    case teamManagement
+    case prioritySupport
+
+    public var name: String {
+        switch self {
+        case .knowledgeExpansion:
+            return "Knowledge Expansion"
+        case .advancedModels:
+            return "Advanced AI Models"
+        case .thinkingModels:
+            return "Thinking Models"
+        case .proactiveAI:
+            return "Proactive AI (TCA)"
+        case .jakeIntegration:
+            return "Jake Integration"
+        case .teamManagement:
+            return "Team Management"
+        case .prioritySupport:
+            return "Priority Support"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .knowledgeExpansion:
+            return "Expand Serena's knowledge base with real-time information retrieval"
+        case .advancedModels:
+            return "Access powerful models like Mixtral-8x7B and DeepSeek-33B"
+        case .thinkingModels:
+            return "Use advanced reasoning models like DeepSeek-R1"
+        case .proactiveAI:
+            return "Serena reaches out to YOU - birthday reminders, follow-ups, and personalized suggestions"
+        case .jakeIntegration:
+            return "Connect to Jake for centralized compute and team coordination"
+        case .teamManagement:
+            return "Manage team members and shared resources"
+        case .prioritySupport:
+            return "Get priority email support with 24-hour response time"
+        }
+    }
+}
+
+// MARK: - Notifications
+
+extension Notification.Name {
+    public static let subscriptionExpired = Notification.Name("SubscriptionExpired")
+    public static let subscriptionRenewed = Notification.Name("SubscriptionRenewed")
+    public static let subscriptionUpgraded = Notification.Name("SubscriptionUpgraded")
+}
+
+// MARK: - Auto-Activation Response
+
+private struct DeviceLicenseResponse: Codable {
+    let licensed: Bool
+    let licenseKey: String?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case licensed
+        case licenseKey = "license_key"
+        case message
+    }
+}
+
+// MARK: - Keychain Service
+
+/// Service for securely storing subscription data in Keychain
+public class KeychainService {
+    private let serviceName = "ai.folktech.serena.subscription"
+
+    func saveLicenseKey(_ key: String) throws {
+        guard let data = key.data(using: .utf8) else {
+            throw SubscriptionError.verificationFailed(
+                NSError(domain: "KeychainService", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to encode license key as UTF-8"])
+            )
+        }
+        try saveToKeychain(data: data, forKey: "licenseKey")
+    }
+
+    func getLicenseKey() -> String? {
+        guard let data = getFromKeychain(forKey: "licenseKey") else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func deleteLicenseKey() throws {
+        try deleteFromKeychain(forKey: "licenseKey")
+    }
+
+    // MARK: - Trial Flag (Keychain backup)
+
+    func setTrialUsedFlag(_ used: Bool) {
+        let data = Data(used ? [1] : [0])
+        try? saveToKeychain(data: data, forKey: "trialUsed")
+    }
+
+    func getTrialUsedFlag() -> Bool {
+        guard let data = getFromKeychain(forKey: "trialUsed"),
+              let byte = data.first else { return false }
+        return byte == 1
+    }
+
+    // MARK: - Daily Count (Keychain backup with HMAC)
+
+    private static let hmacKeyData = Data([0x73, 0x65, 0x72, 0x65, 0x6e, 0x61, 0x2d, 0x68, 0x6d, 0x61, 0x63]) // "serena-hmac"
+
+    /// Save daily count with integrity check
+    func saveDailyCount(_ count: Int, date: String) {
+        let payload = "\(date):\(count)"
+        let hmac = Self.computeHMAC(payload)
+        let record = "\(payload)|\(hmac)"
+        guard let data = record.data(using: .utf8) else { return }
+        try? saveToKeychain(data: data, forKey: "dailyToolCount")
+    }
+
+    /// Load daily count with integrity verification. Returns (count, date) or nil if tampered.
+    func loadDailyCount() -> (count: Int, date: String)? {
+        guard let data = getFromKeychain(forKey: "dailyToolCount"),
+              let record = String(data: data, encoding: .utf8) else { return nil }
+
+        let parts = record.split(separator: "|")
+        guard parts.count == 2 else { return nil }
+
+        let payload = String(parts[0])
+        let storedHMAC = String(parts[1])
+
+        // Verify HMAC
+        guard Self.computeHMAC(payload) == storedHMAC else { return nil }
+
+        let payloadParts = payload.split(separator: ":")
+        guard payloadParts.count == 2,
+              let count = Int(payloadParts[1]) else { return nil }
+
+        return (count: count, date: String(payloadParts[0]))
+    }
+
+    /// HMAC-SHA256 integrity check for daily count tamper detection
+    private static func computeHMAC(_ input: String) -> String {
+        let key = SymmetricKey(data: hmacKeyData)
+        let inputData = Data(input.utf8)
+        let mac = HMAC<SHA256>.authenticationCode(for: inputData, using: key)
+        return Data(mac).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - Message Timestamps (Keychain backup with HMAC)
+
+    /// Save message timestamps with HMAC integrity check
+    func saveMessageTimestamps(_ timestamps: [TimeInterval]) {
+        // Encode as comma-separated epoch doubles
+        let payload = timestamps.map { String($0) }.joined(separator: ",")
+        let hmac = Self.computeHMAC(payload)
+        let record = "\(payload)|\(hmac)"
+        guard let data = record.data(using: .utf8) else { return }
+        try? saveToKeychain(data: data, forKey: "messageTimestamps")
+    }
+
+    /// Load message timestamps with HMAC verification. Returns nil if tampered.
+    func loadMessageTimestamps() -> [TimeInterval]? {
+        guard let data = getFromKeychain(forKey: "messageTimestamps"),
+              let record = String(data: data, encoding: .utf8) else { return nil }
+
+        let parts = record.split(separator: "|")
+        guard parts.count == 2 else { return nil }
+
+        let payload = String(parts[0])
+        let storedHMAC = String(parts[1])
+
+        // Verify HMAC
+        guard Self.computeHMAC(payload) == storedHMAC else {
+            // Tampered — return nil (treated as empty, user gets fresh window)
+            return nil
+        }
+
+        // Empty payload means no timestamps yet
+        if payload.isEmpty { return [] }
+
+        let timestamps = payload.split(separator: ",").compactMap { TimeInterval($0) }
+        return timestamps
+    }
+
+    func saveSubscriptionStatus(_ status: SubscriptionStatus) throws {
+        let data = try JSONEncoder().encode(status)
+        try saveToKeychain(data: data, forKey: "subscriptionStatus")
+    }
+
+    func getSubscriptionStatus() -> SubscriptionStatus? {
+        guard let data = getFromKeychain(forKey: "subscriptionStatus") else { return nil }
+        return try? JSONDecoder().decode(SubscriptionStatus.self, from: data)
+    }
+
+    private func saveToKeychain(data: Data, forKey key: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data
+        ]
+
+        // Delete existing item
+        SecItemDelete(query as CFDictionary)
+
+        // Add new item
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw SubscriptionError.verificationFailed(
+                NSError(domain: "Keychain", code: Int(status), userInfo: nil)
+            )
+        }
+    }
+
+    private func getFromKeychain(forKey key: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data else {
+            return nil
+        }
+
+        return data
+    }
+
+    private func deleteFromKeychain(forKey key: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key
+        ]
+
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw SubscriptionError.verificationFailed(
+                NSError(domain: "Keychain", code: Int(status), userInfo: nil)
+            )
+        }
+    }
+}
+
+// MARK: - API Client
+
+/// Client for communicating with Serena license server
+public class SubscriptionAPIClient {
+    private let baseURL: URL
+
+    /// Date decoder that handles ISO 8601 with or without timezone suffix.
+    /// Python's datetime.isoformat() omits timezone for naive datetimes,
+    /// but Swift's .iso8601 requires it. This handles both cases.
+    private static func makeDateDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        let iso8601Full = ISO8601DateFormatter()
+        iso8601Full.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let iso8601NoFrac = ISO8601DateFormatter()
+        iso8601NoFrac.formatOptions = [.withInternetDateTime]
+
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let string = try container.decode(String.self)
+
+            // Try standard ISO 8601 first (with timezone)
+            if let date = iso8601Full.date(from: string) { return date }
+            if let date = iso8601NoFrac.date(from: string) { return date }
+
+            // Server may omit timezone — append Z and retry
+            let withZ = string + "Z"
+            if let date = iso8601Full.date(from: withZ) { return date }
+            if let date = iso8601NoFrac.date(from: withZ) { return date }
+
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Cannot decode date: \(string)")
+        }
+        return decoder
+    }
+
+    init(baseURL: String = "https://web-production-95ba1.up.railway.app") {
+        // Use environment variable override if present (for testing)
+        let defaultURL = URL(string: baseURL) ?? URL(string: "https://web-production-95ba1.up.railway.app")!
+        if let envURL = ProcessInfo.processInfo.environment["SERENA_API_URL"],
+           let envParsedURL = URL(string: envURL) {
+            self.baseURL = envParsedURL
+        } else {
+            self.baseURL = defaultURL
+        }
+    }
+
+    struct VerifyResponse: Codable {
+        let tier: SubscriptionTier
+        let expiresAt: Date
+        let gracePeriodEndsAt: Date?
+        let isInGracePeriod: Bool
+    }
+
+    struct ActivateResponse: Codable {
+        let tier: SubscriptionTier
+        let expiresAt: Date
+        let gracePeriodEndsAt: Date?
+        let isInGracePeriod: Bool
+    }
+
+    func verify(licenseKey: String, deviceId: String, appVersion: String) async throws -> VerifyResponse {
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/v1/license/verify"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = [
+            "license_key": licenseKey,
+            "device_id": deviceId,
+            "app_version": appVersion
+        ]
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SubscriptionError.networkUnavailable
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw SubscriptionError.serverError(httpResponse.statusCode)
+        }
+
+        return try Self.makeDateDecoder().decode(VerifyResponse.self, from: data)
+    }
+
+    func activate(licenseKey: String, deviceId: String, deviceName: String) async throws -> ActivateResponse {
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/v1/license/activate"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = [
+            "license_key": licenseKey,
+            "device_id": deviceId,
+            "device_name": deviceName
+        ]
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SubscriptionError.networkUnavailable
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            if httpResponse.statusCode == 403 {
+                throw SubscriptionError.deviceLimitExceeded
+            }
+            throw SubscriptionError.serverError(httpResponse.statusCode)
+        }
+
+        return try Self.makeDateDecoder().decode(ActivateResponse.self, from: data)
+    }
+
+    func deactivate(licenseKey: String, deviceId: String) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/v1/license/deactivate"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = [
+            "license_key": licenseKey,
+            "device_id": deviceId
+        ]
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SubscriptionError.networkUnavailable
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw SubscriptionError.serverError(httpResponse.statusCode)
+        }
+    }
+
+    struct CustomerPortalResponse: Codable {
+        let url: String
+        let status: String
+    }
+
+    /// Get Stripe Customer Portal URL for subscription management
+    func getCustomerPortalURL(deviceId: String) async throws -> URL {
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/customer-portal"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = ["device_id": deviceId]
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SubscriptionError.networkUnavailable
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            // Parse error message if available
+            if let errorJson = try? JSONDecoder().decode([String: String].self, from: data),
+               let errorMsg = errorJson["error"] {
+                throw SubscriptionError.verificationFailed(
+                    NSError(domain: "CustomerPortal", code: httpResponse.statusCode,
+                            userInfo: [NSLocalizedDescriptionKey: errorMsg])
+                )
+            }
+            throw SubscriptionError.serverError(httpResponse.statusCode)
+        }
+
+        let portalResponse = try JSONDecoder().decode(CustomerPortalResponse.self, from: data)
+
+        guard let portalURL = URL(string: portalResponse.url) else {
+            throw SubscriptionError.verificationFailed(
+                NSError(domain: "CustomerPortal", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Invalid portal URL returned"])
+            )
+        }
+
+        return portalURL
+    }
+}
+
+// MARK: - License Status
+
+public enum LicenseStatus: String {
+    case none = "No license"
+    case valid = "Active"
+    case invalid = "Invalid"
+    case expired = "Expired"
+
+    public var color: String {
+        switch self {
+        case .none: return "secondary"
+        case .valid: return "green"
+        case .invalid: return "red"
+        case .expired: return "orange"
+        }
+    }
+}
+
+// MARK: - Pro Features Enum
+
+public enum ProFeature: String, CaseIterable {
+    case unlimitedHistory = "Unlimited History"
+    case advancedPersonalization = "Advanced Personalization"
+    case priorityRTAI = "Priority Processing"
+
+    public var icon: String {
+        switch self {
+        case .unlimitedHistory: return "clock.fill"
+        case .advancedPersonalization: return "sparkles"
+        case .priorityRTAI: return "bolt.fill"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .unlimitedHistory:
+            return "Access all your conversations without time limits"
+        case .advancedPersonalization:
+            return "Custom instructions and response styles"
+        case .priorityRTAI:
+            return "Faster AI responses with RTAI"
+        }
+    }
+}

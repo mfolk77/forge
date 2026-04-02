@@ -1,0 +1,12 @@
+{
+  "name": "conversation-engine",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/conversation/engine.rs",
+  "line_count": 337,
+  "why": "ConversationEngine struct, message history, ChatRequest builder",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

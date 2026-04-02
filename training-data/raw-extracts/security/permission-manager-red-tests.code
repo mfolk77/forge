@@ -1,0 +1,376 @@
+import XCTest
+import EventKit
+@testable import SerenaCore
+
+final class PermissionManagerRedTests: XCTestCase {
+
+    // MARK: - Permission Enum Security
+
+    func test_permission_rawValue_noNullBytes() {
+        for permission in Permission.allCases {
+            XCTAssertFalse(permission.rawValue.contains("\0"),
+                "Permission \(permission) contains null byte in rawValue")
+        }
+    }
+
+    func test_permission_fromRawValue_rejectsNullBytes() {
+        let malicious = "calendar\0; DROP TABLE"
+        XCTAssertNil(Permission(rawValue: malicious))
+    }
+
+    func test_permission_category_exhaustive() {
+        for permission in Permission.allCases {
+            let category = permission.category
+            XCTAssertNotNil(category)
+        }
+    }
+
+    func test_permission_apiRequestable_correctSet() {
+        let apiRequestable: [Permission] = [.calendar, .reminders, .contacts, .microphone, .photos, .music]
+        for perm in apiRequestable {
+            XCTAssertEqual(perm.category, .apiRequestable, "\(perm) should be apiRequestable")
+        }
+    }
+
+    func test_permission_settingsRedirect_correctSet() {
+        let settingsRedirect: [Permission] = [.accessibility, .screenRecording]
+        for perm in settingsRedirect {
+            XCTAssertEqual(perm.category, .settingsRedirect, "\(perm) should be settingsRedirect")
+        }
+    }
+
+    func test_permission_implicit_correctSet() {
+        let implicit: [Permission] = [.automation, .files]
+        for perm in implicit {
+            XCTAssertEqual(perm.category, .implicit, "\(perm) should be implicit")
+        }
+    }
+
+    // MARK: - ToolResult Backward Compatibility
+
+    func test_toolResult_existingInit_stillWorks() {
+        let result = ToolResult(success: true, output: "ok", error: nil)
+        XCTAssertTrue(result.success)
+        XCTAssertNil(result.permissionNeeded)
+        XCTAssertNil(result.permissionDenied)
+    }
+
+    func test_toolResult_permissionNeeded_returnable() {
+        let result = ToolResult(success: false, output: "", error: "Need calendar",
+                                permissionNeeded: .calendar)
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.permissionNeeded, .calendar)
+        XCTAssertNil(result.permissionDenied)
+    }
+
+    func test_toolResult_permissionDenied_returnable() {
+        let result = ToolResult(success: false, output: "", error: "Calendar denied",
+                                permissionDenied: .calendar)
+        XCTAssertFalse(result.success)
+        XCTAssertNil(result.permissionNeeded)
+        XCTAssertEqual(result.permissionDenied, .calendar)
+    }
+
+    func test_toolResult_bothPermissionFields_mutuallySettable() {
+        // Edge case: shouldn't happen in practice, but struct should handle it
+        let result = ToolResult(success: false, output: "", error: nil,
+                                permissionNeeded: .contacts,
+                                permissionDenied: .calendar)
+        XCTAssertEqual(result.permissionNeeded, .contacts)
+        XCTAssertEqual(result.permissionDenied, .calendar)
+    }
+
+    func test_toolResult_requiresUpgrade_stillWorks() {
+        let result = ToolResult(success: false, output: "", error: "Upgrade needed",
+                                requiresUpgrade: true)
+        XCTAssertTrue(result.requiresUpgrade)
+        XCTAssertNil(result.permissionNeeded)
+    }
+
+    // MARK: - ToolHandler Protocol Defaults
+
+    /// Mock handler that doesn't declare permissions — should get empty defaults
+    private final class MockNoPermHandler: ToolHandler {
+        nonisolated let toolName = "mock"
+        func execute(action: String?, params: [String: String]) async -> ToolResult {
+            ToolResult(success: true, output: "ok", error: nil)
+        }
+    }
+
+    /// Mock handler that declares required permissions
+    private final class MockCalendarHandler: ToolHandler {
+        nonisolated let toolName = "calendar"
+        var requiredPermissions: [Permission] { [.calendar] }
+        func execute(action: String?, params: [String: String]) async -> ToolResult {
+            ToolResult(success: true, output: "ok", error: nil)
+        }
+    }
+
+    /// Mock handler with action-level permissions
+    private final class MockSystemHandler: ToolHandler {
+        nonisolated let toolName = "system"
+        func permissionsForAction(_ action: String?) -> [Permission] {
+            switch action {
+            case "show_desktop": return [.accessibility]
+            default: return []
+            }
+        }
+        func execute(action: String?, params: [String: String]) async -> ToolResult {
+            ToolResult(success: true, output: "ok", error: nil)
+        }
+    }
+
+    @MainActor
+    func test_toolHandler_defaultPermissions_empty() {
+        let handler = MockNoPermHandler()
+        XCTAssertTrue(handler.requiredPermissions.isEmpty)
+        XCTAssertTrue(handler.permissionsForAction("anything").isEmpty)
+    }
+
+    @MainActor
+    func test_toolHandler_requiredPermissions_declared() {
+        let handler = MockCalendarHandler()
+        XCTAssertEqual(handler.requiredPermissions, [.calendar])
+    }
+
+    @MainActor
+    func test_toolHandler_actionPermissions_varies() {
+        let handler = MockSystemHandler()
+        XCTAssertEqual(handler.permissionsForAction("show_desktop"), [.accessibility])
+        XCTAssertTrue(handler.permissionsForAction("open_app").isEmpty)
+    }
+
+    @MainActor
+    func test_toolHandler_actionPermissions_nilAction() {
+        let handler = MockSystemHandler()
+        XCTAssertTrue(handler.permissionsForAction(nil).isEmpty)
+    }
+
+    // MARK: - P0 Security: Tool Bypass Prevention
+
+    func test_toolResult_permissionNeeded_cannotBeForgedViaString() {
+        // Ensure Permission enum doesn't accept arbitrary strings
+        let forged = Permission(rawValue: "superadmin")
+        XCTAssertNil(forged, "Arbitrary permission strings must be rejected")
+    }
+
+    func test_permission_allCases_exactCount() {
+        // If someone adds a permission, this test forces them to update tests
+        XCTAssertEqual(Permission.allCases.count, 10,
+            "Permission enum has \(Permission.allCases.count) cases — update tests if this changed intentionally")
+    }
+
+    // MARK: - PermissionManager Core
+
+    @MainActor
+    func test_permissionManager_check_returnsStatus() {
+        let manager = PermissionManager.shared
+        let status = manager.check(.accessibility)
+        XCTAssertNotEqual(status, .unavailable)
+    }
+
+    @MainActor
+    func test_permissionManager_check_allPermissions_noThrow() {
+        let manager = PermissionManager.shared
+        for perm in Permission.allCases {
+            let _ = manager.check(perm)
+        }
+    }
+
+    // MARK: - Session Cooldown
+
+    @MainActor
+    func test_permissionManager_cooldown_tracksDeclined() {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        XCTAssertFalse(manager.isDeclinedThisSession(.calendar))
+        manager.markDeclinedThisSession(.calendar)
+        XCTAssertTrue(manager.isDeclinedThisSession(.calendar))
+        XCTAssertFalse(manager.isDeclinedThisSession(.reminders))
+    }
+
+    @MainActor
+    func test_permissionManager_cooldown_resetClearsAll() {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        manager.markDeclinedThisSession(.calendar)
+        manager.markDeclinedThisSession(.reminders)
+        manager.resetForTesting()
+        XCTAssertFalse(manager.isDeclinedThisSession(.calendar))
+        XCTAssertFalse(manager.isDeclinedThisSession(.reminders))
+    }
+
+    // MARK: - Request Queue
+
+    @MainActor
+    func test_permissionManager_request_implicitPermission_returnsQuickly() async {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+        let status = await manager.request(.automation)
+        XCTAssertNotEqual(status, .unavailable)
+    }
+
+    @MainActor
+    func test_permissionManager_request_filesPermission_noHang() async {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        let start = Date()
+        let _ = await manager.request(.files)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 5.0, "request() should not hang")
+    }
+
+    @MainActor
+    func test_permissionManager_request_declinedReturnsWithoutDialog() async {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        // Use screenRecording — not pre-granted on test machines, and settingsRedirect
+        // won't trigger a dialog. Cooldown should prevent re-request.
+        manager.markDeclinedThisSession(.screenRecording)
+        let status = await manager.request(.screenRecording)
+        // Settings-redirect permissions check cooldown, but since check() returns first
+        // and screenRecording is settingsRedirect, it returns current status.
+        // The important thing: it doesn't hang or crash.
+        XCTAssertTrue(status == .denied || status == .notDetermined || status == .granted)
+    }
+
+    @MainActor
+    func test_permissionManager_cooldown_preventsAPIRequest() {
+        // Verify the cooldown flag is checked (unit-level)
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        manager.markDeclinedThisSession(.contacts)
+        XCTAssertTrue(manager.isDeclinedThisSession(.contacts))
+        // If request() were called, it would hit the cooldown guard and return .denied
+        // without presenting a dialog — verified by the isDeclinedThisSession check
+    }
+
+    // MARK: - P0 Security: Cooldown Bypass Prevention
+
+    @MainActor
+    func test_permissionManager_cooldown_cannotBypassViaReset() {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        manager.markDeclinedThisSession(.accessibility)
+        XCTAssertTrue(manager.isDeclinedThisSession(.accessibility))
+
+        // Only resetForTesting clears cooldown — no public API to bypass
+        manager.resetForTesting()
+        XCTAssertFalse(manager.isDeclinedThisSession(.accessibility))
+    }
+
+    @MainActor
+    func test_permissionManager_settingsRedirect_returnsWithoutDialog() async {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        // Settings-redirect permissions can't trigger a dialog — should return current status
+        let status = await manager.request(.accessibility)
+        // In test env, AX is not granted — should be .notDetermined
+        XCTAssertTrue(status == .notDetermined || status == .granted || status == .denied)
+    }
+
+    // MARK: - P0 Security: Race Condition Protection
+
+    @MainActor
+    func test_permissionManager_concurrentChecks_noRace() async {
+        let manager = PermissionManager.shared
+        manager.resetForTesting()
+
+        // Fire multiple checks — @MainActor serializes these
+        let statuses = await withTaskGroup(of: PermissionStatus.self) { group in
+            for perm in [Permission.calendar, .reminders, .contacts] {
+                group.addTask { @MainActor in
+                    manager.check(perm)
+                }
+            }
+            var results: [PermissionStatus] = []
+            for await status in group {
+                results.append(status)
+            }
+            return results
+        }
+
+        XCTAssertEqual(statuses.count, 3)
+    }
+
+    // MARK: - Tool Handler Permission Declarations
+
+    @MainActor
+    func test_calendarHandler_requiresCalendarPermission() {
+        let handler = CalendarToolHandler(eventStore: EKEventStore())
+        XCTAssertTrue(handler.requiredPermissions.contains(.calendar))
+    }
+
+    @MainActor
+    func test_notesHandler_requiresAutomation() {
+        let handler = NotesToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.contains(.automation))
+    }
+
+    @MainActor
+    func test_mediaHandler_requiresAutomation() {
+        let handler = MediaToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.contains(.automation))
+    }
+
+    @MainActor
+    func test_browserHandler_requiresAutomation() {
+        let handler = BrowserToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.contains(.automation))
+    }
+
+    @MainActor
+    func test_systemHandler_showDesktop_requiresAccessibility() {
+        let handler = SystemToolHandler()
+        XCTAssertTrue(handler.permissionsForAction("show_desktop").contains(.accessibility))
+    }
+
+    @MainActor
+    func test_systemHandler_toggleHiddenFiles_requiresAccessibility() {
+        let handler = SystemToolHandler()
+        XCTAssertTrue(handler.permissionsForAction("toggle_hidden_files").contains(.accessibility))
+    }
+
+    @MainActor
+    func test_systemHandler_volume_noPermission() {
+        let handler = SystemToolHandler()
+        XCTAssertTrue(handler.permissionsForAction("volume").isEmpty)
+    }
+
+    @MainActor
+    func test_screenHandler_requiresScreenRecording() {
+        let handler = ScreenToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.contains(.screenRecording))
+    }
+
+    @MainActor
+    func test_screenHandler_requiresAccessibility() {
+        let handler = ScreenToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.contains(.accessibility))
+    }
+
+    @MainActor
+    func test_memoryHandler_noPermissions() {
+        let handler = MemoryToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.isEmpty)
+    }
+
+    @MainActor
+    func test_webSearchHandler_noPermissions() {
+        let handler = WebSearchToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.isEmpty)
+    }
+
+    @MainActor
+    func test_appHandler_noPermissions() {
+        let handler = AppToolHandler()
+        XCTAssertTrue(handler.requiredPermissions.isEmpty)
+    }
+}

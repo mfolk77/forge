@@ -1,0 +1,775 @@
+import Foundation
+import os.log
+
+/// Parses tool calls from AI responses and extracts parameters
+/// Supports both legacy TOOL: format and Hermes-2-Pro <tool_call> JSON format
+@MainActor
+class ToolCallParser {
+    static let shared = ToolCallParser()
+    private let logger = Logger(subsystem: "com.serenanet.tools", category: "ToolCallParser")
+
+    struct ToolCall {
+        let tool: String
+        let action: String?
+        let params: [String: String]
+        let rawLine: String
+
+        var ftaiTask: String {
+            var task = "task: \(tool)"
+            if let action = action {
+                task += ".\(action)"
+            }
+            task += "\n"
+
+            for (key, value) in params {
+                task += "\(key): \(value)\n"
+            }
+
+            return task
+        }
+    }
+
+    private init() {}
+
+    /// Parse tool calls from AI response
+    /// Supports:
+    /// 1. Hermes-2-Pro format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    /// 2. Legacy format: TOOL:calendar action:create_event title:Meeting date:tomorrow
+    func parseToolCalls(from response: String) -> [ToolCall] {
+        var toolCalls: [ToolCall] = []
+
+        logger.info("🔍 ToolCallParser: Parsing response (\(response.count) chars)")
+        logger.info("🔍 ToolCallParser: Contains '<tool_call>': \(response.contains("<tool_call>"))")
+        logger.info("🔍 ToolCallParser: Contains '</tool_call>': \(response.contains("</tool_call>"))")
+        logger.info("🔍 ToolCallParser: Contains 'TOOL:': \(response.contains("TOOL:"))")
+        logger.info("🔍 ToolCallParser: Contains 'launch_app': \(response.contains("launch_app"))")
+
+        // SAFETY: Check if response appears to be an example/educational context
+        // If the model is explaining how tools work, don't execute the "example" tool calls
+        if isExampleOrEducationalContext(response) {
+            logger.warning("⚠️ ToolCallParser: Detected example/educational context - skipping tool call execution")
+            return []
+        }
+
+        // First, try Hermes-2-Pro <tool_call> JSON format
+        let hermesToolCalls = parseHermesToolCalls(from: response)
+        toolCalls.append(contentsOf: hermesToolCalls)
+        logger.info("🔍 ToolCallParser: Found \(hermesToolCalls.count) Hermes tool calls")
+
+        // If no Hermes calls found, try legacy TOOL: format
+        if toolCalls.isEmpty {
+            let legacyToolCalls = parseLegacyToolCalls(from: response)
+            toolCalls.append(contentsOf: legacyToolCalls)
+            logger.info("🔍 ToolCallParser: Found \(legacyToolCalls.count) legacy tool calls")
+        }
+
+        // Deduplicate: same tool + action + params = same call
+        var seen = Set<String>()
+        toolCalls = toolCalls.filter { call in
+            let key = "\(call.tool)|\(call.action ?? "")|\(call.params.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: ","))"
+            return seen.insert(key).inserted
+        }
+
+        // Cap at 10 tool calls per response to prevent DoS from crafted output
+        if toolCalls.count > 10 {
+            logger.warning("⚠️ ToolCallParser: Capping \(toolCalls.count) tool calls to 10")
+            toolCalls = Array(toolCalls.prefix(10))
+        }
+
+        logger.info("🔍 ToolCallParser: Total tool calls found: \(toolCalls.count)")
+        return toolCalls
+    }
+
+    /// Detect if the response is an example/educational context where tool calls shouldn't be executed
+    /// This prevents the model from accidentally executing tool calls when it's just explaining how they work
+    private func isExampleOrEducationalContext(_ response: String) -> Bool {
+        let lowercased = response.lowercased()
+
+        // Educational/example indicators that appear BEFORE tool calls
+        let educationalIndicators = [
+            "example application",
+            "example workflow",
+            "example integration",
+            "for example",
+            "for instance",
+            "here's how",
+            "here is how",
+            "this is how",
+            "would look like",
+            "could look like",
+            "might look like",
+            "such as:",
+            "like this:",
+            "as follows:",
+            "### example",
+            "## example",
+            "# example",
+            "practical steps",
+            "workflow:",
+            "integration workflow",
+            "sample code",
+            "demo:",
+            "demonstration"
+        ]
+
+        // Check if any educational indicator appears in the response
+        for indicator in educationalIndicators {
+            if lowercased.contains(indicator) {
+                // Only trigger if the response is long (explanations are typically long)
+                // Short responses with tool calls are likely real commands
+                if response.count > 500 {
+                    logger.info("🔍 ToolCallParser: Found educational indicator '\(indicator)' in long response")
+                    return true
+                }
+            }
+        }
+
+        // Check for markdown headers followed by numbered lists (common in explanations)
+        let hasMarkdownStructure = lowercased.contains("###") && (lowercased.contains("1.") || lowercased.contains("2."))
+        if hasMarkdownStructure && response.count > 800 {
+            logger.info("🔍 ToolCallParser: Detected markdown structure in long educational response")
+            return true
+        }
+
+        return false
+    }
+
+    // MARK: - Hermes-2-Pro Format Parser
+
+    /// Parse Hermes-2-Pro tool call formats:
+    /// 1. JSON format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    /// 2. XML attribute format: <function_name param="value" />
+    private func parseHermesToolCalls(from response: String) -> [ToolCall] {
+        var toolCalls: [ToolCall] = []
+
+        // Pattern 1: <tool_call>...</tool_call>
+        // Extract everything between the tags, then parse as JSON
+        let tagPattern = #"<tool_call>\s*([\s\S]*?)\s*</tool_call>"#
+        if let regex = try? NSRegularExpression(pattern: tagPattern, options: []) {
+            let nsRange = NSRange(response.startIndex..<response.endIndex, in: response)
+            let matches = regex.matches(in: response, options: [], range: nsRange)
+
+            for match in matches {
+                guard let contentRange = Range(match.range(at: 1), in: response) else { continue }
+                let content = String(response[contentRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // The content should be JSON like: {"name": "...", "arguments": {...}}
+                if let toolCall = parseHermesJSON(content, rawLine: "<tool_call>\(content)</tool_call>") {
+                    toolCalls.append(toolCall)
+                    logger.info("📞 Parsed Hermes JSON tool call: \(toolCall.tool) action:\(toolCall.action ?? "none")")
+                }
+            }
+        }
+
+        // Pattern 2: Missing CLOSING tag - <tool_call>{"name": "...", "arguments": {...}}
+        // The model often outputs <tool_call> but forgets </tool_call>
+        if response.contains("<tool_call>") && !response.contains("</tool_call>") {
+            logger.info("🔍 Detected <tool_call> without </tool_call> - parsing with missing closing tag")
+            let parts = response.components(separatedBy: "<tool_call>")
+            for part in parts.dropFirst() { // Skip content before first <tool_call>
+                let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Find the JSON object starting with {
+                if let jsonStart = trimmed.firstIndex(of: "{") {
+                    // Find the end of the JSON by matching braces
+                    var braceCount = 0
+                    var jsonEnd = jsonStart
+                    var foundStart = false
+                    for idx in trimmed[jsonStart...].indices {
+                        let char = trimmed[idx]
+                        if char == "{" {
+                            braceCount += 1
+                            foundStart = true
+                        } else if char == "}" {
+                            braceCount -= 1
+                            if foundStart && braceCount == 0 {
+                                jsonEnd = trimmed.index(after: idx)
+                                break
+                            }
+                        }
+                    }
+                    if foundStart && braceCount == 0 {
+                        let jsonCandidate = String(trimmed[jsonStart..<jsonEnd])
+                        if let toolCall = parseHermesJSON(jsonCandidate, rawLine: "<tool_call>" + jsonCandidate) {
+                            let isDuplicate = toolCalls.contains { existing in
+                                existing.tool == toolCall.tool && existing.action == toolCall.action &&
+                                existing.params == toolCall.params
+                            }
+                            if !isDuplicate {
+                                toolCalls.append(toolCall)
+                                logger.info("📞 Parsed Hermes JSON (missing close tag): \(toolCall.tool) action:\(toolCall.action ?? "none")")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 3: Missing opening tag - {"name": "...", "arguments": {...}}</tool_call>
+        // The model sometimes omits the opening <tool_call> tag
+        // Simple approach: find </tool_call> and look backwards for the JSON
+        if response.contains("</tool_call>") && !response.contains("<tool_call>") {
+            // No opening tag but has closing tag - extract JSON before </tool_call>
+            let parts = response.components(separatedBy: "</tool_call>")
+            for part in parts {
+                let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Find the FIRST { that starts the JSON object (not nested ones)
+                if let jsonStart = trimmed.firstIndex(of: "{") {
+                    let jsonCandidate = String(trimmed[jsonStart...])
+                    // Try to parse it as tool call JSON
+                    if let toolCall = parseHermesJSON(jsonCandidate, rawLine: jsonCandidate + "</tool_call>") {
+                        let isDuplicate = toolCalls.contains { existing in
+                            existing.tool == toolCall.tool && existing.action == toolCall.action &&
+                            existing.params == toolCall.params
+                        }
+                        if !isDuplicate {
+                            toolCalls.insert(toolCall, at: 0)
+                            logger.info("📞 Parsed Hermes JSON (missing open tag): \(toolCall.tool) action:\(toolCall.action ?? "none")")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 3: <function_name param="value" param2="value2" />
+        // Examples: <launch_app app_name="Safari" />, <create_calendar_event title="Meeting" date="tomorrow" time="14:00" />
+        let xmlPattern = #"<(\w+)\s+([^>]+)\s*/>"#
+        if let regex = try? NSRegularExpression(pattern: xmlPattern, options: []) {
+            let nsRange = NSRange(response.startIndex..<response.endIndex, in: response)
+            let matches = regex.matches(in: response, options: [], range: nsRange)
+
+            for match in matches {
+                guard let funcNameRange = Range(match.range(at: 1), in: response),
+                      let attrsRange = Range(match.range(at: 2), in: response) else { continue }
+
+                let funcName = String(response[funcNameRange])
+                let attrsString = String(response[attrsRange])
+
+                // Skip if it's an HTML/XML tag we don't care about
+                let skipTags = ["br", "hr", "img", "input", "meta", "link", "!--"]
+                guard !skipTags.contains(funcName.lowercased()) else { continue }
+
+                // Parse XML attributes
+                var params: [String: String] = [:]
+                let attrPattern = #"(\w+)\s*=\s*"([^"]*)""#
+                if let attrRegex = try? NSRegularExpression(pattern: attrPattern, options: []) {
+                    let attrNsRange = NSRange(attrsString.startIndex..<attrsString.endIndex, in: attrsString)
+                    let attrMatches = attrRegex.matches(in: attrsString, options: [], range: attrNsRange)
+
+                    for attrMatch in attrMatches {
+                        guard let keyRange = Range(attrMatch.range(at: 1), in: attrsString),
+                              let valueRange = Range(attrMatch.range(at: 2), in: attrsString) else { continue }
+                        let key = String(attrsString[keyRange])
+                        let value = String(attrsString[valueRange])
+                        params[key] = value
+                    }
+                }
+
+                if !params.isEmpty {
+                    let (tool, action) = mapHermesFunctionToTool(funcName)
+                    let rawLine = "<\(funcName) \(attrsString) />"
+                    let toolCall = ToolCall(tool: tool, action: action, params: params, rawLine: rawLine)
+                    toolCalls.append(toolCall)
+                    logger.info("📞 Parsed Hermes XML tool call: \(toolCall.tool) action:\(toolCall.action ?? "none")")
+                }
+            }
+        }
+
+        return toolCalls
+    }
+
+    /// Parse JSON from Hermes tool call and convert to ToolCall
+    private func parseHermesJSON(_ json: String, rawLine: String) -> ToolCall? {
+        guard let data = json.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let name = parsed["name"] as? String else {
+            logger.warning("⚠️ Failed to parse Hermes tool call JSON: \(json)")
+            return nil
+        }
+
+        // Reject empty or whitespace-only tool names — they can't be routed
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            logger.warning("⚠️ Rejected tool call with empty/whitespace name")
+            return nil
+        }
+
+        let arguments = parsed["arguments"] as? [String: Any] ?? [:]
+
+        // Map Hermes function names to our tool system
+        let (tool, mappedAction) = mapHermesFunctionToTool(trimmedName)
+
+        // Convert arguments to string params
+        var params: [String: String] = [:]
+        for (key, value) in arguments {
+            if let stringValue = value as? String {
+                params[key] = stringValue
+            } else {
+                params[key] = String(describing: value)
+            }
+        }
+
+        // If the mapper didn't extract an action, check if arguments contains "action"
+        // This handles LLM output like {"name": "memory", "arguments": {"action": "remember", ...}}
+        var action = mappedAction
+        if action == nil, let argAction = params["action"] {
+            action = argAction
+            params.removeValue(forKey: "action")
+        }
+
+        return ToolCall(tool: tool, action: action, params: params, rawLine: rawLine)
+    }
+
+    /// Map Hermes function names to our tool:action format
+    private func mapHermesFunctionToTool(_ functionName: String) -> (tool: String, action: String?) {
+        switch functionName {
+        // Direct tool names (LLM uses {"name": "tool", "arguments": {"action": "...", ...}})
+        // Action will be extracted from arguments in parseHermesJSON
+        case "calendar", "notes", "media", "browser", "app", "file", "memory", "system",
+             "web_search", "websearch", "executive", "briefing", "screen":
+            return (functionName, nil)
+
+        // Calendar tools
+        case "create_calendar_event":
+            return ("calendar", "create_event")
+        case "view_calendar", "view_events", "view_calendar_events", "list_calendar_events":
+            return ("calendar", "view_events")
+        case "delete_calendar_event", "cancel_calendar_event", "remove_calendar_event":
+            return ("calendar", "delete_event")
+        case "update_calendar_event", "modify_calendar_event", "change_calendar_event", "reschedule_calendar_event":
+            return ("calendar", "update_event")
+
+        // App tools
+        case "launch_app", "open_app", "start_app":
+            return ("app", "launch")
+        case "quit_app", "close_app", "stop_app":
+            return ("app", "quit")
+        case "list_apps", "list_running_apps":
+            return ("app", "list_active")
+
+        // Media tools
+        case "play_music", "play_song", "play_track", "media_play":
+            return ("media", "play")
+        case "pause_music", "media_pause":
+            return ("media", "pause")
+        case "stop_music", "media_stop":
+            return ("media", "stop")
+        case "next_track", "skip_track", "media_next":
+            return ("media", "next")
+        case "previous_track", "media_previous":
+            return ("media", "previous")
+        case "toggle_playback", "media_toggle":
+            return ("media", "toggle")
+        case "set_volume", "media_volume":
+            return ("media", "volume")
+        case "playback_status", "media_status", "now_playing":
+            return ("media", "status")
+
+        // File tools
+        case "search_files", "find_files":
+            return ("file", "search")
+        case "read_file":
+            return ("file", "read")
+        case "write_file", "create_file":
+            return ("file", "write")
+        case "list_files":
+            return ("file", "list")
+        case "delete_file", "remove_file":
+            return ("file", "delete")
+
+        // Browser tools
+        case "open_url", "navigate_to", "go_to_url", "browse_to":
+            return ("browser", "open_url")
+        case "web_search", "search_web", "google_search":
+            return ("web_search", "search")  // Routes to handleWebSearchTool with real DuckDuckGo scraping
+        case "new_tab", "open_new_tab":
+            return ("browser", "new_tab")
+        case "close_tab":
+            return ("browser", "close_tab")
+
+        // Notes tools
+        case "add_note", "create_note", "new_note":
+            return ("notes", "add")
+        case "read_notes", "get_notes", "list_notes", "show_notes":
+            return ("notes", "list")
+        case "get_note", "read_note", "show_note":
+            return ("notes", "get")
+        case "update_note", "edit_note", "modify_note":
+            return ("notes", "update")
+        case "append_note", "add_to_note", "append_to_note":
+            return ("notes", "append")
+        case "delete_note", "remove_note":
+            return ("notes", "delete")
+
+        // Memory/User fact tools
+        case "lookup_user_fact", "get_user_fact", "recall_user_fact", "check_user_fact":
+            return ("memory", "lookup")
+        case "remember_fact", "save_fact", "store_fact":
+            return ("memory", "remember")
+        case "forget_fact", "delete_fact", "remove_fact", "forget_memory", "delete_memory":
+            return ("memory", "forget")
+
+        default:
+            // Try to infer tool and action from function name
+            let parts = functionName.split(separator: "_")
+            if parts.count >= 2 {
+                let action = String(parts[0])
+                let tool = parts.dropFirst().joined(separator: "_")
+                return (tool, action)
+            }
+            return (functionName, nil)
+        }
+    }
+
+    // MARK: - Legacy TOOL: Format Parser
+
+    /// Parse legacy TOOL: format
+    /// Format: TOOL:calendar action:create_event title:Meeting date:tomorrow
+    private func parseLegacyToolCalls(from response: String) -> [ToolCall] {
+        var toolCalls: [ToolCall] = []
+
+        let lines = response.components(separatedBy: .newlines)
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+
+            guard trimmedLine.hasPrefix("TOOL:") || trimmedLine.hasPrefix("TOOL: ") else { continue }
+
+            // Remove "TOOL:" or "TOOL: " prefix (handle optional space)
+            var toolLine = trimmedLine
+            if toolLine.hasPrefix("TOOL: ") {
+                toolLine = String(toolLine.dropFirst(6)) // "TOOL: " = 6 chars
+            } else {
+                toolLine = String(toolLine.dropFirst(5)) // "TOOL:" = 5 chars
+            }
+            toolLine = toolLine.trimmingCharacters(in: .whitespaces)
+
+            // Parse the tool line
+            if let toolCall = parseToolLine(toolLine, rawLine: trimmedLine) {
+                toolCalls.append(toolCall)
+                logger.info("📞 Parsed legacy tool call: \(toolCall.tool) action:\(toolCall.action ?? "none")")
+            }
+        }
+
+        return toolCalls
+    }
+
+    private func parseToolLine(_ line: String, rawLine: String) -> ToolCall? {
+        // Parse tool name (first token before space)
+        guard let firstSpaceIndex = line.firstIndex(of: " ") else {
+            // No parameters, just tool name
+            return ToolCall(tool: line, action: nil, params: [:], rawLine: rawLine)
+        }
+
+        let toolName = String(line[..<firstSpaceIndex])
+        let parametersString = String(line[line.index(after: firstSpaceIndex)...])
+
+        var action: String?
+        var params: [String: String] = [:]
+
+        // Parse key:value pairs while respecting quoted strings
+        var currentIndex = parametersString.startIndex
+
+        while currentIndex < parametersString.endIndex {
+            // Skip whitespace
+            while currentIndex < parametersString.endIndex && parametersString[currentIndex].isWhitespace {
+                currentIndex = parametersString.index(after: currentIndex)
+            }
+
+            guard currentIndex < parametersString.endIndex else { break }
+
+            // Find key (everything until colon)
+            guard let colonIndex = parametersString[currentIndex...].firstIndex(of: ":") else { break }
+            let key = String(parametersString[currentIndex..<colonIndex])
+
+            // Move past colon
+            currentIndex = parametersString.index(after: colonIndex)
+            guard currentIndex < parametersString.endIndex else { break }
+
+            // Parse value (handle quoted strings)
+            var value = ""
+
+            if parametersString[currentIndex] == "\"" {
+                // Quoted value - find matching closing quote
+                currentIndex = parametersString.index(after: currentIndex)
+                let startQuoteIndex = currentIndex
+
+                while currentIndex < parametersString.endIndex && parametersString[currentIndex] != "\"" {
+                    currentIndex = parametersString.index(after: currentIndex)
+                }
+
+                value = String(parametersString[startQuoteIndex..<currentIndex])
+
+                // Move past closing quote
+                if currentIndex < parametersString.endIndex {
+                    currentIndex = parametersString.index(after: currentIndex)
+                }
+            } else {
+                // Unquoted value - read until space or end
+                let valueStart = currentIndex
+
+                while currentIndex < parametersString.endIndex && !parametersString[currentIndex].isWhitespace {
+                    currentIndex = parametersString.index(after: currentIndex)
+                }
+
+                value = String(parametersString[valueStart..<currentIndex])
+            }
+
+            // Store parameter
+            if key == "action" {
+                action = value
+            } else {
+                params[key] = value
+            }
+        }
+
+        return ToolCall(
+            tool: toolName,
+            action: action,
+            params: params,
+            rawLine: rawLine
+        )
+    }
+
+    /// Remove tool call lines from response to get clean text for display
+    /// Handles Hermes <tool_call> blocks, XML function tags, and legacy TOOL: lines
+    func removeToolCalls(from response: String) -> String {
+        var cleaned = response
+
+        // Remove Hermes <tool_call>...</tool_call> blocks (handles nested JSON)
+        let hermesPattern = #"<tool_call>[\s\S]*?</tool_call>\s*"#
+        if let regex = try? NSRegularExpression(pattern: hermesPattern, options: []) {
+            let nsRange = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: nsRange, withTemplate: "")
+        }
+
+        // Remove malformed tool calls (missing opening tag): {"name": "...", "arguments": {...}}</tool_call>
+        // ULTRA-AGGRESSIVE cleanup - use simple string matching first, then regex
+
+        // Step 1: Simple string replacements for EXACT patterns (handles nested braces correctly)
+        let simplePatterns = [
+            "</tool_call>",
+            "<tool_call>",
+        ]
+        for pattern in simplePatterns {
+            cleaned = cleaned.replacingOccurrences(of: pattern, with: "")
+        }
+
+        // Step 2: Remove complete JSON tool call blocks using balanced brace matching
+        // Pattern: {"name": "...", "arguments": {...}}
+        // Model outputs various spacing: {"name": "...", {"name":"...", { "name": "..."
+        func findJsonToolCallStart(_ text: String) -> Range<String.Index>? {
+            // Look for any { followed by "name" with flexible whitespace/colon
+            // Use regex for maximum flexibility with whitespace variations
+            let pattern = #"\{\s*"name"\s*:\s*""#
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+               let match = regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..<text.endIndex, in: text)),
+               let range = Range(match.range, in: text) {
+                return range
+            }
+            return nil
+        }
+
+        while let startRange = findJsonToolCallStart(cleaned) {
+            // Find matching closing braces
+            var braceCount = 0
+            var endIndex = startRange.lowerBound
+            var foundStart = false
+            for idx in cleaned[startRange.lowerBound...].indices {
+                let char = cleaned[idx]
+                if char == "{" {
+                    braceCount += 1
+                    foundStart = true
+                } else if char == "}" {
+                    braceCount -= 1
+                    if foundStart && braceCount == 0 {
+                        endIndex = cleaned.index(after: idx)
+                        break
+                    }
+                }
+            }
+            if foundStart && braceCount == 0 {
+                cleaned.removeSubrange(startRange.lowerBound..<endIndex)
+            } else {
+                break // Couldn't find matching braces, stop to avoid infinite loop
+            }
+        }
+
+        // Step 3: Regex patterns for remaining fragments - ULTRA AGGRESSIVE
+        let malformedPatterns = [
+            // Partial tool JSON fragments
+            #""launch_app""#,
+            #""view_calendar""#,
+            #""create_calendar_event""#,
+            #""search_files""#,
+            #""web_search""#,
+            #""play_music""#,
+            #""arguments""#,
+            #""app_name""#,
+            // Lines that are just JSON-like
+            #"^\s*\{.*\}\s*$"#,
+            // Hallucinated inline code examples (model outputs "json {..." as examples)
+            #"json\s+\{[^}]*"name"[^}]*\}"#,
+            #"json\s+\{[^}]*"arguments"[^}]*\}"#,
+            // Python code examples that get hallucinated
+            #"python\s+#\s*Example[^\n]*\n"#,
+            #"python\s+def\s+\w+\([^)]*\):[^\n]*"#,
+            // Markdown code blocks with hallucinated tool calls (```json ... ```)
+            #"```json\s*\n?\s*\{[^`]*"name"[^`]*\}\s*\n?\s*```"#,
+            #"```python[\s\S]*?```"#,
+            // AGGRESSIVE: Inline python with tool_call on same/next line
+            #"python\s+#[^<]*<tool_call>"#,
+            #"python\s*#[^\n]*\n\s*<tool_call>"#,
+            // AGGRESSIVE: Any remaining <tool_call> with content (even partial)
+            #"<tool_call>\s*\{[^}]*\}+"#,
+            // AGGRESSIVE: Corrupted json prefixes (onso, json, etc) followed by tool-like JSON
+            #"onso\s*\{[^}]*"name"[^}]*\}+"#,
+            #"json\s*\{[^}]*"name"[^}]*\}+"#,
+            // AGGRESSIVE: Hypothetical/example tool calls inline
+            #"\(hypothetical\)\s*<tool_call>"#,
+            #"# Example tool call[^\n]*"#,
+            // AGGRESSIVE: Any {"name": followed by tool-like content until }}
+            #"\{"name":\s*"[^"]*_[^"]*"[^}]*"arguments"[^}]*\}\}"#,
+            // AGGRESSIVE: Clean up orphaned closing braces after removal
+            #"\}\s*\}\s*$"#
+        ]
+        for pattern in malformedPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
+                let nsRange = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: nsRange, withTemplate: "")
+            }
+        }
+
+        // Remove model artifacts and stop token leakage
+        // IMPORTANT: Only remove actual artifacts, NOT valid response content!
+        let artifactPatterns = [
+            #"</s>"#,                           // End of sequence token
+            #"<s>"#,                            // Start of sequence token
+            #"<\|im_start\|>"#,                 // Chat template token
+            #"<\|im_end\|>"#,                   // Chat template token
+            #"Извист:"#,                        // Russian artifact
+            #"Kat\.:"#,                         // Polish artifact
+            #"Ответ[^:]*:"#,                    // Russian "Answer"
+            #"Tag</s><s>.*?`\."#,               // Training data leakage pattern
+            #"\{\"status\"[^}]+\}"#,            // Raw status JSON
+            // System prompt leakage patterns (only obvious leaks)
+            #"Tool Call Structure:\s*"#,        // "Tool Call Structure:" prefix
+            #"BRIEF MESSAGE EXAMPLES[^:]*:"#,   // System prompt examples header
+            #"MANDATORY EXAMPLES[^:]*:"#,       // System prompt header
+            #"Copy this format exactly:"#,      // System prompt instruction
+            #"\"launch_app\"\s*,\s*\"arguments\"\s*:\s*\{[^}]+\}"#,  // Naked JSON without tags
+            #"\"name\"\s*:\s*\"[^\"]+\"\s*,\s*\"arguments\""#,  // Partial tool JSON
+            #"Opening\s+\w+\.\s*Opening\s+\w+\."#,  // Double confirmations only
+            #"TOOLS:\s*launch_app"#,            // System prompt tools list leak
+            #"RULES:\s*\d+\."#,                 // System prompt rules leak
+            #"Output ONE\s*<tool_call>"#,       // System prompt instruction leak
+            // Hermes-2-Pro system prompt leakage
+            #"NEVER respond to action requests without a <tool_call> block"#,
+            #"For general questions \(not actions\), respond normally without tool calls"#,
+            #"Tool format:[^.]*\."#,
+            #"Output format:[^.]*\."#,
+            // Hallucinated Python code blocks (model dumps training examples)
+            #"python\s+import\s+torch"#,
+            #"python\s+from\s+transformers"#,
+            #"python\s+tokenizer\s*="#,
+            #"python\s+model\s*="#,
+            #"python\s+def\s+train_model"#,
+            #"python\s+def\s+update_model"#,
+            #"python\s+def\s+get_contextual"#,
+            #"python\s+def\s+expand_knowledge"#,
+            #"BertTokenizerFast[^)]+\)"#,
+            #"AutoModel\.from_pretrained[^)]+\)"#,
+            #"torch\.tensor[^)]+\)"#,
+            #"torch\.optim\.Adam[^)]+\)"#,
+            #"model\.train\(\)"#,
+            #"model\.parameters\(\)"#,
+            #"torch\.no_grad\(\):"#,
+            #"outputs\.argmax[^)]+\)"#,
+            #"tokenizer\.encode[^)]+\)"#,
+            #"tokenizer\.decode[^)]+\)"#,
+            // Inline code with newlines collapsed (model output artifact)
+            #"for\s+\w+\s+in\s+range\(epochs\):"#,
+            #"for\s+log\s+in\s+interaction_logs\]"#,
+            #"inputs\s*=\s*\[tokenizer\.encode"#,
+            #"labels\s*=\s*\[log\['response'\]"#,
+            #"input_tensor,\s*label_tensor"#,
+            #"input_tensor\s*=\s*torch\.tensor"#,
+            #"label_tensor\s*=\s*torch\.tensor"#,
+            #"optimizer\s*=\s*torch\.optim"#,
+            #"#\s*Convert to PyTorch tensors"#,
+            #"#\s*Forward pass"#,
+            #"#\s*Example pseudo-code"#,
+            #"#\s*Extract useful information"#
+        ]
+        for pattern in artifactPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let nsRange = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: nsRange, withTemplate: "")
+            }
+        }
+
+        // Remove XML function tags: <function_name param="value" />
+        // Match common tool function names
+        let toolFunctions = [
+            // Calendar functions
+            "create_calendar_event", "delete_calendar_event", "update_calendar_event",
+            "view_calendar_events", "list_calendar_events", "cancel_calendar_event",
+            "modify_calendar_event", "reschedule_calendar_event",
+            // App functions
+            "launch_app", "open_app", "quit_app", "close_app", "start_app", "stop_app",
+            "list_apps", "list_running_apps",
+            // File functions
+            "search_files", "find_files", "read_file", "write_file", "list_files",
+            "create_file", "delete_file", "remove_file",
+            // Media functions
+            "play_music", "play_song", "play_track", "media_play",
+            "pause_music", "media_pause", "stop_music", "media_stop",
+            "next_track", "skip_track", "media_next",
+            "previous_track", "media_previous",
+            "toggle_playback", "media_toggle",
+            "set_volume", "media_volume",
+            "playback_status", "media_status", "now_playing"
+        ]
+        for funcName in toolFunctions {
+            let xmlPattern = "<\(funcName)\\s+[^>]+\\s*/>"
+            if let regex = try? NSRegularExpression(pattern: xmlPattern, options: []) {
+                let nsRange = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: nsRange, withTemplate: "")
+            }
+        }
+
+        // Remove legacy TOOL: lines
+        let lines = cleaned.components(separatedBy: .newlines)
+        let cleanedLines = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.hasPrefix("TOOL:") && !trimmed.hasPrefix("TOOL: ")
+        }
+
+        var result = cleanedLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // FINAL NUCLEAR CLEANUP: Remove ANY remaining tool_call artifacts
+        // This catches anything the previous patterns missed
+
+        // Remove any line that contains <tool_call> or tool_call syntax
+        let nuclearPatterns = [
+            #".*<tool_call>.*"#,
+            #".*</tool_call>.*"#,
+            #".*\{"name":\s*"[^"]*".*"arguments".*"#,
+            #".*onso\{.*"#,
+            #"\s*python\s+$"#,  // Orphaned "python" word
+            #"^\s*\}\s*$"#,     // Lines with just closing braces
+            #"^\s*\}\}\s*$"#,   // Lines with double closing braces
+        ]
+        for pattern in nuclearPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
+                let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+                result = regex.stringByReplacingMatches(in: result, options: [], range: nsRange, withTemplate: "")
+            }
+        }
+
+        // Clean up multiple consecutive newlines left by removals
+        while result.contains("\n\n\n") {
+            result = result.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

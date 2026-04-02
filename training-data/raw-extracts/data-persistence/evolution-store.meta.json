@@ -1,0 +1,12 @@
+{
+  "name": "evolution-store",
+  "category": "data-persistence",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/evolution/store.rs",
+  "line_count": 442,
+  "why": "Skill persistence, version management",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

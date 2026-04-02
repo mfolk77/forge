@@ -1,0 +1,506 @@
+import XCTest
+@testable import SerenaCore
+
+final class ScreenIntelligenceRedTests: XCTestCase {
+
+    // MARK: - ScreenContext Summary Tests
+
+    func test_screenContext_summaryWithApp() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Safari", bundleIdentifier: "com.apple.Safari", isActive: true),
+            window: nil,
+            contextType: .browser(url: nil),
+            timestamp: Date()
+        )
+        XCTAssertTrue(context.summary.contains("Safari"))
+    }
+
+    func test_screenContext_summaryWithWindowTitle() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Safari", bundleIdentifier: "com.apple.Safari", isActive: true),
+            window: WindowContent(title: "GitHub - Pull Request #42", textContent: "", uiElements: [], appName: "Safari"),
+            contextType: .browser(url: "https://github.com"),
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("Safari"))
+        XCTAssertTrue(summary.contains("GitHub - Pull Request #42"))
+    }
+
+    func test_screenContext_summaryNoApp() {
+        let context = ScreenContext(
+            app: nil,
+            window: nil,
+            contextType: .unknown,
+            timestamp: Date()
+        )
+        XCTAssertEqual(context.summary, "No active app")
+    }
+
+    func test_screenContext_emailSummaryIncludesSender() {
+        let emailCtx = EmailContext(sender: "john@example.com", subject: "Meeting notes", bodyPreview: "Hi team...")
+        let context = ScreenContext(
+            app: AppInfo(name: "Mail", bundleIdentifier: "com.apple.mail", isActive: true),
+            window: WindowContent(title: "Meeting notes", textContent: "", uiElements: [], appName: "Mail"),
+            contextType: .email(emailCtx),
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("john@example.com"))
+        XCTAssertTrue(summary.contains("Meeting notes"))
+    }
+
+    func test_screenContext_codingSummaryIncludesFileExtension() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", isActive: true),
+            window: WindowContent(title: "ChatManager.swift", textContent: "func sendMessage() {", uiElements: [], appName: "Xcode"),
+            contextType: .coding,
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("Editing: ChatManager.swift"))
+    }
+
+    func test_screenContext_codingSummaryIncludesCodePreview() {
+        let codeContent = "import Foundation\nclass Foo {\n    func bar() { }\n}"
+        let context = ScreenContext(
+            app: AppInfo(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", isActive: true),
+            window: WindowContent(title: "Foo.swift", textContent: codeContent, uiElements: [], appName: "Xcode"),
+            contextType: .coding,
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("Visible code:"))
+        XCTAssertTrue(summary.contains("import Foundation"))
+    }
+
+    func test_screenContext_codingLongCodeTruncatedWithEllipsis() {
+        let longCode = String(repeating: "let x = 1\n", count: 100)
+        let context = ScreenContext(
+            app: AppInfo(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", isActive: true),
+            window: WindowContent(title: "Big.swift", textContent: longCode, uiElements: [], appName: "Xcode"),
+            contextType: .coding,
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("..."), "Long code preview should be truncated with ...")
+    }
+
+    func test_screenContext_notesSummaryIncludesPreview() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Notes", bundleIdentifier: "com.apple.Notes", isActive: true),
+            window: WindowContent(title: "Shopping List", textContent: "Eggs, Milk, Bread", uiElements: [], appName: "Notes"),
+            contextType: .notes,
+            timestamp: Date()
+        )
+        let summary = context.summary
+        XCTAssertTrue(summary.contains("Note content:"))
+        XCTAssertTrue(summary.contains("Eggs, Milk, Bread"))
+    }
+
+    func test_screenContext_messagingSummary() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Slack", bundleIdentifier: "com.slack.Slack", isActive: true),
+            window: nil,
+            contextType: .messaging(platform: "Slack"),
+            timestamp: Date()
+        )
+        XCTAssertTrue(context.summary.contains("Messaging on Slack"))
+    }
+
+    func test_screenContext_browserSummaryIncludesURL() {
+        let context = ScreenContext(
+            app: AppInfo(name: "Safari", bundleIdentifier: "com.apple.Safari", isActive: true),
+            window: nil,
+            contextType: .browser(url: "https://docs.swift.org"),
+            timestamp: Date()
+        )
+        XCTAssertTrue(context.summary.contains("https://docs.swift.org"))
+    }
+
+    // MARK: - AppInfo Tests
+
+    func test_appInfo_properties() {
+        let info = AppInfo(name: "Finder", bundleIdentifier: "com.apple.finder", isActive: true)
+        XCTAssertEqual(info.name, "Finder")
+        XCTAssertEqual(info.bundleIdentifier, "com.apple.finder")
+        XCTAssertTrue(info.isActive)
+    }
+
+    // MARK: - WindowContent Tests
+
+    func test_windowContent_properties() {
+        let elements = [UIElementInfo(role: "AXButton", title: "OK", element: AXUIElementCreateSystemWide())]
+        let content = WindowContent(title: "Document.txt", textContent: "Hello", uiElements: elements, appName: "TextEdit")
+        XCTAssertEqual(content.title, "Document.txt")
+        XCTAssertEqual(content.textContent, "Hello")
+        XCTAssertEqual(content.appName, "TextEdit")
+        XCTAssertEqual(content.uiElements.count, 1)
+    }
+
+    // MARK: - UIElementInfo Tests
+
+    func test_uiElementInfo_properties() {
+        let element = AXUIElementCreateSystemWide()
+        let info = UIElementInfo(role: "AXTextField", title: "Search", element: element)
+        XCTAssertEqual(info.role, "AXTextField")
+        XCTAssertEqual(info.title, "Search")
+    }
+
+    // MARK: - EmailContext Tests
+
+    func test_emailContext_properties() {
+        let ctx = EmailContext(sender: "alice@example.com", subject: "Re: Project Update", bodyPreview: "Thanks for the update...")
+        XCTAssertEqual(ctx.sender, "alice@example.com")
+        XCTAssertEqual(ctx.subject, "Re: Project Update")
+        XCTAssertEqual(ctx.bodyPreview, "Thanks for the update...")
+    }
+
+    func test_emailContext_optionalFields() {
+        let ctx = EmailContext(sender: nil, subject: nil, bodyPreview: "Just a body")
+        XCTAssertNil(ctx.sender)
+        XCTAssertNil(ctx.subject)
+        XCTAssertEqual(ctx.bodyPreview, "Just a body")
+    }
+
+    // MARK: - ContextType Tests
+
+    func test_contextType_emailWithContext() {
+        let email = EmailContext(sender: "bob@test.com", subject: "Hello", bodyPreview: "body")
+        let type = ContextType.email(email)
+        if case .email(let ctx) = type {
+            XCTAssertEqual(ctx?.sender, "bob@test.com")
+        } else {
+            XCTFail("Expected .email case")
+        }
+    }
+
+    func test_contextType_emailWithNil() {
+        let type = ContextType.email(nil)
+        if case .email(let ctx) = type {
+            XCTAssertNil(ctx)
+        } else {
+            XCTFail("Expected .email case")
+        }
+    }
+
+    func test_contextType_browserWithURL() {
+        let type = ContextType.browser(url: "https://example.com")
+        if case .browser(let url) = type {
+            XCTAssertEqual(url, "https://example.com")
+        } else {
+            XCTFail("Expected .browser case")
+        }
+    }
+
+    func test_contextType_messagingPlatform() {
+        let type = ContextType.messaging(platform: "Messages")
+        if case .messaging(let platform) = type {
+            XCTAssertEqual(platform, "Messages")
+        } else {
+            XCTFail("Expected .messaging case")
+        }
+    }
+
+    func test_contextType_otherAppName() {
+        let type = ContextType.other(appName: "CustomApp")
+        if case .other(let name) = type {
+            XCTAssertEqual(name, "CustomApp")
+        } else {
+            XCTFail("Expected .other case")
+        }
+    }
+
+    // MARK: - AnalyzedContext Tests
+
+    func test_analyzedContext_naturalLanguageSummary_basic() {
+        let screen = ScreenContext(
+            app: AppInfo(name: "Safari", bundleIdentifier: "com.apple.Safari", isActive: true),
+            window: nil,
+            contextType: .browser(url: nil),
+            timestamp: Date()
+        )
+        let analyzed = AnalyzedContext(
+            screenContext: screen,
+            recognizedContacts: [],
+            relevantMemories: [],
+            suggestions: [],
+            analyzedAt: Date()
+        )
+        XCTAssertTrue(analyzed.naturalLanguageSummary.contains("Safari"))
+    }
+
+    func test_analyzedContext_naturalLanguageSummary_withContacts() {
+        let screen = ScreenContext(
+            app: AppInfo(name: "Mail", bundleIdentifier: "com.apple.mail", isActive: true),
+            window: nil,
+            contextType: .email(nil),
+            timestamp: Date()
+        )
+        let contact = RecognizedContact(
+            identifier: "john@test.com",
+            name: "John Smith",
+            memoryContext: "Project lead for Alpha",
+            relationship: "colleague"
+        )
+        let analyzed = AnalyzedContext(
+            screenContext: screen,
+            recognizedContacts: [contact],
+            relevantMemories: [],
+            suggestions: [],
+            analyzedAt: Date()
+        )
+        let summary = analyzed.naturalLanguageSummary
+        XCTAssertTrue(summary.contains("John Smith"))
+        XCTAssertTrue(summary.contains("colleague"))
+    }
+
+    func test_analyzedContext_naturalLanguageSummary_withMemories() {
+        let screen = ScreenContext(
+            app: AppInfo(name: "Notes", bundleIdentifier: "com.apple.Notes", isActive: true),
+            window: nil,
+            contextType: .notes,
+            timestamp: Date()
+        )
+        let analyzed = AnalyzedContext(
+            screenContext: screen,
+            recognizedContacts: [],
+            relevantMemories: ["User prefers dark mode", "Weekly review on Fridays"],
+            suggestions: [],
+            analyzedAt: Date()
+        )
+        let summary = analyzed.naturalLanguageSummary
+        XCTAssertTrue(summary.contains("Related info I remember"))
+        XCTAssertTrue(summary.contains("dark mode"))
+    }
+
+    func test_analyzedContext_naturalLanguageSummary_withSuggestion() {
+        let screen = ScreenContext(
+            app: AppInfo(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", isActive: true),
+            window: nil,
+            contextType: .coding,
+            timestamp: Date()
+        )
+        let suggestion = ContextSuggestion(
+            type: .offer,
+            text: "I can help explain this code",
+            action: "ask_about_code"
+        )
+        let analyzed = AnalyzedContext(
+            screenContext: screen,
+            recognizedContacts: [],
+            relevantMemories: [],
+            suggestions: [suggestion],
+            analyzedAt: Date()
+        )
+        XCTAssertTrue(analyzed.naturalLanguageSummary.contains("I can help explain this code"))
+    }
+
+    // MARK: - RecognizedContact Tests
+
+    func test_recognizedContact_properties() {
+        let contact = RecognizedContact(
+            identifier: "jane@corp.com",
+            name: "Jane Doe",
+            memoryContext: "VP of Engineering",
+            relationship: "manager"
+        )
+        XCTAssertEqual(contact.identifier, "jane@corp.com")
+        XCTAssertEqual(contact.name, "Jane Doe")
+        XCTAssertEqual(contact.memoryContext, "VP of Engineering")
+        XCTAssertEqual(contact.relationship, "manager")
+    }
+
+    func test_recognizedContact_nilRelationship() {
+        let contact = RecognizedContact(
+            identifier: "unknown@test.com",
+            name: "Unknown Person",
+            memoryContext: "Met at conference",
+            relationship: nil
+        )
+        XCTAssertNil(contact.relationship)
+    }
+
+    // MARK: - ContextSuggestion Tests
+
+    func test_contextSuggestion_types() {
+        let offer = ContextSuggestion(type: .offer, text: "Can I help?", action: "help")
+        let info = ContextSuggestion(type: .contextInfo, text: "FYI", action: "show_info")
+        let warning = ContextSuggestion(type: .warning, text: "Watch out!", action: "warn")
+        let reminder = ContextSuggestion(type: .reminder, text: "Don't forget", action: "remind")
+
+        if case .offer = offer.type {} else { XCTFail("Expected .offer") }
+        if case .contextInfo = info.type {} else { XCTFail("Expected .contextInfo") }
+        if case .warning = warning.type {} else { XCTFail("Expected .warning") }
+        if case .reminder = reminder.type {} else { XCTFail("Expected .reminder") }
+    }
+
+    // MARK: - ScreenReader Accessibility Check (Non-Intrusive)
+
+    @MainActor
+    func test_screenReader_hasAccessibilityPermissionReturnsBool() {
+        let result = ScreenReader.shared.hasAccessibilityPermission()
+        // In CI/test environment this may be true or false — just verify it returns without crashing
+        XCTAssertTrue(result == true || result == false)
+    }
+
+    @MainActor
+    func test_screenReader_debugLoggingIsGated() {
+        // Verify debug logging gate flag exists and is true
+        XCTAssertTrue(ScreenReader.debugLoggingIsGated,
+                       "Debug logging should be gated behind DebugSettings.fileLoggingEnabled")
+    }
+
+    @MainActor
+    func test_screenReader_getActiveAppReturnsSomething() {
+        // In test environment, there's always an active app (xctest runner or Xcode)
+        let app = ScreenReader.shared.getActiveApp()
+        // May be nil in headless CI, that's fine
+        if let app = app {
+            XCTAssertFalse(app.name.isEmpty)
+            XCTAssertFalse(app.bundleIdentifier.isEmpty)
+        }
+    }
+
+    // MARK: - Security: Malicious Content in Screen Data
+
+    func test_security_maliciousTextInWindowContent() {
+        let malicious = "<script>alert('xss')</script> DROP TABLE users; --"
+        let content = WindowContent(title: malicious, textContent: malicious, uiElements: [], appName: "Evil App")
+        // Data types should store as-is without executing
+        XCTAssertEqual(content.title, malicious)
+        XCTAssertEqual(content.textContent, malicious)
+    }
+
+    func test_security_extremelyLongTextContent() {
+        let hugeText = String(repeating: "A", count: 500_000)
+        let content = WindowContent(title: "Big Window", textContent: hugeText, uiElements: [], appName: "App")
+        XCTAssertEqual(content.textContent.count, 500_000)
+    }
+
+    func test_security_emptyStringsHandled() {
+        let context = ScreenContext(
+            app: AppInfo(name: "", bundleIdentifier: "", isActive: false),
+            window: WindowContent(title: "", textContent: "", uiElements: [], appName: ""),
+            contextType: .unknown,
+            timestamp: Date()
+        )
+        // Should not crash
+        let _ = context.summary
+    }
+
+    // MARK: - Tier 1: Window Position & Size Tests
+
+    func test_windowContent_positionAndSize() {
+        let content = WindowContent(
+            title: "Test",
+            textContent: "",
+            uiElements: [],
+            appName: "App",
+            position: CGPoint(x: 100, y: 200),
+            size: CGSize(width: 800, height: 600)
+        )
+        XCTAssertEqual(content.position?.x, 100)
+        XCTAssertEqual(content.position?.y, 200)
+        XCTAssertEqual(content.size?.width, 800)
+        XCTAssertEqual(content.size?.height, 600)
+    }
+
+    func test_windowContent_positionAndSizeDefaultNil() {
+        let content = WindowContent(title: "Test", textContent: "", uiElements: [], appName: "App")
+        XCTAssertNil(content.position)
+        XCTAssertNil(content.size)
+    }
+
+    // MARK: - Tier 1: Element State Tests
+
+    func test_uiElementInfo_enabledState() {
+        let element = AXUIElementCreateSystemWide()
+        let info = UIElementInfo(role: "AXButton", title: "Submit", element: element, isEnabled: true)
+        XCTAssertTrue(info.isEnabled)
+
+        let disabled = UIElementInfo(role: "AXButton", title: "Submit", element: element, isEnabled: false)
+        XCTAssertFalse(disabled.isEnabled)
+    }
+
+    func test_uiElementInfo_enabledDefaultsTrue() {
+        let element = AXUIElementCreateSystemWide()
+        let info = UIElementInfo(role: "AXButton", title: "OK", element: element)
+        XCTAssertTrue(info.isEnabled)
+    }
+
+    func test_uiElementInfo_valueProperty() {
+        let element = AXUIElementCreateSystemWide()
+        let textField = UIElementInfo(role: "AXTextField", title: "Search", element: element, value: "hello world")
+        XCTAssertEqual(textField.value, "hello world")
+
+        let noValue = UIElementInfo(role: "AXButton", title: "OK", element: element)
+        XCTAssertNil(noValue.value)
+    }
+
+    func test_uiElementInfo_frameProperty() {
+        let element = AXUIElementCreateSystemWide()
+        let frame = CGRect(x: 10, y: 20, width: 100, height: 30)
+        let info = UIElementInfo(role: "AXButton", title: "Click", element: element, frame: frame)
+        XCTAssertEqual(info.frame?.origin.x, 10)
+        XCTAssertEqual(info.frame?.size.width, 100)
+    }
+
+    func test_uiElementInfo_frameDefaultNil() {
+        let element = AXUIElementCreateSystemWide()
+        let info = UIElementInfo(role: "AXButton", title: "OK", element: element)
+        XCTAssertNil(info.frame)
+    }
+
+    // MARK: - Tier 2: Interaction Helper Tests
+
+    @MainActor
+    func test_screenReader_findElementByTitle() {
+        let element = AXUIElementCreateSystemWide()
+        let buttons = [
+            UIElementInfo(role: "AXButton", title: "Cancel", element: element),
+            UIElementInfo(role: "AXButton", title: "Submit Form", element: element),
+            UIElementInfo(role: "AXTextField", title: "Email", element: element)
+        ]
+        let content = WindowContent(title: "Form", textContent: "", uiElements: buttons, appName: "App")
+
+        let found = content.uiElements.first { $0.title.localizedCaseInsensitiveContains("submit") }
+        XCTAssertEqual(found?.title, "Submit Form")
+
+        let notFound = content.uiElements.first { $0.title.localizedCaseInsensitiveContains("delete") }
+        XCTAssertNil(notFound)
+    }
+
+    @MainActor
+    func test_screenReader_findElementsByRole() {
+        let element = AXUIElementCreateSystemWide()
+        let elements = [
+            UIElementInfo(role: "AXButton", title: "OK", element: element),
+            UIElementInfo(role: "AXTextField", title: "Name", element: element),
+            UIElementInfo(role: "AXButton", title: "Cancel", element: element),
+            UIElementInfo(role: "AXCheckBox", title: "Agree", element: element)
+        ]
+        let content = WindowContent(title: "Dialog", textContent: "", uiElements: elements, appName: "App")
+
+        let buttons = content.uiElements.filter { $0.role == "AXButton" }
+        XCTAssertEqual(buttons.count, 2)
+        XCTAssertEqual(buttons[0].title, "OK")
+        XCTAssertEqual(buttons[1].title, "Cancel")
+
+        let checkboxes = content.uiElements.filter { $0.role == "AXCheckBox" }
+        XCTAssertEqual(checkboxes.count, 1)
+    }
+
+    @MainActor
+    func test_screenReader_findElementCaseInsensitive() {
+        let element = AXUIElementCreateSystemWide()
+        let elements = [
+            UIElementInfo(role: "AXButton", title: "SUBMIT", element: element)
+        ]
+        let content = WindowContent(title: "Form", textContent: "", uiElements: elements, appName: "App")
+
+        let found = content.uiElements.first { $0.title.localizedCaseInsensitiveContains("submit") }
+        XCTAssertNotNil(found)
+        XCTAssertEqual(found?.title, "SUBMIT")
+    }
+}

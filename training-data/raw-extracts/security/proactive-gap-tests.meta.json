@@ -1,0 +1,1 @@
+{"name": "proactive-gap-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/ProactiveIntelligenceGapTests.swift", "line_count": 554, "why": "Serena red tests: ProactiveIntelligenceGapTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

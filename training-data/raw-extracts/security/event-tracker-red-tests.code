@@ -1,0 +1,289 @@
+import XCTest
+@testable import SerenaCore
+
+/// Red Tests: ConversationEventTracker — detects future events mentioned in conversation
+/// and tracks them for proactive follow-up.
+///
+/// These tests verify that:
+/// 1. "tomorrow" creates an event ~1 day out
+/// 2. "in N days" creates an event ~N days out
+/// 3. Day names (e.g. "Friday") resolve to the correct weekday
+/// 4. "next week" creates an event ~7 days out
+/// 5. Topic extraction pulls meaningful keywords
+/// 6. Past-tense / no-date messages return nil (no event tracked)
+///
+/// Target file:
+/// - Sources/SerenaCore/Services/TCA/ConversationEventTracker.swift
+@MainActor
+final class ConversationEventTrackerRedTests: XCTestCase {
+
+    private var tracker: ConversationEventTracker!
+
+    override func setUp() {
+        super.setUp()
+        tracker = ConversationEventTracker.shared
+        tracker.clearAllEvents()
+    }
+
+    override func tearDown() {
+        tracker.clearAllEvents()
+        super.tearDown()
+    }
+
+    // MARK: - Test 1: Tomorrow detection
+
+    /// "I have a meeting tomorrow" should create an event approximately 1 day from now,
+    /// with a topic containing "meeting".
+    func test_tomorrowDetection_tracksEventOneDayOut() {
+        let result = tracker.analyzeAndTrack(message: "I have a meeting tomorrow")
+
+        XCTAssertNotNil(result, "Should detect a future event from 'tomorrow'")
+
+        guard let result = result else { return }
+
+        // Topic should contain "meeting"
+        XCTAssertTrue(
+            result.event.topic.lowercased().contains("meeting"),
+            "Topic '\(result.event.topic)' should contain 'meeting'"
+        )
+
+        // Event date should be ~1 day from now
+        let daysOut = Calendar.current.dateComponents([.day], from: Date(), to: result.event.eventDate).day ?? 0
+        XCTAssertTrue(
+            daysOut >= 0 && daysOut <= 1,
+            "Event should be ~1 day out, got \(daysOut) days"
+        )
+
+        // Should be stored
+        let allEvents = tracker.getAllEvents()
+        XCTAssertEqual(allEvents.count, 1, "Should have exactly 1 tracked event")
+    }
+
+    // MARK: - Test 2: "in N days" detection
+
+    /// "I have an interview in 3 days" should create an event approximately 3 days from now.
+    func test_inNDaysDetection_tracksEventCorrectDaysOut() {
+        let result = tracker.analyzeAndTrack(message: "I have an interview in 3 days")
+
+        XCTAssertNotNil(result, "Should detect a future event from 'in 3 days'")
+
+        guard let result = result else { return }
+
+        let daysOut = Calendar.current.dateComponents([.day], from: Date(), to: result.event.eventDate).day ?? 0
+        XCTAssertTrue(
+            daysOut >= 2 && daysOut <= 3,
+            "Event should be ~3 days out, got \(daysOut) days"
+        )
+
+        XCTAssertTrue(
+            result.event.topic.lowercased().contains("interview"),
+            "Topic '\(result.event.topic)' should contain 'interview'"
+        )
+    }
+
+    // MARK: - Test 3: Day name detection
+
+    /// "I have a presentation on Friday" should create an event whose weekday is Friday (weekday=6).
+    func test_dayNameDetection_tracksCorrectDayOfWeek() {
+        let result = tracker.analyzeAndTrack(message: "I have a presentation on Friday")
+
+        XCTAssertNotNil(result, "Should detect a future event from day name 'Friday'")
+
+        guard let result = result else { return }
+
+        let weekday = Calendar.current.component(.weekday, from: result.event.eventDate)
+        // Friday = weekday 6 in Calendar (Sun=1, Mon=2, ... Fri=6, Sat=7)
+        XCTAssertEqual(weekday, 6, "Event weekday should be Friday (6), got \(weekday)")
+
+        // Event should be in the future
+        XCTAssertTrue(
+            result.event.eventDate > Date(),
+            "Event date should be in the future"
+        )
+
+        XCTAssertTrue(
+            result.event.topic.lowercased().contains("presentation"),
+            "Topic '\(result.event.topic)' should contain 'presentation'"
+        )
+    }
+
+    // MARK: - Test 4: "next week" detection
+
+    /// "I have a trip next week" should create an event approximately 7 days from now.
+    func test_nextWeekDetection_tracksEventSevenDaysOut() {
+        let result = tracker.analyzeAndTrack(message: "I have a trip next week")
+
+        XCTAssertNotNil(result, "Should detect a future event from 'next week'")
+
+        guard let result = result else { return }
+
+        let daysOut = Calendar.current.dateComponents([.day], from: Date(), to: result.event.eventDate).day ?? 0
+        XCTAssertTrue(
+            daysOut >= 6 && daysOut <= 7,
+            "Event should be ~7 days out, got \(daysOut) days"
+        )
+
+        XCTAssertTrue(
+            result.event.topic.lowercased().contains("trip"),
+            "Topic '\(result.event.topic)' should contain 'trip'"
+        )
+    }
+
+    // MARK: - Test 5: Topic extraction
+
+    /// "meeting with investors tomorrow" should extract a topic containing both
+    /// "meeting" and "investor" (the "X with Y" extraction pattern).
+    func test_topicExtraction_extractsMeaningfulTopic() {
+        let result = tracker.analyzeAndTrack(message: "meeting with investors tomorrow")
+
+        XCTAssertNotNil(result, "Should detect event from 'meeting with investors tomorrow'")
+
+        guard let result = result else { return }
+
+        let topic = result.event.topic.lowercased()
+        XCTAssertTrue(
+            topic.contains("meeting"),
+            "Topic '\(result.event.topic)' should contain 'meeting'"
+        )
+        XCTAssertTrue(
+            topic.contains("investor"),
+            "Topic '\(result.event.topic)' should contain 'investor'"
+        )
+    }
+
+    // MARK: - Test 6: No future date → nil
+
+    /// "I had a great meeting yesterday" should return nil because there is no
+    /// future date pattern. The tracker only tracks future events.
+    func test_noDateMessage_returnsNil() {
+        let result = tracker.analyzeAndTrack(message: "I had a great meeting yesterday")
+
+        XCTAssertNil(result, "Past-tense message with no future date should return nil")
+
+        // No events should be stored
+        let allEvents = tracker.getAllEvents()
+        XCTAssertEqual(allEvents.count, 0, "No events should be tracked for past-tense messages")
+    }
+
+    // MARK: - Test 7: Follow-up timing is eventDate + 5 minutes
+
+    /// Tracking "exam tomorrow" should set followUpDate to exactly 5 minutes after eventDate.
+    func test_followUpTiming_isEventDatePlusFiveMinutes() {
+        let result = tracker.analyzeAndTrack(message: "I have an exam tomorrow")
+
+        XCTAssertNotNil(result, "Should detect a future event from 'exam tomorrow'")
+
+        guard let result = result else { return }
+
+        let minutesBetween = Calendar.current.dateComponents(
+            [.minute],
+            from: result.event.eventDate,
+            to: result.event.followUpDate
+        ).minute ?? 0
+
+        XCTAssertEqual(
+            minutesBetween, 5,
+            "followUpDate should be exactly 5 minutes after eventDate, got \(minutesBetween) minutes"
+        )
+    }
+
+    // MARK: - Test 8: Follow-up question is context-aware
+
+    /// Tracking "interview tomorrow" should produce a followUpQuestion that mentions "interview".
+    func test_followUpQuestion_isContextAware() {
+        let result = tracker.analyzeAndTrack(message: "I have an interview tomorrow")
+
+        XCTAssertNotNil(result, "Should detect a future event from 'interview tomorrow'")
+
+        guard let result = result else { return }
+
+        XCTAssertFalse(
+            result.event.followUpQuestion.isEmpty,
+            "followUpQuestion should not be empty"
+        )
+        XCTAssertTrue(
+            result.event.followUpQuestion.lowercased().contains("interview"),
+            "followUpQuestion '\(result.event.followUpQuestion)' should contain 'interview'"
+        )
+    }
+
+    // MARK: - Test 9: Outcome detection resolves tracked event
+
+    /// After tracking "interview tomorrow", calling checkForOutcomeMention with
+    /// "the interview went well" should resolve the event (status = .resolved).
+    func test_outcomeDetection_resolvesTrackedEvent() {
+        let result = tracker.analyzeAndTrack(message: "I have an interview tomorrow")
+        XCTAssertNotNil(result, "Should detect a future event")
+
+        guard let result = result else { return }
+
+        tracker.checkForOutcomeMention("the interview went well")
+
+        let allEvents = tracker.getAllEvents()
+        let matched = allEvents.first { $0.id == result.event.id }
+
+        XCTAssertNotNil(matched, "Event should still exist after outcome mention")
+        XCTAssertEqual(
+            matched?.status, .resolved,
+            "Event status should be .resolved after outcome mention, got \(String(describing: matched?.status))"
+        )
+    }
+
+    // MARK: - Test 10: Deduplication — same event tracked once
+
+    /// Tracking "meeting tomorrow" twice with similar wording should result in only 1 event.
+    func test_dedup_sameEventTrackedOnce() {
+        let _ = tracker.analyzeAndTrack(message: "I have a meeting tomorrow")
+        let _ = tracker.analyzeAndTrack(message: "My meeting is tomorrow")
+
+        let allEvents = tracker.getAllEvents()
+        let meetingEvents = allEvents.filter { $0.topic.lowercased().contains("meeting") }
+
+        XCTAssertEqual(
+            meetingEvents.count, 1,
+            "Should have exactly 1 meeting event after dedup, got \(meetingEvents.count)"
+        )
+    }
+
+    // MARK: - Test 11: Events needing follow-up — future follow-up date returns empty
+
+    /// After tracking "exam tomorrow", getEventsNeedingFollowUp() should return empty
+    /// because the follow-up date is in the future (eventDate + 2 days > now).
+    func test_eventsNeedingFollowUp_returnsOverdueEvents() {
+        let result = tracker.analyzeAndTrack(message: "I have an exam tomorrow")
+        XCTAssertNotNil(result, "Should detect a future event")
+
+        let needingFollowUp = tracker.getEventsNeedingFollowUp()
+
+        XCTAssertTrue(
+            needingFollowUp.isEmpty,
+            "No events should need follow-up yet (follow-up date is in the future), got \(needingFollowUp.count)"
+        )
+    }
+
+    // MARK: - Test 12: markAsFollowedUp changes status and sets date
+
+    /// After tracking an event, calling markAsFollowedUp should set status to .followedUp
+    /// and set followedUpDate to a non-nil value.
+    func test_markAsFollowedUp_changesStatusAndSetsDate() {
+        let result = tracker.analyzeAndTrack(message: "I have a meeting tomorrow")
+        XCTAssertNotNil(result, "Should detect a future event")
+
+        guard let result = result else { return }
+
+        tracker.markAsFollowedUp(eventId: result.event.id)
+
+        let allEvents = tracker.getAllEvents()
+        let matched = allEvents.first { $0.id == result.event.id }
+
+        XCTAssertNotNil(matched, "Event should still exist after marking as followed up")
+        XCTAssertEqual(
+            matched?.status, .followedUp,
+            "Event status should be .followedUp, got \(String(describing: matched?.status))"
+        )
+        XCTAssertNotNil(
+            matched?.followedUpDate,
+            "followedUpDate should be set after markAsFollowedUp"
+        )
+    }
+}

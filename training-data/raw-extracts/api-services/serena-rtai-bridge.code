@@ -1,0 +1,1088 @@
+import Foundation
+import os.log
+
+// DEBUG: File-based logging for RTAIBridge (disabled in production)
+private func rtaiBridgeDebugLog(_ message: String) {
+    guard DebugSettings.fileLoggingEnabled else { return }
+    let logPath = NSHomeDirectory() + "/Documents/serena_rtai_bridge_debug.log"
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logLine = "[\(timestamp)] \(message)\n"
+    guard let logData = logLine.data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: logPath) {
+        handle.seekToEndOfFile()
+        handle.write(logData)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: logPath, contents: logData)
+    }
+}
+
+/// Swift bridge to the FolkTech RTAI Rust backend
+/// This provides a clean interface for Serena to use the real RTAI system
+/// Now integrates with Mitosis learned patterns for adaptive instant responses
+@MainActor
+class RTAIBridge: ObservableObject {
+    private let logger = Logger(subsystem: "com.serenanet.rtai", category: "RTAIBridge")
+    private var libraryHandle: UnsafeMutableRawPointer?
+    private var isInitialized = false
+    private var isStarted = false
+    private var hasCompletedFirstQuery = false
+
+    /// Integration with Mitosis-learned patterns
+    private lazy var mitosisIntegration = MitosisRTAIIntegration.shared
+
+    /// Mitosis cell orchestrator for specialized cell-based execution
+    private lazy var mitosisOrchestrator = MitosisOrchestrator.shared
+
+    /// Swift FTAI parser for knowledge base lookup (fallback when Rust library unavailable)
+    private lazy var swiftFTAIParser = SwiftFTAIParser.shared
+    
+    // Function pointers to Rust RTAI functions
+    // Use C-compatible types: Int32 for i32, UInt8 for bool (Rust bool = 1 byte)
+    private var rtai_init: (@convention(c) (Int32, UInt8, UInt8, UInt64) -> UInt8)?
+    private var rtai_start: (@convention(c) () -> UInt8)?
+    private var rtai_shutdown: (@convention(c) () -> UInt8)?
+    private var rtai_health_check: (@convention(c) () -> UInt8)?
+    private var rtai_process_text: UnsafeMutableRawPointer?
+    private var rtai_free_result: UnsafeMutableRawPointer?
+    
+    init() {
+        loadRTAILibrary()
+    }
+    
+    deinit {
+        // Note: Can't call async shutdown in deinit
+        if let handle = libraryHandle {
+            // Call shutdown function directly if available
+            if let shutdownFunc = rtai_shutdown {
+                _ = shutdownFunc()
+            }
+            dlclose(handle)
+        }
+    }
+    
+    // MARK: - Library Loading
+    
+    private func loadRTAILibrary() {
+        // Use SerenaConfig for RTAI library path (supports environment variables)
+        let config = SerenaConfig.shared
+
+        // Only try to load if RTAI is enabled
+        guard config.features.rtaiEnabled else {
+            logger.info("ℹ️ RTAI is disabled in configuration")
+            return
+        }
+
+        // Build list of paths to try
+        var possiblePaths: [String] = []
+
+        // 1. Try app bundle Resources first (for DMG distribution)
+        if let bundleResourcesURL = Bundle.main.resourceURL {
+            let bundledLibPath = bundleResourcesURL
+                .appendingPathComponent("Libraries")
+                .appendingPathComponent("libfolktech_rtai.dylib")
+                .path
+            possiblePaths.append(bundledLibPath)
+        }
+
+        // 2. Try configured path (from env var or config file)
+        if let configuredPath = config.paths.rtaiLibrary {
+            possiblePaths.append(configuredPath)
+        }
+
+        // 3. Try standard locations as fallback
+        possiblePaths.append(contentsOf: [
+            "\(config.paths.projectRoot)/Libraries/libfolktech_rtai.dylib",  // Check Libraries/ first
+            "\(config.paths.projectRoot)/libfolktech_rtai.dylib",
+            "./libfolktech_rtai.dylib",
+            "./Libraries/libfolktech_rtai.dylib",
+            "/usr/local/lib/libfolktech_rtai.dylib",
+            "/opt/homebrew/lib/libfolktech_rtai.dylib"
+        ])
+
+        for path in possiblePaths {
+            if let handle = dlopen(path, RTLD_NOW) {
+                logger.info("✅ Loaded RTAI library from: \(path)")
+                libraryHandle = handle
+                loadFunctionPointers()
+                return
+            }
+        }
+
+        logger.warning("⚠️ Failed to load RTAI library from any location")
+        logger.debug("💡 Set SERENA_RTAI_LIBRARY environment variable to specify location")
+        logger.debug("💡 Or build the Rust RTAI library and place it in project root")
+    }
+    
+    private func loadFunctionPointers() {
+        guard let handle = libraryHandle else { return }
+
+        // Load function pointers using unsafeBitCast (dlsym returns pointer to function, not pointer to pointer)
+        if let ptr = dlsym(handle, "rtai_init") {
+            rtai_init = unsafeBitCast(ptr, to: (@convention(c) (Int32, UInt8, UInt8, UInt64) -> UInt8).self)
+        }
+        if let ptr = dlsym(handle, "rtai_start") {
+            rtai_start = unsafeBitCast(ptr, to: (@convention(c) () -> UInt8).self)
+        }
+        if let ptr = dlsym(handle, "rtai_shutdown") {
+            rtai_shutdown = unsafeBitCast(ptr, to: (@convention(c) () -> UInt8).self)
+        }
+        if let ptr = dlsym(handle, "rtai_health_check") {
+            rtai_health_check = unsafeBitCast(ptr, to: (@convention(c) () -> UInt8).self)
+        }
+        rtai_process_text = dlsym(handle, "rtai_process_text")
+        rtai_free_result = dlsym(handle, "rtai_free_result")
+        
+        let functionsLoaded = (rtai_init != nil) && (rtai_start != nil) && (rtai_shutdown != nil) && (rtai_health_check != nil) && (rtai_process_text != nil) && (rtai_free_result != nil)
+        
+        if functionsLoaded {
+            logger.info("✅ Successfully loaded all RTAI function pointers (including process_text)")
+        } else {
+            logger.error("❌ Failed to load some RTAI function pointers")
+            logger.error("   - rtai_init: \(self.rtai_init != nil)")
+            logger.error("   - rtai_start: \(self.rtai_start != nil)")
+            logger.error("   - rtai_shutdown: \(self.rtai_shutdown != nil)")
+            logger.error("   - rtai_health_check: \(self.rtai_health_check != nil)")
+            logger.error("   - rtai_process_text: \(self.rtai_process_text != nil)")
+            logger.error("   - rtai_free_result: \(self.rtai_free_result != nil)")
+        }
+    }
+    
+    // MARK: - RTAI System Management
+    
+    /// Initialize the RTAI system
+    func initialize(maxCells: Int = 8, zeroMode: Bool = true, infinityMode: Bool = true) -> Bool {
+        guard !isInitialized else {
+            logger.info("⚠️ RTAI already initialized")
+            return true
+        }
+
+        logger.info("🚀 Initializing RTAI system...")
+
+        // ALWAYS try to initialize Rust RTAI if available (loads .ftai files)
+        var rustInitialized = false
+        if let initFunc = rtai_init {
+            logger.debug("🦀 Initializing Rust RTAI library (loads .ftai fact files)...")
+
+            // CRITICAL: The Rust library looks for rtai-library/ relative to the current
+            // working directory. For distributed apps, we need to temporarily change to
+            // the app bundle's Resources folder where rtai-library/ is bundled.
+            let originalDir = FileManager.default.currentDirectoryPath
+            var changedDir = false
+
+            if let bundleResourcesURL = Bundle.main.resourceURL {
+                let rtaiLibPath = bundleResourcesURL.appendingPathComponent("rtai-library")
+                if FileManager.default.fileExists(atPath: rtaiLibPath.path) {
+                    logger.debug("📦 Found bundled rtai-library, changing to Resources dir")
+                    FileManager.default.changeCurrentDirectoryPath(bundleResourcesURL.path)
+                    changedDir = true
+                }
+            }
+
+            let result = initFunc(Int32(maxCells), zeroMode ? 1 : 0, infinityMode ? 1 : 0, 1000)
+
+            // Restore original directory
+            if changedDir {
+                FileManager.default.changeCurrentDirectoryPath(originalDir)
+            }
+
+            if result == 0 {
+                logger.error("❌ Rust RTAI initialization failed - will use Swift fallback only")
+            } else {
+                rustInitialized = true
+                logger.debug("✅ Rust RTAI initialized - .ftai facts loaded")
+            }
+        } else {
+            logger.info("ℹ️ Rust RTAI library not loaded, using Swift patterns only")
+        }
+
+        // Mark as initialized (Swift fallback always available)
+        isInitialized = true
+        isStarted = true
+
+        // ALWAYS initialize Swift FTAI parser as fallback for knowledge base lookup
+        #if DEBUG
+        print("📚 [RTAIBridge] Initializing SwiftFTAIParser...")
+        #endif
+        let swiftParserReady = self.swiftFTAIParser.initialize()
+        if swiftParserReady {
+            logger.info("✅ Swift FTAI parser loaded \(self.swiftFTAIParser.factCount) facts from \(self.swiftFTAIParser.loadedFileCount) files")
+            #if DEBUG
+            print("✅ [RTAIBridge] SwiftFTAIParser loaded \(self.swiftFTAIParser.factCount) facts")
+            #endif
+        } else {
+            logger.warning("⚠️ Swift FTAI parser failed to initialize")
+            #if DEBUG
+            print("⚠️ [RTAIBridge] SwiftFTAIParser failed to initialize")
+            #endif
+        }
+
+        if rustInitialized {
+            logger.info("✅ RTAI ready: Rust FTAI facts + Swift patterns")
+            #if DEBUG
+            print("✅ [RTAIBridge] RTAI ready: Rust + Swift patterns")
+            #endif
+        } else if swiftParserReady {
+            logger.info("✅ RTAI ready: Swift FTAI parser (\(self.swiftFTAIParser.factCount) facts) + Swift patterns")
+            #if DEBUG
+            print("✅ [RTAIBridge] RTAI ready: SwiftFTAIParser (\(self.swiftFTAIParser.factCount) facts)")
+            #endif
+        } else {
+            logger.info("✅ RTAI ready: Swift patterns only (no knowledge base)")
+            #if DEBUG
+            print("⚠️ [RTAIBridge] RTAI ready: Swift patterns only (no knowledge base)")
+            #endif
+        }
+
+        // Initialize MitosisOrchestrator for cell-based execution
+        if FeatureFlags.mitosisEnabled {
+            // Access the lazy property to trigger initialization
+            let triggers = mitosisOrchestrator.getRegisteredTriggers()
+            logger.info("🧬 MitosisOrchestrator ready: \(triggers.count) cell triggers registered")
+            #if DEBUG
+            print("🧬 [RTAIBridge] MitosisOrchestrator ready: \(triggers.count) cell triggers")
+            #endif
+        } else {
+            logger.info("ℹ️ MitosisOrchestrator disabled via FeatureFlags")
+            #if DEBUG
+            print("ℹ️ [RTAIBridge] MitosisOrchestrator disabled")
+            #endif
+        }
+
+        return true
+    }
+    
+    /// Start the RTAI system
+    func start() -> Bool {
+        guard isInitialized else {
+            logger.error("❌ Cannot start RTAI - not initialized")
+            return false
+        }
+
+        guard !isStarted else {
+            logger.info("⚠️ RTAI already started")
+            return true
+        }
+
+        // Already started in fallback mode during initialize()
+        logger.info("✅ RTAI system ready (Swift fallback mode)")
+        isStarted = true
+
+        return true
+    }
+    
+    /// Shutdown the RTAI system
+    func shutdown() -> Bool {
+        guard let shutdownFunc = rtai_shutdown else {
+            return true // If library not loaded, consider it shut down
+        }
+        
+        guard isInitialized else {
+            return true // If not initialized, consider it shut down
+        }
+        
+        logger.info("🔄 Shutting down RTAI system...")
+
+        let successC = shutdownFunc()
+        let success = successC != 0
+
+        if success {
+            isInitialized = false
+            isStarted = false
+            logger.info("✅ RTAI shutdown successful")
+        } else {
+            logger.error("❌ RTAI shutdown failed")
+        }
+
+        return success
+    }
+    
+    /// Check if RTAI system is healthy
+    func healthCheck() -> Bool {
+        guard let healthFunc = rtai_health_check else {
+            return false
+        }
+        
+        guard isInitialized else {
+            return false
+        }
+
+        let healthyC = healthFunc()
+        let healthy = healthyC != 0
+        logger.debug("🏥 RTAI health check: \(healthy ? "healthy" : "unhealthy")")
+        return healthy
+    }
+    
+    // MARK: - Processing (Simplified for MVP)
+
+    /// Process text input through RTAI system with intelligent responses
+    func processText(_ input: String, context: [Message] = []) async -> RTAIProcessingResult {
+        // CRITICAL: Early rejection of help/conversational queries that should go to LLM
+        // This MUST run before any tier processing to prevent fact lookups on complex requests
+        let lowerInput = input.lowercased()
+        let helpIndicators = [
+            "help me", "help with", "build a", "build me", "create a", "create me",
+            "write a", "write me", "make a", "make me", "implement", "code for",
+            "how do i", "how to", "can you help", "i need to", "i want to",
+            "show me how", "teach me", "explain how", "guide me", "walk me through",
+            "give me a", "write code", "write some", "generate", "develop",
+            "design a", "set up", "configure", "install", "debug", "fix my"
+        ]
+
+        for indicator in helpIndicators {
+            if lowerInput.contains(indicator) {
+                rtaiBridgeDebugLog("🚫 REJECTED: Help/conversational query detected ('\(indicator)') - routing to LLM")
+                logger.debug("🚫 RTAI rejecting help query: '\(input.prefix(40))...' - routing to LLM")
+                return RTAIProcessingResult(
+                    success: false,
+                    response: "",
+                    processingTimeMs: 0,
+                    confidence: 0.0,
+                    errorMessage: nil
+                )
+            }
+        }
+
+        // DEBUG: File-based logging for troubleshooting (always visible)
+        rtaiBridgeDebugLog("🔍 processText ENTRY: '\(input.prefix(60))'")
+        rtaiBridgeDebugLog("🔍 State: isInitialized=\(self.isInitialized), isStarted=\(self.isStarted), isSystemReady=\(self.isSystemReady)")
+        rtaiBridgeDebugLog("🔍 SwiftFTAI: isInit=\(self.swiftFTAIParser.isInitialized), factCount=\(self.swiftFTAIParser.factCount)")
+
+        // DEBUG: Log state for troubleshooting
+        logger.debug("🔍 DEBUG RTAIBridge.processText: isInitialized=\(self.isInitialized), isStarted=\(self.isStarted), isSystemReady=\(self.isSystemReady)")
+        logger.debug("🔍 DEBUG RTAIBridge.processText: swiftFTAIParser.isInitialized=\(self.swiftFTAIParser.isInitialized), factCount=\(self.swiftFTAIParser.factCount)")
+        #if DEBUG
+        print("🔍 DEBUG RTAIBridge: isSystemReady=\(self.isSystemReady), parserInit=\(self.swiftFTAIParser.isInitialized), facts=\(self.swiftFTAIParser.factCount)")
+        #endif
+
+        guard isSystemReady else {
+            rtaiBridgeDebugLog("❌ RTAI system not ready! isInitialized=\(self.isInitialized), isStarted=\(self.isStarted)")
+            logger.error("❌ RTAI system not ready! isInitialized=\(self.isInitialized), isStarted=\(self.isStarted)")
+            #if DEBUG
+            print("❌ RTAI system not ready! isInitialized=\(self.isInitialized), isStarted=\(self.isStarted)")
+            #endif
+            return RTAIProcessingResult(
+                success: false,
+                response: "",
+                processingTimeMs: 0,
+                confidence: 0.0,
+                errorMessage: "RTAI system not ready"
+            )
+        }
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        logger.debug("🦀 Processing text input through RTAI system (\(input.count) chars, context: \(context.count) messages)")
+
+        // TIER 1: Try Rust RTAI library first (loads .ftai files with facts)
+        if let processFunc = rtai_process_text {
+            logger.debug("🦀 Calling Rust RTAI backend for query: '\(input.prefix(50))...'")
+
+            // Call Rust rtai_process_text via raw pointer manipulation
+            // CRTAIResult layout: success(u8) + padding(7) + response(ptr) + time(u64) + confidence(f64) + error(ptr)
+            // Total size: 40 bytes on 64-bit
+
+            let rustResult = input.withCString { inputPtr -> (success: Bool, response: String, confidence: Double) in
+                // Allocate buffer for result struct (40 bytes)
+                let resultBuffer = UnsafeMutableRawPointer.allocate(byteCount: 40, alignment: 8)
+                defer { resultBuffer.deallocate() }
+
+                // Call the Rust function
+                typealias ProcessTextFn = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Void
+                // Actually, rtai_process_text returns the struct directly, not via out param
+                // Let's use a simpler approach - call it and read the return value
+
+                typealias ProcessTextFnDirect = @convention(c) (UnsafePointer<CChar>) -> UnsafeMutableRawPointer
+                let rustProcess = unsafeBitCast(processFunc, to: ProcessTextFnDirect.self)
+
+                let resultPtr = rustProcess(inputPtr)
+
+                // Read fields from the returned struct pointer
+                // Layout: u8 success, 7 padding, ptr response, u64 time, f64 confidence, ptr error
+                let success = resultPtr.load(fromByteOffset: 0, as: UInt8.self) != 0
+                let responsePtr = resultPtr.load(fromByteOffset: 8, as: UnsafePointer<CChar>?.self)
+                let confidence = resultPtr.load(fromByteOffset: 24, as: Double.self)
+
+                var response = ""
+                if let rPtr = responsePtr {
+                    response = String(cString: rPtr)
+                }
+
+                // Free the result
+                if let freeFunc = self.rtai_free_result {
+                    typealias FreeFn = @convention(c) (UnsafeMutableRawPointer) -> Void
+                    let rustFree = unsafeBitCast(freeFunc, to: FreeFn.self)
+                    rustFree(resultPtr)
+                }
+
+                return (success, response, confidence)
+            }
+
+            let processingTime = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+
+            // Check if Rust returned a high-confidence result
+            if rustResult.success && rustResult.confidence >= 0.80 && !rustResult.response.isEmpty {
+                logger.info("✅ Rust RTAI returned high-confidence result: \(rustResult.confidence) in \(processingTime)ms")
+
+                // Track RTAI hit for analytics
+                AnalyticsManager.shared.trackRTAIHit()
+                trackResponseTime(ms: Double(processingTime), tier: "rust")
+
+                return RTAIProcessingResult(
+                    success: true,
+                    response: rustResult.response,
+                    processingTimeMs: processingTime,
+                    confidence: rustResult.confidence,
+                    errorMessage: nil
+                )
+            }
+
+            logger.debug("🔄 Rust RTAI confidence too low (\(rustResult.confidence)), falling back to Swift FTAI parser")
+        }
+
+        // TIER 1.5: Try Swift FTAI parser for knowledge base lookups
+        rtaiBridgeDebugLog("🔍 TIER 1.5: Checking SwiftFTAIParser (isInit=\(self.swiftFTAIParser.isInitialized), factCount=\(self.swiftFTAIParser.factCount))")
+        logger.debug("🔍 TIER 1.5: Checking SwiftFTAIParser (isInitialized=\(self.swiftFTAIParser.isInitialized), factCount=\(self.swiftFTAIParser.factCount))")
+        #if DEBUG
+        print("🔍 TIER 1.5: SwiftFTAIParser isInitialized=\(self.swiftFTAIParser.isInitialized), factCount=\(self.swiftFTAIParser.factCount)")
+        #endif
+
+        if swiftFTAIParser.isInitialized {
+            rtaiBridgeDebugLog("🔍 TIER 1.5: Calling lookupQuery for: '\(input)'")
+            logger.debug("🔍 TIER 1.5: Calling lookupQuery for: '\(input)'")
+            #if DEBUG
+            print("🔍 TIER 1.5: Calling lookupQuery for: '\(input)'")
+            #endif
+
+            if let result = swiftFTAIParser.lookupQuery(input) {
+                let processingTime = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+                rtaiBridgeDebugLog("✅ TIER 1.5 HIT: confidence=\(result.confidence), response='\(result.response.prefix(80))'")
+                logger.info("✅ Swift FTAI parser returned result (confidence: \(result.confidence)) in \(processingTime)ms")
+                #if DEBUG
+                print("✅ FTAI HIT: \(result.response.prefix(100))")
+                #endif
+
+                // Track RTAI hit for analytics
+                AnalyticsManager.shared.trackRTAIHit()
+                trackResponseTime(ms: Double(processingTime), tier: "ftai")
+
+                return RTAIProcessingResult(
+                    success: true,
+                    response: result.response,
+                    processingTimeMs: processingTime,
+                    confidence: result.confidence,
+                    errorMessage: nil
+                )
+            } else {
+                rtaiBridgeDebugLog("❌ TIER 1.5: lookupQuery returned nil for: '\(input)'")
+                logger.debug("❌ TIER 1.5: SwiftFTAIParser.lookupQuery returned nil for: '\(input)'")
+                #if DEBUG
+                print("❌ TIER 1.5: lookupQuery returned nil for: '\(input)'")
+                #endif
+            }
+        } else {
+            rtaiBridgeDebugLog("⚠️ TIER 1.5: SwiftFTAIParser NOT INITIALIZED!")
+            logger.warning("⚠️ TIER 1.5: SwiftFTAIParser not initialized!")
+            #if DEBUG
+            print("⚠️ TIER 1.5: SwiftFTAIParser NOT INITIALIZED!")
+            #endif
+        }
+
+        // TIER 1.7: Try MitosisOrchestrator for specialized cell-based execution
+        // This handles medical protocols, medication lookups, and other cell-based tasks
+        if FeatureFlags.mitosisEnabled && mitosisOrchestrator.canHandle(input) {
+            logger.debug("🧬 TIER 1.7: MitosisOrchestrator can handle query, executing...")
+            #if DEBUG
+            print("🧬 TIER 1.7: MitosisOrchestrator matched for: '\(input.prefix(50))'")
+            #endif
+
+            do {
+                let cellResponse = try await mitosisOrchestrator.execute(input: input, context: [:])
+                let processingTime = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+
+                logger.debug("✅ Mitosis cell executed in \(cellResponse.processingTime * 1000)ms (total: \(processingTime)ms)")
+                #if DEBUG
+                print("✅ MITOSIS HIT: \(cellResponse.content.prefix(100))")
+                #endif
+
+                // Check if we triggered replication (for monitoring)
+                let stats = mitosisOrchestrator.stats
+                if stats.totalReplications > 0 {
+                    logger.debug("🧬 Mitosis stats: \(stats.totalCells) cells, \(stats.totalReplications) replications, \(stats.totalExecutions) executions")
+                }
+
+                // Track RTAI hit for analytics (Mitosis cell hit counts as RTAI)
+                AnalyticsManager.shared.trackRTAIHit()
+                trackResponseTime(ms: Double(processingTime), tier: "mitosis")
+
+                return RTAIProcessingResult(
+                    success: true,
+                    response: cellResponse.content,
+                    processingTimeMs: processingTime,
+                    confidence: 0.92, // High confidence for cell-based responses
+                    errorMessage: nil
+                )
+            } catch {
+                logger.warning("⚠️ TIER 1.7: MitosisOrchestrator execution failed: \(error.localizedDescription)")
+                #if DEBUG
+                print("⚠️ TIER 1.7: Mitosis execution failed: \(error.localizedDescription)")
+                #endif
+                // Fall through to next tier
+            }
+        }
+
+        // TIER 2: Check for user-context queries (my wife, my favorite, etc.)
+        if let userResponse = await checkUserContextQuery(input) {
+            let processingTime = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+            logger.debug("👤 User fact lookup returned result in \(processingTime)ms")
+
+            AnalyticsManager.shared.trackRTAIHit()
+            trackResponseTime(ms: Double(processingTime), tier: "user")
+
+            return RTAIProcessingResult(
+                success: true,
+                response: userResponse,
+                processingTimeMs: processingTime,
+                confidence: 0.95,
+                errorMessage: nil
+            )
+        }
+
+        // TIER 3: Fall back to Swift pattern matching (hardcoded responses for greetings, etc.)
+        let response = generateIntelligentResponse(for: input, context: context)
+
+        let processingTime = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+        let confidence = determineConfidence(for: input, context: context)
+
+        logger.debug("✅ RTAI processing completed in \(processingTime)ms")
+
+        // Track RTAI hit or miss based on confidence
+        // Low confidence (< 0.5) means we're just returning a generic/empty response -> miss
+        if confidence >= 0.5 && !response.isEmpty {
+            AnalyticsManager.shared.trackRTAIHit()
+        } else {
+            AnalyticsManager.shared.trackRTAIMiss()
+        }
+        trackResponseTime(ms: Double(processingTime), tier: "fallback")
+
+        return RTAIProcessingResult(
+            success: true,
+            response: response,
+            processingTimeMs: processingTime,
+            confidence: confidence,
+            errorMessage: nil
+        )
+    }
+    
+    // MARK: - Private Helpers
+    
+    /// Track response time, separating cold start from regular queries
+    private func trackResponseTime(ms: Double, tier: String) {
+        if !hasCompletedFirstQuery {
+            hasCompletedFirstQuery = true
+            AnalyticsManager.shared.trackRTAIColdStart(ms: ms)
+        } else {
+            AnalyticsManager.shared.trackRTAIResponseTime(ms: ms, tier: tier)
+        }
+    }
+
+    private var isSystemReady: Bool {
+        // In fallback mode, we only need initialized and started flags
+        // Library handle is optional (only needed for Rust backend)
+        return isInitialized && isStarted
+    }
+    
+    private func generateIntelligentResponse(for input: String, context: [Message]) -> String {
+        let lowercased = input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // FIRST: Check Mitosis-learned patterns (adaptive learning from user interactions)
+        if let (learnedPattern, confidence) = mitosisIntegration.matchLearnedPattern(input) {
+            if confidence >= 0.80 {
+                logger.debug("📚 Using Mitosis-learned pattern: \(learnedPattern.id) (confidence: \(confidence))")
+                return learnedPattern.generateResponse()
+            }
+        }
+
+        // Check conversation history for context-aware responses
+        let hasConversationHistory = !context.isEmpty
+
+        // ===========================================
+        // GREETINGS (instant responses) - ONLY for short, pure greetings
+        // ===========================================
+        let greetings = ["hi", "hello", "hey", "howdy", "greetings", "yo", "sup", "hiya", "good morning", "good afternoon", "good evening"]
+
+        // Only match greetings if the message is SHORT (< 30 chars) - otherwise send to LLM
+        // This prevents "good morning, today is a big day..." from being intercepted
+        let isShortMessage = input.count < 30
+        let isGreeting = isShortMessage && (greetings.contains(lowercased) || greetings.contains(where: { lowercased.hasPrefix($0 + " ") || lowercased.hasPrefix($0 + "!") || lowercased.hasPrefix($0 + ",") }))
+
+        if isGreeting {
+            let timeOfDay = getTimeOfDayGreeting()
+            if hasConversationHistory {
+                return ["Hello again! What else can I help you with?",
+                        "Hey! Good to hear from you again.",
+                        "Hi there! Ready to help with anything else."].randomElement()!
+            }
+            return ["\(timeOfDay)! How can I help you today?",
+                    "Hello! I'm Serena, your AI assistant. What can I do for you?",
+                    "Hey there! What's on your mind?"].randomElement()!
+        }
+
+        // ===========================================
+        // EMOTIONAL INTELLIGENCE - Positive emotions
+        // ===========================================
+
+        // "How are you" variations
+        if lowercased.contains("how are you") || lowercased.contains("how're you") || lowercased.contains("how you doing") {
+            return ["I'm doing great, thanks for asking! How are you doing?",
+                    "I'm wonderful! Always happy to chat. How about you?",
+                    "Doing well! Ready to help with whatever you need. How's your day going?"].randomElement()!
+        }
+
+        // User sharing positive state
+        if (lowercased.contains("i'm good") || lowercased.contains("im good") || lowercased.contains("i am good") ||
+            lowercased.contains("i'm great") || lowercased.contains("im great") || lowercased.contains("i'm doing well") ||
+            lowercased.contains("i'm fine") || lowercased.contains("doing good") || lowercased.contains("doing great") ||
+            lowercased.contains("doing well") || lowercased.contains("pretty good") || lowercased.contains("not bad")) &&
+            (lowercased.contains("you") || lowercased.contains("yourself") || lowercased.count < 40) {
+            return ["I'm glad to hear that you're doing well! As for me, I'm here to assist you with any questions or tasks you need help with. Feel free to ask anything or request an action, and I'll be happy to help.",
+                    "That's great to hear! I'm doing well too, thank you. What can I help you with today?",
+                    "Wonderful! I'm glad you're doing well. I'm here and ready to help with whatever you need."].randomElement()!
+        }
+
+        // Thank you responses
+        if lowercased.contains("thank") || lowercased.contains("thanks") || lowercased.contains("thx") || lowercased.contains("ty") {
+            return ["You're welcome! Let me know if there's anything else I can help with.",
+                    "Happy to help! Is there anything else you'd like to know?",
+                    "Of course! I'm here whenever you need me."].randomElement()!
+        }
+
+        // ===========================================
+        // EMOTIONAL INTELLIGENCE - Negative emotions
+        // ===========================================
+        let negativeIndicators = ["sad", "upset", "angry", "frustrated", "stressed", "worried", "anxious", "tired", "exhausted", "bad day", "rough day", "terrible", "awful", "hate"]
+        let isNegative = negativeIndicators.contains(where: { lowercased.contains($0) })
+
+        if isNegative {
+            if lowercased.contains("sad") || lowercased.contains("upset") {
+                return "I'm sorry to hear you're feeling that way. Would you like to talk about it, or would you prefer I help take your mind off things with something else?"
+            }
+            if lowercased.contains("stressed") || lowercased.contains("anxious") || lowercased.contains("worried") {
+                return "I understand that can be tough. Remember to take things one step at a time. Is there something specific I can help you with to ease some of that stress?"
+            }
+            if lowercased.contains("tired") || lowercased.contains("exhausted") {
+                return "It sounds like you could use a break. Make sure to take care of yourself! Is there anything I can help you with to make things a bit easier?"
+            }
+            if lowercased.contains("bad day") || lowercased.contains("rough day") {
+                return "I'm sorry your day hasn't been great. I hope I can help make it a little better. What can I do for you?"
+            }
+        }
+
+        // ===========================================
+        // CONVERSATIONAL - About Serena
+        // ===========================================
+        if lowercased.contains("what's your name") || lowercased.contains("who are you") || lowercased.contains("what are you") {
+            return "I'm Serena, your local AI assistant! I run entirely on your device for privacy, and I can help with questions, manage your calendar, open apps, and more."
+        }
+
+        // ===========================================
+        // USER NAME - From settings
+        // ===========================================
+        if lowercased.contains("what is my name") || lowercased.contains("what's my name") ||
+           lowercased.contains("do you know my name") || lowercased.contains("who am i") ||
+           lowercased.contains("remember my name") || lowercased.contains("my name is") {
+            let userName = UserDefaults.standard.string(forKey: "SerenaNet.UserNickname") ?? ""
+            if !userName.isEmpty && userName != "Enter your nickname" {
+                if lowercased.contains("my name is") {
+                    // User is telling us their name - acknowledge it
+                    return "Nice to meet you! I'll remember that your name is \(userName). You can update it anytime in Settings."
+                }
+                return "Your name is \(userName)! I remember you from your settings."
+            } else {
+                return "I don't know your name yet. You can set your nickname in Settings (click the gear icon) and I'll remember it!"
+            }
+        }
+
+        if lowercased.contains("what can you do") || lowercased == "help" {
+            return """
+            I'm Serena, your local AI assistant! I'm here to help with all sorts of things:
+
+            I can manage your day - creating calendar events, setting reminders, and giving you morning briefings with your schedule and weather.
+
+            I can control your Mac - launching apps, playing music, opening websites, and searching your files.
+
+            I can help you think through problems, explain concepts, or just have a conversation. I remember what we talk about, so feel free to reference things from earlier.
+
+            And everything runs locally on your Mac, so your conversations stay private. What would you like to explore?
+            """
+        }
+
+        // ===========================================
+        // FACTUAL KNOWLEDGE (fast retrieval demos)
+        // ===========================================
+        if lowercased.contains("capital of france") {
+            return "The capital of France is Paris."
+        }
+
+        if lowercased.contains("what is ai") || lowercased.contains("what's ai") {
+            return "AI (Artificial Intelligence) is technology that enables computers to perform tasks that typically require human intelligence, such as understanding language, recognizing patterns, and making decisions."
+        }
+
+        // Time query - but NOT if it's a scheduling/calendar request (those need LLM + tool calls)
+        let isSchedulingRequest = lowercased.contains("schedule") || lowercased.contains("calendar") ||
+                                   lowercased.contains("meeting") || lowercased.contains("appointment") ||
+                                   lowercased.contains("downtime") || lowercased.contains("event") ||
+                                   lowercased.contains("remind") || lowercased.contains("set") ||
+                                   lowercased.contains("create") || lowercased.contains("add")
+        let isTimeQuery = lowercased.contains("what time") || lowercased.contains("what's the time") ||
+                          lowercased.contains("current time") || (lowercased == "time")
+        if isTimeQuery && !isSchedulingRequest {
+            let formatter = DateFormatter()
+            formatter.dateStyle = .full
+            formatter.timeStyle = .short
+            return "The current date and time is: \(formatter.string(from: Date()))"
+        }
+
+        if lowercased == "date" || lowercased.contains("what's the date") || lowercased.contains("what is the date") || lowercased.contains("today's date") {
+            let formatter = DateFormatter()
+            formatter.dateStyle = .full
+            formatter.timeStyle = .none
+            return "Today is \(formatter.string(from: Date()))."
+        }
+
+        // Default: Let AI engine handle for better context awareness
+        return ""
+    }
+
+    /// Get time-appropriate greeting
+    private func getTimeOfDayGreeting() -> String {
+        let hour = Calendar.current.component(.hour, from: Date())
+        switch hour {
+        case 5..<12:
+            return "Good morning"
+        case 12..<17:
+            return "Good afternoon"
+        case 17..<21:
+            return "Good evening"
+        default:
+            return "Hello"
+        }
+    }
+    
+    private func determineConfidence(for input: String, context: [Message]) -> Double {
+        let lowercased = input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ===========================================
+        // GREETINGS - High confidence for instant response
+        // ===========================================
+        let greetings = ["hi", "hello", "hey", "howdy", "greetings", "yo", "sup", "hiya", "good morning", "good afternoon", "good evening"]
+        let isGreeting = greetings.contains(lowercased) || greetings.contains(where: { lowercased.hasPrefix($0 + " ") || lowercased.hasPrefix($0 + "!") || lowercased.hasPrefix($0 + ",") })
+
+        if isGreeting {
+            return 0.95  // Very high - greetings should be instant
+        }
+
+        // ===========================================
+        // EMOTIONAL PATTERNS - High confidence
+        // ===========================================
+
+        // "How are you" variations
+        if lowercased.contains("how are you") || lowercased.contains("how're you") || lowercased.contains("how you doing") {
+            return 0.92
+        }
+
+        // User sharing emotional state (good, great, sad, etc.)
+        if (lowercased.contains("i'm good") || lowercased.contains("im good") || lowercased.contains("i am good") ||
+            lowercased.contains("i'm great") || lowercased.contains("im great") || lowercased.contains("i'm doing well") ||
+            lowercased.contains("i'm fine") || lowercased.contains("doing good") || lowercased.contains("doing great") ||
+            lowercased.contains("doing well") || lowercased.contains("pretty good") || lowercased.contains("not bad")) {
+            return 0.92
+        }
+
+        // Thank you
+        if lowercased.contains("thank") || lowercased.contains("thanks") || lowercased.contains("thx") || lowercased == "ty" {
+            return 0.92
+        }
+
+        // Negative emotions - should respond with empathy instantly
+        let negativeIndicators = ["sad", "upset", "angry", "frustrated", "stressed", "worried", "anxious", "tired", "exhausted", "bad day", "rough day"]
+        if negativeIndicators.contains(where: { lowercased.contains($0) }) {
+            return 0.90
+        }
+
+        // ===========================================
+        // ABOUT SERENA - High confidence
+        // ===========================================
+        if lowercased.contains("what's your name") || lowercased.contains("who are you") || lowercased.contains("what are you") {
+            return 0.92
+        }
+
+        if lowercased.contains("what can you do") || lowercased == "help" {
+            return 0.90
+        }
+
+        // ===========================================
+        // USER NAME - High confidence
+        // ===========================================
+        if lowercased.contains("what is my name") || lowercased.contains("what's my name") ||
+           lowercased.contains("do you know my name") || lowercased.contains("who am i") ||
+           lowercased.contains("remember my name") || lowercased.contains("my name is") {
+            return 0.95  // Very high - personal info should be instant
+        }
+
+        // ===========================================
+        // FACTUAL KNOWLEDGE - High confidence
+        // ===========================================
+        if lowercased.contains("capital of france") {
+            return 0.95
+        }
+
+        if lowercased.contains("what is ai") || lowercased.contains("what's ai") {
+            return 0.92
+        }
+
+        // Time/date queries - but NOT scheduling requests (those need LLM + tools)
+        let isSchedulingReq = lowercased.contains("schedule") || lowercased.contains("calendar") ||
+                               lowercased.contains("meeting") || lowercased.contains("appointment") ||
+                               lowercased.contains("downtime") || lowercased.contains("event") ||
+                               lowercased.contains("remind") || lowercased.contains("set") ||
+                               lowercased.contains("create") || lowercased.contains("add")
+        let isTimeQuery2 = lowercased.contains("what time") || lowercased.contains("what's the time") ||
+                           lowercased.contains("current time") || (lowercased == "time")
+        let isDateQuery = lowercased == "date" || lowercased.contains("what's the date") ||
+                          lowercased.contains("what is the date") || lowercased.contains("today's date")
+        if (isTimeQuery2 || isDateQuery) && !isSchedulingReq {
+            return 0.90
+        }
+
+        // ===========================================
+        // DEFAULT - Low confidence, let LLM handle
+        // ===========================================
+        return 0.40
+    }
+    
+}
+
+// MARK: - Supporting Types
+
+/// Result of RTAI processing operation
+struct RTAIProcessingResult {
+    let success: Bool
+    let response: String
+    let processingTimeMs: UInt64
+    let confidence: Double
+    let errorMessage: String?
+    
+    var isSuccessful: Bool { success }
+    var processingTimeFormatted: String { "\(processingTimeMs)ms" }
+    var confidenceFormatted: String { String(format: "%.1f%%", confidence * 100) }
+}
+
+// MARK: - Mitosis Integration
+
+extension RTAIBridge {
+    /// Get all learned patterns count
+    func syncMitosisPatterns() async -> (synced: Int, total: Int) {
+        let total = mitosisIntegration.getAllLearnedPatterns().count
+        return (0, total)
+    }
+
+    /// Get stats about learned patterns
+    func getLearnedPatternStats() -> (total: Int, byCategory: [PatternCategory: Int], lastSync: Date?) {
+        return mitosisIntegration.getStats()
+    }
+
+    /// Mitosis integration is always available (local-only, no external service)
+    func isMitosisServiceAvailable() async -> Bool {
+        return true
+    }
+}
+
+// MARK: - User Context Query Handling
+
+extension RTAIBridge {
+    /// Check if input is a DIRECT user-context query and look up from RTAI user facts
+    /// Returns a response string if found, nil otherwise
+    ///
+    /// IMPORTANT: Only handles simple, direct factual questions like:
+    /// - "What is my wife's name?"
+    /// - "Who is my dog?"
+    /// - "What's my favorite color?"
+    ///
+    /// Does NOT handle conversational/complex queries (those go to LLM with lookup_user_fact tool):
+    /// - "I'm planning a surprise for my wife"
+    /// - "Help me pick a gift for my wife"
+    /// - "What would my wife like?"
+    private func checkUserContextQuery(_ input: String) async -> String? {
+        let lowercased = input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // STRICT CHECK: Only handle direct factual questions
+        // These patterns indicate a simple "lookup my X" type question
+        let directQuestionPatterns = [
+            "what is my", "what's my", "whats my",
+            "who is my", "who's my", "whos my",
+            "what was my",  // past tense
+            "do you know my", "do you remember my",
+            "remind me of my", "remind me what my"
+        ]
+
+        // Check if it's a direct question pattern
+        let isDirectQuestion = directQuestionPatterns.contains(where: { lowercased.hasPrefix($0) || lowercased.contains($0) })
+
+        // Also check for simple "my X name" questions at the start
+        let simplePatterns = ["my wife", "my husband", "my dog", "my cat", "my son", "my daughter", "my favorite"]
+        let startsWithSimple = simplePatterns.contains(where: { lowercased.hasPrefix($0) })
+
+        // EXCLUDE conversational patterns - these should go to LLM
+        let conversationalIndicators = [
+            "help me", "help with", "i need", "i want",
+            "planning", "plan for", "plan a",
+            "surprise", "gift for", "present for",
+            "would like", "should i", "could i",
+            "recommend", "suggest", "advice",
+            "how can", "how do", "how should",
+            // Action/statement indicators (not questions)
+            " likes ", " loves ", " enjoys ", " hates ",
+            " wants ", " needs ", " prefers ",
+            "what should", "what could", "what can",
+            "write on", "write to", "say to",
+            "tell her", "tell him", "tell my"
+        ]
+        let isConversational = conversationalIndicators.contains(where: { lowercased.contains($0) })
+
+        // Additional check: if it's a statement about someone (contains verb after "my X")
+        // e.g., "my wife likes..." is a statement, not a query
+        let statementPatterns = ["my wife ", "my husband ", "my dog ", "my cat "]
+        let isStatement = statementPatterns.contains(where: { pattern in
+            if lowercased.hasPrefix(pattern) {
+                let afterPattern = String(lowercased.dropFirst(pattern.count))
+                // If followed by a verb, it's a statement
+                let verbs = ["likes", "loves", "enjoys", "hates", "wants", "needs", "is a", "works", "does"]
+                return verbs.contains(where: { afterPattern.hasPrefix($0) })
+            }
+            return false
+        })
+
+        // Only proceed if it's a direct question AND not conversational AND not a statement
+        guard (isDirectQuestion || startsWithSimple) && !isConversational && !isStatement else {
+            if (isConversational || isStatement) && lowercased.contains("my ") {
+                logger.debug("🔀 Conversational/statement detected - routing to LLM: '\(input.prefix(50))'")
+            }
+            return nil
+        }
+
+        logger.debug("📋 Direct user fact query detected - checking RTAI: '\(input.prefix(50))'")
+
+        // Get all user facts from RTAI
+        let facts = await UserFTAIManager.shared.getAllFacts()
+        guard !facts.isEmpty else { return nil }
+
+        // Try to match the query to a fact
+        // Pattern matching for common queries
+
+        // Wife/spouse queries
+        if lowercased.contains("wife") || lowercased.contains("spouse") {
+            if let fact = facts.first(where: { $0.key.contains("wife") || $0.key.contains("spouse") }) {
+                return "Your wife's name is \(fact.value)."
+            }
+        }
+
+        // Husband/spouse queries
+        if lowercased.contains("husband") {
+            if let fact = facts.first(where: { $0.key.contains("husband") }) {
+                return "Your husband's name is \(fact.value)."
+            }
+        }
+
+        // Child queries
+        if lowercased.contains("son") {
+            if let fact = facts.first(where: { $0.key.contains("son") }) {
+                return "Your son's name is \(fact.value)."
+            }
+        }
+        if lowercased.contains("daughter") {
+            if let fact = facts.first(where: { $0.key.contains("daughter") }) {
+                return "Your daughter's name is \(fact.value)."
+            }
+        }
+        if lowercased.contains("child") || lowercased.contains("kid") {
+            if let fact = facts.first(where: { $0.key.contains("son") || $0.key.contains("daughter") || $0.key.contains("child") }) {
+                return "Your child's name is \(fact.value)."
+            }
+        }
+
+        // Pet queries
+        if lowercased.contains("dog") {
+            if let fact = facts.first(where: { $0.key.contains("dog") }) {
+                return "Your dog's name is \(fact.value)."
+            }
+        }
+        if lowercased.contains("cat") {
+            if let fact = facts.first(where: { $0.key.contains("cat") }) {
+                return "Your cat's name is \(fact.value)."
+            }
+        }
+        if lowercased.contains("pet") {
+            if let fact = facts.first(where: { $0.key.contains("dog") || $0.key.contains("cat") || $0.key.contains("pet") }) {
+                return "Your pet's name is \(fact.value)."
+            }
+        }
+
+        // Favorite queries
+        if lowercased.contains("favorite color") || lowercased.contains("favourite color") {
+            if let fact = facts.first(where: { $0.key.contains("color") || $0.key.contains("colour") }) {
+                return "Your favorite color is \(fact.value)."
+            }
+        }
+        if lowercased.contains("favorite") || lowercased.contains("favourite") {
+            // Generic favorite query - find any favorite fact
+            if let fact = facts.first(where: { $0.key.contains("favorite") || $0.key.contains("favourite") }) {
+                let thing = fact.key.replacingOccurrences(of: "favorite ", with: "")
+                return "Your favorite \(thing) is \(fact.value)."
+            }
+        }
+
+        // Birthday queries
+        if lowercased.contains("birthday") {
+            if lowercased.contains("wife") {
+                if let fact = facts.first(where: { $0.key.contains("wife") && $0.key.contains("birthday") }) {
+                    return "Your wife's birthday is \(fact.value)."
+                }
+            }
+            if let fact = facts.first(where: { $0.key.contains("birthday") }) {
+                return "Your birthday is \(fact.value)."
+            }
+        }
+
+        // Location queries
+        if lowercased.contains("live") || lowercased.contains("from") {
+            if let fact = facts.first(where: { $0.key.contains("location") || $0.key.contains("live") }) {
+                return "You live in \(fact.value)."
+            }
+        }
+
+        // Job/work queries
+        if lowercased.contains("job") || lowercased.contains("work") || lowercased.contains("occupation") {
+            if let fact = facts.first(where: { $0.key.contains("occupation") || $0.key.contains("work") || $0.key.contains("job") }) {
+                return "You work as \(fact.value)."
+            }
+        }
+
+        return nil
+    }
+}
+
+// MARK: - Singleton Access
+
+extension RTAIBridge {
+    static let shared = RTAIBridge()
+
+    /// Initialize the shared RTAI bridge with default settings
+    static func initializeShared() -> Bool {
+        let success = shared.initialize()
+        if success {
+            _ = shared.start()
+        }
+        return success
+    }
+}

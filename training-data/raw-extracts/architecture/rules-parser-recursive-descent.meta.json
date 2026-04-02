@@ -1,0 +1,13 @@
+{
+  "name": "rules-parser-recursive-descent",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/rules/parser.rs",
+  "line_count": 512,
+  "why": "Recursive descent parser, tokenization, expression trees",
+  "distill_as": [
+    "instruction",
+    "conversation"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

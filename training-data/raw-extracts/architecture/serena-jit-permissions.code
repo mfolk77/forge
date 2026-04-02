@@ -1,0 +1,396 @@
+import Foundation
+import EventKit
+import AppKit
+import MusicKit
+import os.log
+
+/// Real tool executor with actual macOS API implementations
+/// Replaces stub implementations with EventKit, FileManager, and NSWorkspace
+/// Now delegates to specialized ToolHandler instances for each tool type
+@MainActor
+public class RealToolExecutor {
+    public static let shared = RealToolExecutor()
+    private let logger = Logger(subsystem: "com.serenanet.tools", category: "RealToolExecutor")
+
+    // EventKit for calendar and reminders operations
+    private let eventStore = EKEventStore()
+
+    // Tool Handlers
+    private let calendarHandler: CalendarToolHandler
+    private let notesHandler: NotesToolHandler
+    private let mediaHandler: MediaToolHandler
+    private let browserHandler: BrowserToolHandler
+    private let appHandler: AppToolHandler
+    private let fileHandler: FileToolHandler
+    private let memoryHandler: MemoryToolHandler
+    private let systemHandler: SystemToolHandler
+    private let webSearchHandler: WebSearchToolHandler
+    private let executiveHandler: ExecutiveToolHandler
+    private let briefingHandler: BriefingToolHandler
+    private let screenHandler: ScreenToolHandler
+
+    // Expose search results for "open result N" functionality
+    public var lastSearchResults: [WebSearchToolHandler.SearchResult] {
+        webSearchHandler.lastSearchResults
+    }
+
+    private init() {
+        // Initialize handlers
+        self.calendarHandler = CalendarToolHandler(eventStore: eventStore)
+        self.notesHandler = NotesToolHandler()
+        self.mediaHandler = MediaToolHandler()
+        self.browserHandler = BrowserToolHandler()
+        self.appHandler = AppToolHandler()
+        self.fileHandler = FileToolHandler()
+        self.memoryHandler = MemoryToolHandler()
+        self.systemHandler = SystemToolHandler()
+        self.webSearchHandler = WebSearchToolHandler()
+        self.executiveHandler = ExecutiveToolHandler()
+        self.briefingHandler = BriefingToolHandler(eventStore: eventStore)
+        self.screenHandler = ScreenToolHandler()
+
+        // Don't request calendar/reminders at init — macOS silently denies TCC
+        // dialogs before the app window is visible, and caches the denial for the
+        // session. Access is requested on-demand when a tool actually needs it,
+        // or when the user clicks Enable in Settings.
+    }
+
+    // MARK: - Permission Check
+
+    /// Check all required permissions for a tool+action before execution
+    /// Returns nil if all permissions granted, or a ToolResult describing the missing permission
+    /// For apiRequestable permissions that return .notDetermined, attempts to request access first
+    /// (handles non-sandboxed builds where EKEventStore.authorizationStatus returns .notDetermined
+    /// even when access is already granted)
+    private func checkPermissions(handler: ToolHandler, action: String?) async -> ToolResult? {
+        // Action-level permissions take priority; fall back to handler-level
+        let perms = handler.permissionsForAction(action)
+        let neededPerms = perms.isEmpty ? handler.requiredPermissions : perms
+
+        for perm in neededPerms {
+            var status = PermissionManager.shared.check(perm)
+
+            // For apiRequestable permissions, .notDetermined may be wrong (non-sandbox builds)
+            // Try requesting — returns immediately with true if already granted, no dialog shown
+            if status == .notDetermined && perm.category == .apiRequestable {
+                status = await PermissionManager.shared.request(perm)
+            }
+
+            switch status {
+            case .granted:
+                continue
+            case .notDetermined:
+                return ToolResult(success: false, output: "",
+                                  error: "Permission required: \(perm.rawValue)",
+                                  permissionNeeded: perm)
+            case .denied:
+                if PermissionManager.shared.isDeclinedThisSession(perm) {
+                    return ToolResult(success: false, output: "",
+                                      error: PermissionRequestFlow.previouslyDeniedMessage(for: perm),
+                                      permissionDenied: perm)
+                }
+                return ToolResult(success: false, output: "",
+                                  error: PermissionRequestFlow.previouslyDeniedMessage(for: perm),
+                                  permissionDenied: perm)
+            case .restricted:
+                return ToolResult(success: false, output: "",
+                                  error: "\(perm.rawValue) is restricted by system policy")
+            case .unavailable:
+                return ToolResult(success: false, output: "",
+                                  error: "\(perm.rawValue) is not available on this device")
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Execute Tool
+
+    public func execute(_ ftaiTask: String) async throws -> ToolResult {
+        logger.info("Executing real tool task:\n\(ftaiTask)")
+
+        // Parse FTAI task format
+        let lines = ftaiTask.components(separatedBy: .newlines)
+        guard let taskLine = lines.first else {
+            throw ToolExecutorError.invalidTask("Empty task")
+        }
+
+        // Extract tool and action
+        let taskParts = taskLine.replacingOccurrences(of: "task: ", with: "").components(separatedBy: ".")
+        guard let toolName = taskParts.first else {
+            throw ToolExecutorError.invalidTask("No tool name")
+        }
+
+        let action = taskParts.count > 1 ? taskParts[1] : nil
+
+        // Extract parameters
+        var params: [String: String] = [:]
+        for line in lines.dropFirst() {
+            let parts = line.components(separatedBy: ": ")
+            if parts.count >= 2 {
+                let key = parts[0]
+                let value = parts.dropFirst().joined(separator: ": ")
+                params[key] = value
+            }
+        }
+
+        logger.info("Tool: \(toolName), Action: \(action ?? "none"), Params: \(params.count)")
+
+        // Validate tool exists before execution
+        let validation = ToolRegistry.validateOrError(toolName)
+        guard validation.valid else {
+            logger.warning("Invalid tool request: \(toolName)")
+            return ToolResult(
+                success: false,
+                output: "",
+                error: validation.error ?? "Unknown tool"
+            )
+        }
+
+        // Check subscription-based tool gating for free users
+        let (canExecute, gatingReason) = SubscriptionService.shared.canExecuteGatedTool(toolName)
+        if !canExecute {
+            logger.warning("Tool gated: \(toolName) - \(gatingReason ?? "limit reached")")
+
+            // Track free limit hit for analytics
+            Task { @MainActor in
+                let dailyCount = SubscriptionService.shared.dailyToolCallCount
+                AnalyticsManager.shared.trackFreeLimitHit(dailyCount: dailyCount)
+            }
+
+            return ToolResult(
+                success: false,
+                output: "",
+                error: gatingReason ?? "Daily tool limit reached. Upgrade to Serena Plus for unlimited access.",
+                requiresUpgrade: true
+            )
+        }
+
+        // Execute tool with timeout protection
+        let needsLongerTimeout = ["media", "calendar", "notes", "web_search", "websearch", "briefing"].contains(toolName.lowercased())
+        let timeout: AsyncTimeout.Duration = needsLongerTimeout ? .custom(15.0) : .standard
+
+        do {
+            let result = try await AsyncTimeout.withTimeout(timeout) { [self] in
+                // Route to appropriate handler
+                return await self.routeToHandler(toolName: toolName, action: action, params: params)
+            }
+
+            // Track tool execution in analytics
+            Task { @MainActor in
+                if result.success {
+                    AnalyticsManager.shared.trackToolCall(tool: toolName, success: true)
+                } else {
+                    // Categorize error for analytics
+                    let errorCategory = categorizeError(result.error)
+                    AnalyticsManager.shared.trackToolCall(tool: toolName, success: false, errorCategory: errorCategory)
+                }
+            }
+
+            // Open the related app after successful tool execution
+            if result.success {
+                await openRelatedApp(for: toolName, action: action)
+
+                // Record tool call for daily limit tracking (only for gated tools)
+                SubscriptionService.shared.recordToolCall(toolName)
+            }
+
+            return result
+        } catch let error as TimeoutError {
+            let timeoutSeconds = needsLongerTimeout ? "15" : "5"
+            logger.error("Tool execution timed out: \(error.localizedDescription)")
+            return ToolResult(
+                success: false,
+                output: "",
+                error: "Tool execution timed out after \(timeoutSeconds) seconds"
+            )
+        } catch {
+            throw error
+        }
+    }
+
+    // MARK: - Route to Handler
+
+    private func routeToHandler(toolName: String, action: String?, params: [String: String]) async -> ToolResult {
+        // Resolve handler and check permissions before execution
+        let handler: ToolHandler? = resolveHandler(toolName: toolName)
+
+        if let handler = handler {
+            // Check permissions via PermissionManager
+            if let permResult = await checkPermissions(handler: handler, action: action) {
+                logger.info("Permission check blocked \(toolName).\(action ?? ""): \(permResult.error ?? "")")
+                return permResult
+            }
+        }
+
+        switch toolName.lowercased() {
+        case "calendar":
+            // Calendar handler checks its own access flags internally
+            let calendarGranted = PermissionManager.shared.check(.calendar) == .granted
+            calendarHandler.calendarAccessGranted = calendarGranted
+            let remindersGranted = PermissionManager.shared.check(.reminders) == .granted
+            calendarHandler.remindersAccessGranted = remindersGranted
+            return await calendarHandler.execute(action: action, params: params)
+
+        case "notes":
+            return await notesHandler.execute(action: action, params: params)
+
+        case "media":
+            return await mediaHandler.execute(action: action, params: params)
+
+        case "browser":
+            return await browserHandler.execute(action: action, params: params)
+
+        case "app":
+            return await appHandler.execute(action: action, params: params)
+
+        case "file":
+            return await fileHandler.execute(action: action, params: params)
+
+        case "memory":
+            return await memoryHandler.execute(action: action, params: params)
+
+        case "system":
+            return await systemHandler.execute(action: action, params: params)
+
+        case "web_search", "websearch":
+            return await webSearchHandler.execute(action: action, params: params)
+
+        case "executive":
+            return await executiveHandler.execute(action: action, params: params)
+
+        case "briefing":
+            // Briefing delegates to calendar + reminders — sync access flags
+            let calendarGranted = PermissionManager.shared.check(.calendar) == .granted
+            let remindersGranted = PermissionManager.shared.check(.reminders) == .granted
+            briefingHandler.calendarAccessGranted = calendarGranted
+            briefingHandler.remindersAccessGranted = remindersGranted
+            return await briefingHandler.execute(action: action, params: params)
+
+        case "screen":
+            return await screenHandler.execute(action: action, params: params)
+
+        default:
+            return ToolResult(
+                success: false,
+                output: "",
+                error: "Unknown tool: \(toolName)"
+            )
+        }
+    }
+
+    /// Resolve tool name to handler instance
+    private func resolveHandler(toolName: String) -> ToolHandler? {
+        switch toolName.lowercased() {
+        case "calendar": return calendarHandler
+        case "notes": return notesHandler
+        case "media": return mediaHandler
+        case "browser": return browserHandler
+        case "app": return appHandler
+        case "file": return fileHandler
+        case "memory": return memoryHandler
+        case "system": return systemHandler
+        case "web_search", "websearch": return webSearchHandler
+        case "executive": return executiveHandler
+        case "briefing": return briefingHandler
+        case "screen": return screenHandler
+        default: return nil
+        }
+    }
+
+    // MARK: - Open Search Result
+
+    /// Open a search result by index (1-based)
+    public func openSearchResult(index: Int) async -> ToolResult {
+        return await webSearchHandler.openSearchResult(index: index)
+    }
+
+    // MARK: - Open Related App
+
+    /// Opens the app associated with a tool after successful execution
+    private func openRelatedApp(for toolName: String, action: String?) async {
+        let workspace = NSWorkspace.shared
+
+        switch toolName.lowercased() {
+        case "calendar":
+            let calendarActions = ["create_event", "delete_event", "update_event", "modify_event"]
+            let reminderActions = ["create_reminder"]
+
+            if let action = action {
+                if calendarActions.contains(action.lowercased()) {
+                    if let url = workspace.urlForApplication(withBundleIdentifier: "com.apple.iCal") {
+                        do {
+                            try workspace.launchApplication(at: url, options: [.default], configuration: [:])
+                            logger.info("Opened Calendar app")
+                        } catch {
+                            logger.warning("Could not open Calendar app: \(error.localizedDescription)")
+                        }
+                    }
+                } else if reminderActions.contains(action.lowercased()) {
+                    if let url = workspace.urlForApplication(withBundleIdentifier: "com.apple.reminders") {
+                        do {
+                            try workspace.launchApplication(at: url, options: [.default], configuration: [:])
+                            logger.info("Opened Reminders app")
+                        } catch {
+                            logger.warning("Could not open Reminders app: \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+
+        case "notes":
+            if let url = workspace.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
+                do {
+                    try workspace.launchApplication(at: url, options: [.default], configuration: [:])
+                    logger.info("Brought Notes app to foreground")
+                } catch {
+                    logger.warning("Could not open Notes app: \(error.localizedDescription)")
+                }
+            }
+
+        case "media":
+            if action?.lowercased() == "play" {
+                if let url = workspace.urlForApplication(withBundleIdentifier: "com.apple.Music") {
+                    do {
+                        try workspace.launchApplication(at: url, options: [.default], configuration: [:])
+                        logger.info("Opened Music app")
+                    } catch {
+                        logger.warning("Could not open Music app: \(error.localizedDescription)")
+                    }
+                }
+            }
+
+        default:
+            // No app to open for other tools
+            break
+        }
+    }
+
+    // MARK: - Analytics Helpers
+
+    /// Categorize errors for analytics (no sensitive data)
+    private func categorizeError(_ error: String?) -> String {
+        guard let error = error?.lowercased() else { return "unknown" }
+
+        if error.contains("access") || error.contains("permission") || error.contains("denied") {
+            return "permission_denied"
+        } else if error.contains("timeout") {
+            return "timeout"
+        } else if error.contains("not found") || error.contains("no ") {
+            return "not_found"
+        } else if error.contains("invalid") || error.contains("format") {
+            return "invalid_input"
+        } else if error.contains("network") || error.contains("connection") {
+            return "network_error"
+        } else if error.contains("calendar") {
+            return "calendar_error"
+        } else if error.contains("reminder") {
+            return "reminder_error"
+        } else if error.contains("note") {
+            return "notes_error"
+        } else if error.contains("music") || error.contains("media") {
+            return "media_error"
+        } else {
+            return "other"
+        }
+    }
+}

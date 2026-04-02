@@ -1,0 +1,406 @@
+import Foundation
+import AuthenticationServices
+import os.log
+import Security
+
+/// Manages OAuth 2.0 authentication with VA Lighthouse API
+/// Uses ASWebAuthenticationSession for the OAuth flow and Keychain for token storage
+@MainActor
+public class VAAuthManager: NSObject, ObservableObject {
+    public static let shared = VAAuthManager()
+
+    private let logger = Logger(subsystem: "com.serenanet.va", category: "VAAuthManager")
+
+    // MARK: - Published State
+
+    @Published public private(set) var isAuthenticated: Bool = false
+    @Published public private(set) var authorizedScopes: Set<VAScope> = []
+    @Published public private(set) var isAuthenticating: Bool = false
+
+    // MARK: - Configuration
+
+    /// VA Lighthouse OAuth endpoints
+    /// These are sandbox URLs — swap for production after VA approval
+    public struct Config {
+        public static var authorizationURL = "https://sandbox-api.va.gov/oauth2/authorization"
+        public static var tokenURL = "https://sandbox-api.va.gov/oauth2/token"
+        public static var revokeURL = "https://sandbox-api.va.gov/oauth2/revoke"
+        public static var redirectScheme = "serenanet"
+        public static var redirectURI = "serenanet://oauth/callback"
+        public static var clientId = "" // Set from app config or environment
+
+        /// Switch to production endpoints
+        public static func useProduction() {
+            authorizationURL = "https://api.va.gov/oauth2/authorization"
+            tokenURL = "https://api.va.gov/oauth2/token"
+            revokeURL = "https://api.va.gov/oauth2/revoke"
+        }
+    }
+
+    // MARK: - Keychain Keys
+
+    private enum KeychainKey {
+        static let accessToken = "com.serenanet.va.accessToken"
+        static let refreshToken = "com.serenanet.va.refreshToken"
+        static let tokenExpiry = "com.serenanet.va.tokenExpiry"
+        static let tokenScope = "com.serenanet.va.tokenScope"
+    }
+
+    // MARK: - Private State
+
+    private var currentTokens: VATokens?
+    private var refreshTask: Task<VATokens, Error>?
+
+    // MARK: - Init
+
+    private override init() {
+        super.init()
+        loadTokensFromKeychain()
+    }
+
+    /// Test-only initializer — bypasses Keychain
+    internal init(testTokens: VATokens?) {
+        super.init()
+        if let tokens = testTokens {
+            self.currentTokens = tokens
+            self.isAuthenticated = !tokens.isExpired
+            self.authorizedScopes = parseScopes(tokens.scope)
+        }
+    }
+
+    // MARK: - Public API
+
+    /// Start OAuth flow — presents browser for VA sign-in
+    /// Uses ASWebAuthenticationSession (macOS 10.15+)
+    @discardableResult
+    public func authenticate(scopes: [VAScope] = VAScope.allCases) async throws -> VATokens {
+        guard !Config.clientId.isEmpty else {
+            throw VAError.notAuthenticated
+        }
+
+        isAuthenticating = true
+        defer { isAuthenticating = false }
+
+        let scopeString = scopes.map(\.rawValue).joined(separator: " ")
+        let state = UUID().uuidString
+        let codeVerifier = generateCodeVerifier()
+        let codeChallenge = generateCodeChallenge(from: codeVerifier)
+
+        var components = URLComponents(string: Config.authorizationURL)!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: Config.clientId),
+            URLQueryItem(name: "redirect_uri", value: Config.redirectURI),
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "scope", value: scopeString),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "code_challenge", value: codeChallenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256")
+        ]
+
+        guard let authURL = components.url else {
+            throw VAError.networkError("Invalid authorization URL")
+        }
+
+        // Present ASWebAuthenticationSession
+        let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+            let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: Config.redirectScheme) { url, error in
+                if let error = error {
+                    continuation.resume(throwing: VAError.networkError(error.localizedDescription))
+                } else if let url = url {
+                    continuation.resume(returning: url)
+                } else {
+                    continuation.resume(throwing: VAError.networkError("No callback URL received"))
+                }
+            }
+            session.prefersEphemeralWebBrowserSession = false
+            session.start()
+        }
+
+        // Parse authorization code from callback
+        guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+              let code = components.queryItems?.first(where: { $0.name == "code" })?.value else {
+            throw VAError.networkError("No authorization code in callback")
+        }
+
+        // Verify state parameter
+        let returnedState = components.queryItems?.first(where: { $0.name == "state" })?.value
+        guard returnedState == state else {
+            throw VAError.networkError("OAuth state mismatch — possible CSRF attack")
+        }
+
+        // Exchange code for tokens
+        let tokens = try await exchangeCodeForTokens(code: code, codeVerifier: codeVerifier)
+        saveTokens(tokens)
+
+        logger.info("VA authentication successful. Scopes: \(tokens.scope)")
+        return tokens
+    }
+
+    /// Get a valid access token, refreshing if needed
+    public func getValidToken() async throws -> String {
+        guard let tokens = currentTokens else {
+            throw VAError.notAuthenticated
+        }
+
+        // If token is still valid (with 5-minute buffer), return it
+        if !tokens.expiresWithin(300) {
+            return tokens.accessToken
+        }
+
+        // Token expired or expiring soon — refresh
+        return try await refreshAccessToken().accessToken
+    }
+
+    /// Refresh the access token using the refresh token
+    public func refreshAccessToken() async throws -> VATokens {
+        // Coalesce concurrent refresh requests
+        if let existingTask = refreshTask {
+            return try await existingTask.value
+        }
+
+        let task = Task<VATokens, Error> {
+            guard let tokens = currentTokens else {
+                throw VAError.notAuthenticated
+            }
+
+            logger.info("Refreshing VA access token...")
+
+            var request = URLRequest(url: URL(string: Config.tokenURL)!)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+            let body = [
+                "grant_type": "refresh_token",
+                "refresh_token": tokens.refreshToken,
+                "client_id": Config.clientId,
+                "redirect_uri": Config.redirectURI
+            ]
+            request.httpBody = body.map { "\($0.key)=\($0.value)" }.joined(separator: "&").data(using: .utf8)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw VAError.networkError("Invalid response")
+            }
+
+            guard httpResponse.statusCode == 200 else {
+                throw VAError.tokenRefreshFailed("HTTP \(httpResponse.statusCode)")
+            }
+
+            let tokenResponse = try JSONDecoder().decode(OAuthTokenResponse.self, from: data)
+            let newTokens = tokenResponse.toVATokens()
+            saveTokens(newTokens)
+
+            logger.info("VA token refreshed successfully")
+            return newTokens
+        }
+
+        refreshTask = task
+        defer { refreshTask = nil }
+        return try await task.value
+    }
+
+    /// Revoke VA access and clear all tokens
+    public func revokeAccess() async {
+        logger.info("Revoking VA access...")
+
+        // Try to revoke token on server (best-effort)
+        if let tokens = currentTokens {
+            var request = URLRequest(url: URL(string: Config.revokeURL)!)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            let body = "token=\(tokens.accessToken)&client_id=\(Config.clientId)"
+            request.httpBody = body.data(using: .utf8)
+            _ = try? await URLSession.shared.data(for: request)
+        }
+
+        // Clear local state regardless
+        clearTokens()
+        logger.info("VA access revoked and local data cleared")
+    }
+
+    /// Check if a specific scope is authorized
+    public func hasScope(_ scope: VAScope) -> Bool {
+        authorizedScopes.contains(scope)
+    }
+
+    // MARK: - Token Exchange
+
+    private func exchangeCodeForTokens(code: String, codeVerifier: String) async throws -> VATokens {
+        var request = URLRequest(url: URL(string: Config.tokenURL)!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        let body = [
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": Config.redirectURI,
+            "client_id": Config.clientId,
+            "code_verifier": codeVerifier
+        ]
+        request.httpBody = body.map { "\($0.key)=\($0.value)" }.joined(separator: "&").data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw VAError.tokenRefreshFailed("Token exchange failed: HTTP \(statusCode)")
+        }
+
+        let tokenResponse = try JSONDecoder().decode(OAuthTokenResponse.self, from: data)
+        return tokenResponse.toVATokens()
+    }
+
+    // MARK: - PKCE
+
+    private func generateCodeVerifier() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func generateCodeChallenge(from verifier: String) -> String {
+        guard let data = verifier.data(using: .utf8) else { return "" }
+        var hash = [UInt8](repeating: 0, count: 32)
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &hash)
+        }
+        return Data(hash).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    // MARK: - Keychain Storage
+
+    private func saveTokens(_ tokens: VATokens) {
+        currentTokens = tokens
+        isAuthenticated = true
+        authorizedScopes = parseScopes(tokens.scope)
+
+        // Save to Keychain
+        saveToKeychain(key: KeychainKey.accessToken, value: tokens.accessToken)
+        saveToKeychain(key: KeychainKey.refreshToken, value: tokens.refreshToken)
+        saveToKeychain(key: KeychainKey.tokenExpiry, value: ISO8601DateFormatter().string(from: tokens.expiresAt))
+        saveToKeychain(key: KeychainKey.tokenScope, value: tokens.scope)
+    }
+
+    private func loadTokensFromKeychain() {
+        guard let accessToken = loadFromKeychain(key: KeychainKey.accessToken),
+              let refreshToken = loadFromKeychain(key: KeychainKey.refreshToken),
+              let expiryString = loadFromKeychain(key: KeychainKey.tokenExpiry),
+              let expiresAt = ISO8601DateFormatter().date(from: expiryString),
+              let scope = loadFromKeychain(key: KeychainKey.tokenScope) else {
+            isAuthenticated = false
+            return
+        }
+
+        let tokens = VATokens(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, scope: scope)
+        currentTokens = tokens
+        isAuthenticated = !tokens.isExpired
+        authorizedScopes = parseScopes(scope)
+
+        if tokens.isExpired {
+            logger.info("VA tokens loaded but expired — will refresh on next use")
+        } else {
+            logger.info("VA tokens loaded from Keychain, authenticated")
+        }
+    }
+
+    private func clearTokens() {
+        currentTokens = nil
+        isAuthenticated = false
+        authorizedScopes = []
+        refreshTask = nil
+
+        deleteFromKeychain(key: KeychainKey.accessToken)
+        deleteFromKeychain(key: KeychainKey.refreshToken)
+        deleteFromKeychain(key: KeychainKey.tokenExpiry)
+        deleteFromKeychain(key: KeychainKey.tokenScope)
+    }
+
+    // MARK: - Keychain Helpers
+
+    private func saveToKeychain(key: String, value: String) {
+        let data = value.data(using: .utf8)!
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: "com.serenanet.va"
+        ]
+        SecItemDelete(query as CFDictionary)
+        var addQuery = query
+        addQuery[kSecValueData as String] = data
+        SecItemAdd(addQuery as CFDictionary, nil)
+    }
+
+    private func loadFromKeychain(key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: "com.serenanet.va",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func deleteFromKeychain(key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: "com.serenanet.va"
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    // MARK: - Scope Parsing
+
+    private func parseScopes(_ scopeString: String) -> Set<VAScope> {
+        Set(scopeString.split(separator: " ").compactMap { VAScope(rawValue: String($0)) })
+    }
+
+    // MARK: - For Testing
+
+    /// Reset state — test only
+    internal func resetForTesting() {
+        clearTokens()
+    }
+}
+
+// MARK: - OAuth Token Response (from VA server)
+
+private struct OAuthTokenResponse: Codable {
+    let accessToken: String
+    let refreshToken: String?
+    let expiresIn: Int
+    let scope: String
+    let tokenType: String
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresIn = "expires_in"
+        case scope
+        case tokenType = "token_type"
+    }
+
+    func toVATokens() -> VATokens {
+        VATokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken ?? "",
+            expiresAt: Date().addingTimeInterval(TimeInterval(expiresIn)),
+            scope: scope,
+            tokenType: tokenType
+        )
+    }
+}
+
+// MARK: - CC_SHA256 bridge (CommonCrypto)
+import CommonCrypto

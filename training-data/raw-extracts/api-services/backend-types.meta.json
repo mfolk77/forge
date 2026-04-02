@@ -1,0 +1,13 @@
+{
+  "name": "backend-types",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/backend/types.rs",
+  "line_count": 428,
+  "why": "Rich type system: Token, Message, Role, ToolDefinition, HardwareInfo, ModelBackend trait",
+  "distill_as": [
+    "instruction",
+    "reasoning"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

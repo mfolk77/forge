@@ -1,0 +1,14 @@
+{
+  "name": "inference-security-tests",
+  "category": "security",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/inference/security_tests.rs",
+  "line_count": 812,
+  "why": "Prompt injection, knowledge boundary violations",
+  "distill_as": [
+    "instruction",
+    "conversation",
+    "negative"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

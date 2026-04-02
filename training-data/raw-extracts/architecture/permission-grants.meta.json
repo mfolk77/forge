@@ -1,0 +1,12 @@
+{
+  "name": "permission-grants",
+  "category": "architecture",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/permissions/grants.rs",
+  "line_count": 173,
+  "why": "Grant caching with expiry, scope-based grants",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

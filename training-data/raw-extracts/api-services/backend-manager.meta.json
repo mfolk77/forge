@@ -1,0 +1,12 @@
+{
+  "name": "backend-manager",
+  "category": "api-services",
+  "source_file": "/Users/michaelfolk/Developer/forge/src/backend/manager.rs",
+  "line_count": 250,
+  "why": "Backend lifecycle, hardware probing, provider selection",
+  "distill_as": [
+    "instruction"
+  ],
+  "extract_strategy": "full-file",
+  "pattern": ""
+}

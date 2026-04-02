@@ -1,0 +1,1 @@
+{"name": "rate-limiter-red-tests-2", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/RateLimiterRedTests.swift", "line_count": 241, "why": "Serena red tests: RateLimiterRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

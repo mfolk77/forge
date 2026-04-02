@@ -1,0 +1,1 @@
+{"name": "heuristic-pattern-red-tests", "category": "security", "source_file": "/Users/michaelfolk/Developer/Serena/Tests/SerenaCoreTests/RedTests/HeuristicPatternDetectorRedTests.swift", "line_count": 191, "why": "Serena red tests: HeuristicPatternDetectorRedTests.swift", "distill_as": ["instruction", "conversation", "negative"]}

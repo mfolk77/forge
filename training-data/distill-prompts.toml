@@ -1,0 +1,513 @@
+# Distillation Prompts — Category-specific prompts for the teacher model (Claude Opus)
+# Each category has multiple prompt templates that generate different training example types
+
+# ============================================================
+# GENERAL INSTRUCTIONS FOR ALL CATEGORIES
+# ============================================================
+
+[general]
+teacher_model = "claude-opus-4-6"
+temperature = 0.7
+max_tokens = 4096
+
+system_prompt = """
+You are generating fine-tuning training data for a specialized backend development AI assistant called Forge.
+Forge is built by FolkTech AI and runs locally as a Rust CLI tool.
+
+The target model will be fine-tuned to be an expert backend developer specializing in:
+- Rust systems programming
+- API design and implementation
+- Security-first development (red tests, input sanitization, path traversal prevention)
+- Database and persistence patterns
+- Tool systems and plugin architectures
+- Async programming and concurrency
+
+RULES:
+- Generate realistic, practical examples that a backend developer would actually encounter
+- Include reasoning about trade-offs and design decisions
+- Security must be woven into every response, not bolted on
+- Prefer Rust for new code examples, but accept patterns from any backend language
+- Never generate trivial or boilerplate-only examples
+- Every example should teach something non-obvious
+- Include error handling in all code — never show happy-path-only implementations
+"""
+
+# ============================================================
+# ARCHITECTURE DISTILLATION PROMPTS
+# ============================================================
+
+[architecture.instruction]
+description = "Generate instruction → response pairs from architecture code"
+prompt_template = """
+Given this production code from a backend system:
+
+```
+{code}
+```
+
+File: {filename}
+Purpose: {why}
+
+Generate {count} instruction-response pairs where:
+- The instruction is a realistic request a backend developer would make
+- The response includes the implementation WITH reasoning about design choices
+- Each instruction should be phrased differently (varied vocabulary and specificity)
+- At least one should be high-level ("build a permission system") and one specific ("add denial tracking to the classifier")
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+
+The response should include:
+1. Brief explanation of the approach (2-3 sentences)
+2. The code implementation
+3. Key design decisions and why (inline comments or follow-up explanation)
+"""
+count = 5
+
+[architecture.conversation]
+description = "Generate multi-turn conversations building architecture"
+prompt_template = """
+Given this production code:
+
+```
+{code}
+```
+
+File: {filename}
+Purpose: {why}
+
+Generate a realistic multi-turn conversation (4-6 turns) where a developer iteratively builds this system.
+The conversation should show:
+- Starting from a requirement, not "implement this code"
+- Design discussion before coding
+- At least one course correction or refinement
+- Security considerations raised naturally
+- The final implementation matching the provided code's patterns
+
+Format as JSON array of messages:
+[{{"role": "user", "content": "..."}}, {{"role": "assistant", "content": "..."}}]
+"""
+
+[architecture.reasoning]
+description = "Generate design reasoning chains"
+prompt_template = """
+Given this production code:
+
+```
+{code}
+```
+
+File: {filename}
+Purpose: {why}
+
+Generate {count} "why did you design it this way?" instruction-response pairs.
+Each should explain:
+- What alternatives were considered
+- Why this approach was chosen over alternatives
+- What would break if a simpler approach was used
+- Performance/security/maintainability trade-offs
+
+These teach the model to REASON about architecture, not just implement it.
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 3
+
+[architecture.negative]
+description = "Generate 'wrong approach' examples"
+prompt_template = """
+Given this production code (the CORRECT approach):
+
+```
+{code}
+```
+
+File: {filename}
+Purpose: {why}
+
+Generate {count} examples of WRONG approaches to the same problem:
+1. A naive implementation that seems fine but has a subtle flaw
+2. An over-engineered version that adds unnecessary complexity
+3. A version with a security vulnerability
+
+For each, format as:
+{{"instruction": "Review this implementation for issues: [wrong code]", "response": "Here's what's wrong and how to fix it: [analysis + correct approach]"}}
+
+These teach the model to recognize and fix bad patterns.
+"""
+count = 3
+
+# ============================================================
+# SECURITY DISTILLATION PROMPTS
+# ============================================================
+
+[security.instruction]
+description = "Generate security-focused instruction pairs from red tests"
+prompt_template = """
+Given these security red tests:
+
+```
+{code}
+```
+
+File: {filename}
+Attack vectors covered: {why}
+
+Generate {count} instruction-response pairs where:
+- The instruction asks to secure a component or write security tests
+- The response includes the test code AND the secure implementation
+- Include the attack scenario being prevented
+- Explain what would happen if this test didn't exist
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+
+IMPORTANT: Every response must follow the FolkTech red test methodology:
+1. Identify what an attacker could send
+2. Write a test that sends it
+3. Assert the attack fails
+4. Show the fix
+5. Verify the test passes
+"""
+count = 5
+
+[security.conversation]
+description = "Generate 'is this secure?' review conversations"
+prompt_template = """
+Given these security tests and the code they protect:
+
+```
+{code}
+```
+
+File: {filename}
+Attack vectors: {why}
+
+Generate a multi-turn conversation where:
+- User shows code and asks "is this secure?"
+- Assistant identifies vulnerabilities
+- User asks how to fix them
+- Assistant provides fixes WITH red tests
+- Final turn confirms the fix works
+
+This teaches the model to do security code reviews.
+
+Format as JSON array:
+[{{"role": "user", "content": "..."}}, {{"role": "assistant", "content": "..."}}]
+"""
+
+[security.negative]
+description = "Generate vulnerable code + fix examples"
+prompt_template = """
+Given these security red tests:
+
+```
+{code}
+```
+
+Attack vectors: {why}
+
+Generate {count} examples of VULNERABLE code that these tests would catch:
+- Show realistic code a developer might write without thinking about security
+- Show the specific attack input that exploits it
+- Show the red test that catches it
+- Show the fixed version
+
+Format each as:
+{{"instruction": "I wrote this [component]. Is it secure?\\n```[vulnerable code]```", "response": "This has a [vulnerability type] vulnerability. Here's the attack: [attack]\\nHere's the red test: [test]\\nHere's the fix: [fixed code]"}}
+
+These are the MOST VALUABLE training examples — they teach the model to spot vulnerabilities.
+"""
+count = 5
+
+# ============================================================
+# API & SERVICES DISTILLATION PROMPTS
+# ============================================================
+
+[api-services.instruction]
+description = "Generate API design instruction pairs"
+prompt_template = """
+Given this API/service implementation:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate {count} instruction-response pairs covering:
+- Building the service from scratch
+- Adding error handling and retries
+- Handling edge cases (timeout, auth failure, rate limiting)
+- Testing the service
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 4
+
+[api-services.conversation]
+description = "Generate API design multi-turn conversations"
+prompt_template = """
+Given this production service code:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate a multi-turn conversation (4-8 turns) where a developer:
+1. Starts with a basic requirement ("I need to call this API")
+2. Gets a working implementation
+3. Asks about error handling
+4. Asks about retry/timeout
+5. Asks about auth/security
+6. Ends with production-ready code
+
+The conversation should feel natural, with the assistant proactively suggesting improvements.
+
+Format as JSON array:
+[{{"role": "user", "content": "..."}}, {{"role": "assistant", "content": "..."}}]
+"""
+
+[api-services.reasoning]
+description = "Generate API design decision explanations"
+prompt_template = """
+Given this API implementation:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate {count} examples explaining design decisions:
+- Why this abstraction level? (too thin? too thick?)
+- Why these error types?
+- Why this retry/timeout strategy?
+- Why this auth pattern?
+
+Format as JSON:
+{{"instruction": "Why did you [specific decision]?", "response": "[reasoning with trade-offs]"}}
+"""
+count = 3
+
+# ============================================================
+# DATA PERSISTENCE DISTILLATION PROMPTS
+# ============================================================
+
+[data-persistence.instruction]
+description = "Generate persistence pattern instruction pairs"
+prompt_template = """
+Given this data persistence implementation:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate {count} instruction-response pairs covering:
+- Designing the storage schema
+- Implementing CRUD operations
+- Handling concurrent access
+- Migration and versioning
+- Query optimization
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 4
+
+[data-persistence.conversation]
+description = "Generate schema design conversations"
+prompt_template = """
+Given this persistence code:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate a multi-turn conversation about designing this storage system:
+1. Requirements gathering
+2. Schema discussion
+3. Implementation
+4. Optimization/edge cases
+5. Testing strategy
+
+Format as JSON array.
+"""
+
+[data-persistence.reasoning]
+description = "Generate storage design reasoning"
+prompt_template = """
+Given this code:
+
+```
+{code}
+```
+
+File: {filename}
+Pattern: {why}
+
+Generate {count} "why this approach?" pairs:
+- Why SQLite vs Postgres vs file-based?
+- Why WAL mode?
+- Why this indexing strategy?
+- Why dual-store (vector + structured)?
+- Data consistency guarantees
+
+Format as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 3
+
+# ============================================================
+# RUST IDIOMS DISTILLATION PROMPTS
+# ============================================================
+
+[rust-idioms.instruction]
+description = "Generate Rust idiom instruction pairs from pattern extracts"
+prompt_template = """
+Given these Rust code patterns extracted from a production codebase:
+
+```
+{code}
+```
+
+Pattern category: {why}
+
+Generate {count} instruction-response pairs that teach idiomatic Rust:
+- Show the idiomatic way to solve the problem
+- Explain WHY it's idiomatic (ownership, borrowing, type safety)
+- Show common mistakes (fighting the borrow checker, unnecessary clones)
+- Include compiler error examples where relevant
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 5
+
+[rust-idioms.conversation]
+description = "Generate Rust refactoring conversations"
+prompt_template = """
+Given these Rust patterns:
+
+```
+{code}
+```
+
+Pattern: {why}
+
+Generate a conversation where:
+1. Developer shows non-idiomatic code
+2. Assistant identifies issues
+3. Developer asks for idiomatic version
+4. Assistant refactors with explanation
+5. Developer asks follow-up about the pattern
+
+Format as JSON array.
+"""
+
+[rust-idioms.negative]
+description = "Generate anti-pattern → fix examples"
+prompt_template = """
+Given these CORRECT Rust patterns:
+
+```
+{code}
+```
+
+Pattern: {why}
+
+Generate {count} anti-pattern examples:
+- Code that compiles but is wrong (unnecessary clone, blocking in async, etc.)
+- Code that won't compile + the compiler error + the fix
+- Code that has subtle bugs (data races, use-after-free risks)
+
+Format as:
+{{"instruction": "What's wrong with this Rust code?\\n```[anti-pattern]```", "response": "[analysis + idiomatic fix]"}}
+"""
+count = 4
+
+# ============================================================
+# TESTING METHODOLOGY DISTILLATION PROMPTS
+# ============================================================
+
+[testing-methodology.instruction]
+description = "Generate testing methodology instruction pairs"
+prompt_template = """
+Given these tests:
+
+```
+{code}
+```
+
+File: {filename}
+Methodology: {why}
+
+Generate {count} instruction-response pairs that teach:
+- How to write this type of test from scratch
+- What makes a good vs bad test for this scenario
+- How to identify what needs testing
+- The FolkTech red test methodology
+
+Format each as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 4
+
+[testing-methodology.conversation]
+description = "Generate test-driven development conversations"
+prompt_template = """
+Given these tests and the code they test:
+
+```
+{code}
+```
+
+File: {filename}
+Methodology: {why}
+
+Generate a TDD conversation:
+1. User describes what they want to build
+2. Assistant writes the test FIRST
+3. User confirms the test
+4. Assistant writes the implementation to pass the test
+5. User asks about edge cases
+6. Assistant adds more tests + implementation
+
+Format as JSON array.
+"""
+
+[testing-methodology.reasoning]
+description = "Generate testing strategy reasoning"
+prompt_template = """
+Given these tests:
+
+```
+{code}
+```
+
+Methodology: {why}
+
+Generate {count} "why test it this way?" pairs:
+- Why this assertion strategy?
+- Why test this edge case?
+- Why this test structure (setup → act → assert)?
+- Why mock X but not Y?
+- What would break if this test didn't exist?
+
+Format as JSON:
+{{"instruction": "...", "response": "..."}}
+"""
+count = 3
