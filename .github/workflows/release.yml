@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: forge-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: forge-macos-x86_64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: forge-linux-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: forge-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: cp target/${{ matrix.target }}/release/forge ${{ matrix.name }}
+
+      - name: Rename binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: copy target\${{ matrix.target }}\release\forge.exe ${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create tar.gz archives (Unix binaries)
+        run: |
+          cd artifacts
+          for dir in forge-macos-* forge-linux-*; do
+            [ -d "$dir" ] || continue
+            binary=$(ls "$dir")
+            chmod +x "$dir/$binary"
+            tar czf "${binary}.tar.gz" -C "$dir" "$binary"
+          done
+
+      - name: Create zip archive (Windows binary)
+        run: |
+          cd artifacts
+          for dir in forge-windows-*; do
+            [ -d "$dir" ] || continue
+            binary=$(ls "$dir")
+            zip "${binary%.exe}.zip" -j "$dir/$binary"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
