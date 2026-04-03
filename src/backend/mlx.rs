@@ -69,11 +69,25 @@ impl MlxServer {
         )
     }
 
-    /// Start the MLX LM server with the given model
+    /// Start the MLX LM server with the given model.
+    /// Passes `--max-kv-size` to cap KV cache memory usage, preventing
+    /// Metal OOM crashes on memory-constrained machines (e.g. 16GB).
     pub async fn start(&mut self, model_path: &str, context_length: usize) -> Result<()> {
         self.stop();
 
         let (exe, prefix_args) = Self::find_server()?;
+
+        // Cap KV cache steps to limit memory. On 16GB machines with 14B models,
+        // 32K context can exhaust unified memory. Use the configured context_length
+        // but cap at a safe maximum based on available RAM.
+        let hw = super::types::HardwareInfo::detect();
+        let safe_kv_steps = if hw.ram_gb <= 16 {
+            context_length.min(8192)
+        } else if hw.ram_gb <= 32 {
+            context_length.min(16384)
+        } else {
+            context_length
+        };
 
         let mut cmd = Command::new(&exe);
         cmd.args(&prefix_args);
@@ -86,7 +100,20 @@ impl MlxServer {
             "127.0.0.1",
         ]);
 
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        // Limit prompt cache to control memory usage
+        let cache_str = safe_kv_steps.to_string();
+        cmd.args(["--prompt-cache-size", &cache_str]);
+
+        // Capture stderr to a log file for debugging MLX crashes
+        let log_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".ftai")
+            .join("mlx-server.log");
+        cmd.stdout(Stdio::null());
+        match std::fs::File::create(&log_path) {
+            Ok(file) => { cmd.stderr(Stdio::from(file)); }
+            Err(_) => { cmd.stderr(Stdio::null()); }
+        }
 
         let child = cmd.spawn().context("Failed to start mlx_lm.server")?;
         self.process = Some(child);

@@ -467,39 +467,6 @@ impl TuiApp {
             let _ = mgr.start_session();
         }
 
-        // Warm up model KV cache with system prompt so first user message is fast.
-        // Send a minimal request that forces the model to prefill the system prompt.
-        if self.backend.health_check().await {
-            self.messages.push(DisplayMessage::System(
-                "Warming up model...".to_string(),
-            ));
-            terminal.draw(|frame| self.render(frame))?;
-
-            let warmup_request = crate::backend::types::ChatRequest {
-                messages: vec![
-                    crate::backend::types::Message {
-                        role: crate::backend::types::Role::System,
-                        content: self.engine.system_prompt().to_string(),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                    crate::backend::types::Message {
-                        role: crate::backend::types::Role::User,
-                        content: "hello".to_string(),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                ],
-                tools: vec![],
-                temperature: 0.0,
-                max_tokens: Some(1), // Generate just 1 token — we only want KV cache built
-                model_id: self.config.model.path.clone(),
-            };
-            let _ = self.backend.generate(&warmup_request).await;
-            // Remove the warmup messages
-            self.messages.retain(|m| !matches!(m, DisplayMessage::System(s) if s == "Warming up model..."));
-        }
-
         // Run session_start hook
         {
             let mut env = std::collections::HashMap::new();
