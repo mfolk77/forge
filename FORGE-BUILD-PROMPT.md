@@ -1,13 +1,12 @@
-# Forge Build Prompt — Claude Code Implementation Sprint
+# Forge Build Prompt — Implementation Sprint
 
 **Date:** 2026-04-01
 **Working directory:** ~/Developer/forge/
 **Architecture docs:** Read ALL of these before writing any code:
 - `docs/plans/2026-03-27-forge-architecture.md` (main architecture)
 - `docs/plans/2026-03-27-tool-calling-subsystem-design.md` (tool calling)
-- `docs/plans/2026-03-31-claude-code-lessons-learned.md` (9 amendments from Claude Code analysis)
+- `docs/plans/2026-03-31-architecture-amendments.md` (9 amendments from reference architecture analysis)
 - `docs/plans/2026-03-31-agent-loop-anatomy.md` (agent loop deep-dive)
-- `CLAUDE.md` (project conventions and gotchas)
 
 **Existing codebase:** ~/Developer/forge/ has 212 passing tests and 81 Rust source files. The modules listed as "REUSED from FTAI" already exist and work. Do NOT rewrite them. You are adding NEW modules only.
 
@@ -591,7 +590,7 @@ pub async fn agent_loop(ctx: &mut AgentContext) -> Result<()> {
 
 ---
 
-## Appendix: Patterns From Claude Code Source (final extraction)
+## Appendix: Reference Architecture Patterns (final extraction)
 
 ### A. Summarize Compact Prompt Structure
 

@@ -4,10 +4,9 @@ You are building Forge, a local-first AI coding assistant in Rust. The codebase 
 
 ## Step 1: Read these docs first (mandatory, do not skip)
 
-1. `CLAUDE.md` — project conventions, gotchas, existing module list
-2. `docs/plans/2026-03-27-forge-architecture.md` — full architecture (read sections 1-10)
-3. `docs/plans/2026-03-31-claude-code-lessons-learned.md` — 9 amendments with Rust code designs
-4. `docs/plans/2026-03-31-agent-loop-anatomy.md` — agent loop patterns from learn-claude-code
+1. `docs/plans/2026-03-27-forge-architecture.md` — full architecture (read sections 1-10)
+2. `docs/plans/2026-03-31-architecture-amendments.md` — 9 amendments with Rust code designs
+3. `docs/plans/2026-03-31-agent-loop-anatomy.md` — agent loop patterns
 5. `FORGE-BUILD-PROMPT.md` — full implementation spec with struct definitions, test requirements, and appendices
 
 Read ALL five before writing any code. The implementation spec in FORGE-BUILD-PROMPT.md is the source of truth — it has exact struct definitions, function signatures, test lists, and the orchestrator wiring code.

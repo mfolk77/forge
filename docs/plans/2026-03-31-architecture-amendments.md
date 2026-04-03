@@ -1,17 +1,17 @@
-# Forge Architecture Update: Lessons from Claude Code Source Analysis
+# Forge Architecture Update: Lessons from Modern AI Coding Assistants
 
 **Date:** 2026-03-31
 **Status:** Approved amendments to `2026-03-27-forge-architecture.md`
-**Source:** Analysis of three repositories:
-1. `anthropics/claude-code` — official plugin ecosystem + distribution
-2. `affaan-m/everything-claude-code` — community config toolkit (36 agents, 144 skills, 70+ commands)
-3. `sanbuphy/claude-code-source-code` — decompiled TypeScript source of Claude Code v2.1.88 (~380K lines)
+**Source:** Analysis of modern AI coding assistant architectures:
+1. Open-source plugin ecosystems and community config toolkits
+2. Reference implementations of agent loop patterns
+3. Decompiled and open-source AI coding assistant internals
 
 ---
 
 ## Summary of Changes
 
-This document specifies concrete architecture amendments to Forge based on reverse-engineering Claude Code's internals. Changes are organized by the section they amend in the main architecture doc.
+This document specifies concrete architecture amendments to Forge based on analysis of modern AI coding assistants. Changes are organized by the section they amend in the main architecture doc.
 
 ---
 
@@ -21,7 +21,7 @@ This document specifies concrete architecture amendments to Forge based on rever
 
 Section 7.3 defines a `TokenBudget` with `should_compact()` returning true at 80% usage, but never defines **what compaction does**. The current `truncate_tool_result()` only handles individual tool results. There is no strategy for when the full conversation history exceeds the budget.
 
-Claude Code has a 200K token context window and still needs aggressive three-tier compaction. Forge has 32K. This is survival, not optimization.
+A 200K token context window still needs aggressive three-tier compaction. Forge has 32K. This is survival, not optimization.
 
 ### Design: Three-Tier Compaction
 
@@ -114,9 +114,9 @@ impl ContextCompactor {
 }
 ```
 
-### Key insight from Claude Code
+### Key insight from reference implementations
 
-Claude Code's `snipCompact` is **deterministic** — no model call needed. It removes old messages and re-appends system context. This is critical for Forge where every model call is expensive (local inference at 35 tok/s). The **reinject pattern** is equally important: after compaction, skills, rules, and tool definitions must be re-attached so the model doesn't lose awareness of its capabilities.
+The reference `snipCompact` is **deterministic** — no model call needed. It removes old messages and re-appends system context. This is critical for Forge where every model call is expensive (local inference at 35 tok/s). The **reinject pattern** is equally important: after compaction, skills, rules, and tool definitions must be re-attached so the model doesn't lose awareness of its capabilities.
 
 ---
 
@@ -128,7 +128,7 @@ Section 5 defines the `Tool` trait with `execute()` returning `Result<ToolResult
 - Cancelling a running tool (user presses Ctrl+C during a long bash command)
 - Streaming progress back to the TUI (file indexing, large reads)
 
-Claude Code gives every tool an abort signal and progress callbacks. This makes the TUI dramatically more responsive.
+Modern AI coding assistants give every tool an abort signal and progress callbacks. This makes the TUI dramatically more responsive.
 
 ### Design
 
@@ -231,7 +231,7 @@ The orchestrator passes `CancellationToken` created on Ctrl+C and routes `ToolPr
 
 ### Problem
 
-Section 7.1 uses SQLite for everything: session transcripts AND evolution analytics. Claude Code uses **append-only JSONL per session** for transcripts, which is:
+Section 7.1 uses SQLite for everything: session transcripts AND evolution analytics. Reference implementations use **append-only JSONL per session** for transcripts, which is:
 - Crash-safe (no transactions, append-only)
 - Debuggable (`cat session.jsonl | jq`)
 - Streamable (`tail -f` during debugging)
@@ -292,7 +292,7 @@ pub fn load_session(path: &Path) -> Result<Vec<Message>> {
 
 Section 8.4's `LazyRuleLoader` walks directory parents looking for `.ftai/RULES.md`. This works for module-level scoping but doesn't support **file-type-specific rules** (e.g., "Rust rules only load when working on .rs files").
 
-The everything-claude-code repo uses glob matchers in YAML frontmatter:
+Community config toolkits use glob matchers in YAML frontmatter:
 
 ```yaml
 ---
@@ -371,7 +371,7 @@ This is cheap (glob matching is microseconds) and prevents Forge from loading 10
 
 ### Problem
 
-Forge's architecture treats FTAI Rules and knowledge files as the only extension points. Claude Code separates **rules** (always-on, small, convention enforcement) from **skills** (on-demand, can be large, domain knowledge + workflows). With a 32K context window, injecting all knowledge upfront is not viable.
+Forge's architecture treats FTAI Rules and knowledge files as the only extension points. Modern AI coding assistants separate **rules** (always-on, small, convention enforcement) from **skills** (on-demand, can be large, domain knowledge + workflows). With a 32K context window, injecting all knowledge upfront is not viable.
 
 ### Design: FTAI Skills
 
@@ -470,7 +470,7 @@ impl SkillRegistry {
 
 Section 3 describes llama.cpp FFI as primary and MLX as Mac-specific alternative, but doesn't define runtime selection or fallback behavior.
 
-Claude Code's audio system uses a **memoized probe pattern**: try each backend at startup, cache the first working one, never re-probe.
+Reference implementations use a **memoized probe pattern**: try each backend at startup, cache the first working one, never re-probe.
 
 ### Design
 
@@ -573,7 +573,7 @@ This enables:
 
 ### Problem
 
-Forge has no event-driven automation. Claude Code and everything-claude-code both implement hooks — shell commands triggered by events like tool calls, file edits, or session lifecycle.
+Forge has no event-driven automation. Modern AI coding assistants implement hooks — shell commands triggered by events like tool calls, file edits, or session lifecycle.
 
 ### Design
 
@@ -653,7 +653,7 @@ impl HookRunner {
 
 ### Problem
 
-Section 5.3 uses static safety levels. Claude Code adds a **contextual classifier** that considers the conversation context when deciding permissions. For Forge, we can't call a cloud classifier, but we can use the local model itself.
+Section 5.3 uses static safety levels. Reference implementations add a **contextual classifier** that considers the conversation context when deciding permissions. For Forge, we can't call a cloud classifier, but we can use the local model itself.
 
 ### Design: Lightweight local classification
 

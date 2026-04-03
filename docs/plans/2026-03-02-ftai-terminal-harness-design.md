@@ -5,7 +5,7 @@
 
 ## Overview
 
-`ftai` is a Rust CLI terminal coding assistant powered by local models (llama.cpp + MLX) with a custom rules DSL for governance. It provides Claude Code-level tool capabilities while giving the user full control over the AI's behavior through enforceable rules.
+`ftai` is a Rust CLI terminal coding assistant powered by local models (llama.cpp + MLX) with a custom rules DSL for governance. It provides full tool capabilities while giving the user full control over the AI's behavior through enforceable rules.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ ftai CLI binary
 ├── conversation/ — message history, context management, tool call parsing
 ├── rules/        — DSL parser, evaluator, enforcement hooks
 ├── backend/      — llama.cpp + MLX inference (trait-based)
-├── tools/        — 11 tools at Claude Code parity
+├── tools/        — 11 tools at full coding assistant parity
 └── config/       — TOML config loading, merging
 ```
 

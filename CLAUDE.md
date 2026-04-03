@@ -15,10 +15,10 @@
 ## Architecture Docs
 - Main: `docs/plans/2026-03-27-forge-architecture.md`
 - Tool calling: `docs/plans/2026-03-27-tool-calling-subsystem-design.md`
-- Claude Code amendments: `docs/plans/2026-03-31-claude-code-lessons-learned.md`
+- Architecture amendments: `docs/plans/2026-03-31-architecture-amendments.md`
 - Agent loop deep-dive: `docs/plans/2026-03-31-agent-loop-anatomy.md`
 
-## Agent Loop Design (from learn-claude-code analysis)
+## Agent Loop Design
 - Loop is stateless — exits on `stop_reason != tool_use`, model decides when to stop
 - Tool results are user messages — conversation always alternates user/assistant
 - Errors are tool results — never crash from tool error, let model decide next action
@@ -27,7 +27,7 @@
 - Persistent state (tasks, team) lives on disk, survives context compaction
 - Background execution: fire-and-forget spawn, drain notification queue at top of loop
 
-## Context Management (from CC analysis)
+## Context Management
 - 32K context window, ~26K available for conversation after system overhead
 - Three-tier compaction: microcompact (truncate tool results) → snip (deterministic old message removal) → summarize (emergency model call)
 - Post-compaction reinject: FTAI rules, active skills, tool definitions re-attached after snip

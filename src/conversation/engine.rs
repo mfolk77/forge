@@ -61,6 +61,12 @@ impl ConversationEngine {
 
     /// Build a ChatRequest for the model
     pub fn build_request(&self, config: &Config) -> ChatRequest {
+        self.build_request_with_mode(config, false)
+    }
+
+    /// Build request optimized for mode. In chat mode, tools are omitted
+    /// so the model doesn't waste prefill time on tool schemas.
+    pub fn build_request_with_mode(&self, config: &Config, chat_mode: bool) -> ChatRequest {
         let mut messages = vec![Message {
             role: Role::System,
             content: self.system_prompt.clone(),
@@ -71,7 +77,7 @@ impl ConversationEngine {
 
         ChatRequest {
             messages,
-            tools: self.tools.clone(),
+            tools: if chat_mode { vec![] } else { self.tools.clone() },
             temperature: config.model.temperature,
             max_tokens: Some(4096),
             model_id: config.model.path.clone(),
@@ -225,6 +231,10 @@ impl ConversationEngine {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
     }
 
     pub fn update_system_prompt(&mut self, prompt: String) {

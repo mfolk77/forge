@@ -1,7 +1,7 @@
-# The Anatomy of an Agent Loop: Lessons from learn-claude-code
+# The Anatomy of an Agent Loop: Modern AI Assistant Patterns
 
 **Date:** 2026-03-31
-**Source:** [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) — a minimal Python distillation of Claude Code's architecture into ~11 composable sessions
+**Source:** Analysis of open-source agent loop implementations and modern AI coding assistant patterns
 **Purpose:** Extract every load-bearing pattern from the agent loop for Forge's Rust implementation
 
 ---
@@ -10,7 +10,7 @@
 
 > The harness is the world the model inhabits. The model is the intelligence. The harness is not.
 
-An AI coding agent is not a model. It's a **while loop** with a model inside it. Everything else — tools, memory, permissions, teams, autonomy — is layered on top of that loop without changing its fundamental shape. learn-claude-code proves this by building the full architecture in 11 progressive sessions, where the loop itself never changes.
+An AI coding agent is not a model. It's a **while loop** with a model inside it. Everything else — tools, memory, permissions, teams, autonomy — is layered on top of that loop without changing its fundamental shape. Reference implementations prove this by building the full architecture in progressive sessions, where the loop itself never changes.
 
 ---
 
@@ -259,9 +259,9 @@ body = match.group(2).strip()
 
 ### Forge implication
 
-This directly validates Forge's Amendment 5 (Skills system) from the Claude Code lessons. The implementation should be nearly identical — YAML frontmatter parsed at startup, bodies loaded lazily. The `<skill>` XML wrapper tag helps the model distinguish skill content from regular tool output.
+This directly validates Forge's Amendment 5 (Skills system) from the architecture amendments. The implementation should be nearly identical — YAML frontmatter parsed at startup, bodies loaded lazily. The `<skill>` XML wrapper tag helps the model distinguish skill content from regular tool output.
 
-Forge's trigger-based loading (matching keywords in user input) is an optimization on top of this. learn-claude-code uses explicit `load_skill()` calls, which is simpler but requires the model to know when to load a skill. Triggers automate that decision.
+Forge's trigger-based loading (matching keywords in user input) is an optimization on top of this. The reference implementation uses explicit `load_skill()` calls, which is simpler but requires the model to know when to load a skill. Triggers automate that decision.
 
 ---
 
@@ -335,13 +335,13 @@ Before any compaction, the full transcript is written to disk. This means:
 
 This is the strongest validation of Forge's Amendment 1 (Context Compaction). The three tiers map directly:
 
-| learn-claude-code | Forge Amendment 1 |
+| Reference Implementation | Forge Amendment 1 |
 |---|---|
 | micro_compact (replace old tool_results) | Tier 1: Microcompact |
 | auto_compact (LLM summarize) | Tier 3: Summarize compact |
 | (missing) | Tier 2: Snip compact (deterministic, no model call) |
 
-Forge adds a **middle tier** (snip compact) that learn-claude-code doesn't have. This is because Forge uses local models where every model call is expensive (~35 tok/s). Snip compact — deterministic removal of old messages without summarization — fills the gap between "free but shallow" microcompact and "expensive but thorough" summarization.
+Forge adds a **middle tier** (snip compact) that the reference implementation doesn't have. This is because Forge uses local models where every model call is expensive (~35 tok/s). Snip compact — deterministic removal of old messages without summarization — fills the gap between "free but shallow" microcompact and "expensive but thorough" summarization.
 
 The `read_file` preservation rule is important and should be carried over to Forge. When the model reads a file, it's building working memory for an edit. Compacting that forces a re-read, which wastes a turn. Forge should preserve the last N `file_read` results (where N = 3-5) during microcompact.
 
@@ -583,7 +583,7 @@ The lock prevents two teammates from claiming the same task. This is the simples
 
 ### Identity re-injection
 
-After context compaction, the model forgets who it is. learn-claude-code solves this:
+After context compaction, the model forgets who it is. The reference implementation solves this:
 
 ```python
 def make_identity_block(name, role, team_name):
@@ -607,7 +607,7 @@ For Forge v1 (single agent), the relevant takeaway is **identity re-injection**:
 
 ## The Pre-LLM-Call Checklist
 
-The full integration (s_full.py) reveals the order of operations before every model call:
+The full integration reveals the order of operations before every model call:
 
 ```
 1. Drain background notifications → inject as user message
@@ -669,7 +669,7 @@ pub async fn agent_loop(ctx: &mut AgentContext) -> Result<()> {
 
 ## Error Handling Philosophy
 
-learn-claude-code has a consistent error handling strategy:
+The reference implementation has a consistent error handling strategy:
 
 **Errors are tool results, not exceptions.**
 
@@ -697,7 +697,7 @@ The one exception: **cancellation**. If the user presses Ctrl+C, the tool should
 
 ## State Persistence Strategy
 
-learn-claude-code uses four persistence mechanisms:
+The reference implementation uses four persistence mechanisms:
 
 | What | Where | Survives compaction? | Survives session end? |
 |------|-------|---------------------|----------------------|
@@ -711,18 +711,18 @@ The key insight: **anything that must survive compaction lives on disk, not in m
 
 ### Forge mapping
 
-| learn-claude-code | Forge equivalent |
+| Reference Implementation | Forge equivalent |
 |---|---|
 | `.transcripts/*.jsonl` | `~/.ftai/sessions/<project>/<session>.jsonl` |
 | `.tasks/task_*.json` | Same (file-per-task in project dir) |
 | `.team/inbox/*.jsonl` | Future: multi-agent coordination |
 | `skills/*/SKILL.md` | `~/.ftai/skills/` + `<project>/.ftai/skills/` |
 | In-memory messages | In-memory `Vec<Message>` |
-| Evolution data | `~/.ftai/evolution/evolution.db` (SQLite, not in learn-claude-code) |
+| Evolution data | `~/.ftai/evolution/evolution.db` (SQLite, Forge-specific) |
 
 ---
 
-## What learn-claude-code Doesn't Have (and Forge Needs)
+## What the Reference Implementation Doesn't Have (and Forge Needs)
 
 1. **Streaming.** All LLM calls are blocking. Forge needs token-by-token streaming for TUI responsiveness.
 
@@ -740,7 +740,7 @@ The key insight: **anything that must survive compaction lives on disk, not in m
 
 8. **Knowledge grounding.** No logit-level enforcement. Forge has the KnowledgeSampler.
 
-These are all **additive** — they layer on top of the loop without changing it. The loop from learn-claude-code's s01 is the same loop in Forge. Everything else is policy.
+These are all **additive** — they layer on top of the loop without changing it. The core loop from the reference implementation is the same loop in Forge. Everything else is policy.
 
 ---
 

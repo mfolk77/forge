@@ -102,6 +102,8 @@ pub struct TuiApp {
     budget_tracker: TokenBudgetTracker,
     /// Last-known mtime of FTAI.md for hot-reload detection
     ftai_mtime: Option<std::time::SystemTime>,
+    /// Session persistence manager
+    session_manager: Option<crate::session::manager::SessionManager>,
 }
 
 impl TuiApp {
@@ -264,6 +266,17 @@ impl TuiApp {
         let budget_tracker = TokenBudgetTracker::new();
         let ftai_mtime = Self::read_ftai_mtime(&project_path);
 
+        // Initialize session persistence
+        let session_manager = crate::config::global_config_dir()
+            .ok()
+            .map(|d| d.join("sessions.db"))
+            .and_then(|db_path| {
+                crate::session::manager::SessionManager::open(
+                    &db_path,
+                    &project_path.to_string_lossy(),
+                ).ok()
+            });
+
         Self {
             config,
             backend,
@@ -293,6 +306,7 @@ impl TuiApp {
             denial_tracker,
             budget_tracker,
             ftai_mtime,
+            session_manager,
         }
     }
 
@@ -357,6 +371,64 @@ impl TuiApp {
         self.engine.update_system_prompt(new_prompt);
     }
 
+    /// Resume the most recent session — reload messages into the conversation engine
+    /// and display history so the user can continue where they left off.
+    pub fn resume_last_session(&mut self) {
+        let Some(ref mut mgr) = self.session_manager else { return };
+
+        match mgr.resume_latest() {
+            Ok(Some((session_id, messages))) => {
+                if messages.is_empty() {
+                    self.messages.push(DisplayMessage::System(
+                        "Previous session was empty. Starting fresh.".to_string(),
+                    ));
+                    return;
+                }
+
+                let msg_count = messages.len();
+
+                // Replay messages into the conversation engine and display
+                for msg in &messages {
+                    match msg.role {
+                        crate::backend::types::Role::User => {
+                            self.messages.push(DisplayMessage::User(msg.content.clone()));
+                            self.engine.add_user_message(&msg.content);
+                        }
+                        crate::backend::types::Role::Assistant => {
+                            if !msg.content.trim().is_empty() {
+                                self.messages.push(DisplayMessage::Assistant(msg.content.clone()));
+                            }
+                            self.engine.add_assistant_message(crate::backend::types::ChatResponse {
+                                message: msg.clone(),
+                                tokens_used: Default::default(),
+                                stop_reason: crate::backend::types::StopReason::EndOfText,
+                            });
+                        }
+                        _ => {
+                            // Tool results — add to engine but don't display
+                            self.engine.add_user_message(&msg.content);
+                        }
+                    }
+                }
+
+                let short_id = &session_id[..8.min(session_id.len())];
+                self.messages.push(DisplayMessage::System(
+                    format!("Resumed session {short_id} ({msg_count} messages)"),
+                ));
+            }
+            Ok(None) => {
+                self.messages.push(DisplayMessage::System(
+                    "No previous sessions found. Starting fresh.".to_string(),
+                ));
+            }
+            Err(e) => {
+                self.messages.push(DisplayMessage::System(
+                    format!("Failed to resume: {e}"),
+                ));
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         // Enter TUI mode FIRST so the user can see the splash and exit
         terminal::enable_raw_mode()?;
@@ -390,6 +462,44 @@ impl TuiApp {
             }
         }
 
+        // Start a new session for persistence
+        if let Some(ref mut mgr) = self.session_manager {
+            let _ = mgr.start_session();
+        }
+
+        // Warm up model KV cache with system prompt so first user message is fast.
+        // Send a minimal request that forces the model to prefill the system prompt.
+        if self.backend.health_check().await {
+            self.messages.push(DisplayMessage::System(
+                "Warming up model...".to_string(),
+            ));
+            terminal.draw(|frame| self.render(frame))?;
+
+            let warmup_request = crate::backend::types::ChatRequest {
+                messages: vec![
+                    crate::backend::types::Message {
+                        role: crate::backend::types::Role::System,
+                        content: self.engine.system_prompt().to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    crate::backend::types::Message {
+                        role: crate::backend::types::Role::User,
+                        content: "hello".to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+                tools: vec![],
+                temperature: 0.0,
+                max_tokens: Some(1), // Generate just 1 token — we only want KV cache built
+                model_id: self.config.model.path.clone(),
+            };
+            let _ = self.backend.generate(&warmup_request).await;
+            // Remove the warmup messages
+            self.messages.retain(|m| !matches!(m, DisplayMessage::System(s) if s == "Warming up model..."));
+        }
+
         // Run session_start hook
         {
             let mut env = std::collections::HashMap::new();
@@ -398,6 +508,11 @@ impl TuiApp {
         }
 
         let result = self.main_loop(&mut terminal).await;
+
+        // End session persistence
+        if let Some(ref mut mgr) = self.session_manager {
+            let _ = mgr.end_session("Session ended by user");
+        }
 
         // Run session_end hook
         {
@@ -1001,6 +1116,9 @@ author = ""
         // Add user message
         self.messages.push(DisplayMessage::User(text.clone()));
         self.engine.add_user_message(&text);
+        if let Some(ref mgr) = self.session_manager {
+            let _ = mgr.save_message(crate::backend::types::Role::User, &text, None);
+        }
 
         // Start the agentic loop
         self.run_agentic_loop().await
@@ -1012,15 +1130,18 @@ author = ""
     /// intermediate turns).
     async fn run_agentic_loop(&mut self) -> Result<()> {
         const MAX_TURNS: usize = 25;
+        let is_chat = self.mode == Mode::Chat;
 
         for turn in 0..MAX_TURNS {
             // Check for FTAI.md hot-reload before each LLM call
             self.check_ftai_reload();
-            // Run compaction before each LLM call
-            self.engine.micro_compact();
-            self.engine.compact();
+            // Skip compaction in chat mode — no tool results to compact
+            if !is_chat {
+                self.engine.micro_compact();
+                self.engine.compact();
+            }
             self.is_generating = true;
-            let request = self.engine.build_request(&self.config);
+            let request = self.engine.build_request_with_mode(&self.config, is_chat);
 
             if turn == 0 {
                 // First turn: try streaming for live token display
@@ -1126,7 +1247,10 @@ author = ""
         // In Chat mode skip tool call parsing — display the full response as text.
         if self.mode == Mode::Chat {
             if !content.trim().is_empty() {
-                self.messages.push(DisplayMessage::Assistant(content));
+                self.messages.push(DisplayMessage::Assistant(content.clone()));
+            }
+            if let Some(ref mgr) = self.session_manager {
+                let _ = mgr.save_message(crate::backend::types::Role::Assistant, &content, None);
             }
             self.engine.add_assistant_message(response);
             return Ok(());
@@ -1138,6 +1262,12 @@ author = ""
         if !display_text.trim().is_empty() {
             self.messages
                 .push(DisplayMessage::Assistant(Self::clean_model_output(&display_text)));
+        }
+
+        // Save assistant message to session (with tool calls if any)
+        if let Some(ref mgr) = self.session_manager {
+            let tc = response.message.tool_calls.as_deref();
+            let _ = mgr.save_message(crate::backend::types::Role::Assistant, &content, tc);
         }
 
         self.engine.add_assistant_message(response);

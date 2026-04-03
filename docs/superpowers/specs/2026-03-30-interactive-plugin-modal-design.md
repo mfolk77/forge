@@ -9,7 +9,7 @@ Add an interactive modal overlay system to Forge's TUI, starting with two modals
 1. **`/plugin`** — tabbed plugin browser (Discover, Installed) with search, toggle, install, detail views
 2. **`/skill`** — scrollable skill list (User skills, Plugin skills, Builtin) with token counts
 
-Modeled after Claude Code's plugin/skill UI.
+Modeled after modern AI coding assistant plugin/skill UIs.
 
 ## Architecture
 

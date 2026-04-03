@@ -24,8 +24,8 @@
 
 ---
 
-> **2026-03-31 UPDATE:** Nine architecture amendments based on Claude Code source analysis
-> have been approved. See [`2026-03-31-claude-code-lessons-learned.md`](2026-03-31-claude-code-lessons-learned.md)
+> **2026-03-31 UPDATE:** Nine architecture amendments based on analysis of modern AI coding assistants
+> have been approved. See [`2026-03-31-architecture-amendments.md`](2026-03-31-architecture-amendments.md)
 > for: context compaction (P0), tool abort/progress signals (P0), JSONL transcripts,
 > glob-matched rule loading, skills system, inference fallback chain, cargo feature gates,
 > hook system, and permission denial tracking.
@@ -34,7 +34,7 @@
 
 ## 1. Executive Summary
 
-Forge is a local-first AI development assistant. Single Rust binary. No cloud dependency. It replaces Claude Code for users who want full control over their AI tooling, running Qwen 3.5 models on consumer hardware.
+Forge is a local-first AI development assistant. Single Rust binary. No cloud dependency. It replaces cloud-dependent AI coding assistants for users who want full control over their tooling, running Qwen 3.5 models on consumer hardware.
 
 **What changes from FTAI to Forge:**
 - FTAI's llama-server subprocess model becomes direct FFI to llama.cpp (C API)
@@ -1037,7 +1037,7 @@ impl Tool for SemanticSearchTool {
     // execute() calls search::query::search()
 }
 
-// src/tools/list_dir.rs -- NEW (split from glob for Claude Code parity)
+// src/tools/list_dir.rs -- NEW (split from glob for full coding assistant parity)
 pub struct ListDirTool;
 
 impl Tool for ListDirTool {
@@ -1811,7 +1811,7 @@ The SQLite backend is a drop-in replacement for the file loader. Same `RuleSet` 
 - Simple distribution: single binary, no GUI dependencies
 - Works in any terminal (SSH, tmux, bare metal)
 - Faster iteration: no Tauri/React build overhead
-- Matches Claude Code's UX model (terminal-first)
+- Matches the terminal-first UX model used by modern AI coding assistants
 - Lower memory footprint (no Electron/WebView)
 
 **Cons:**
@@ -1910,8 +1910,8 @@ forge/                              # Renamed from ftai/
 │       ├── 2026-03-02-ftai-terminal-harness-design.md
 │       ├── 2026-03-02-ftai-implementation-plan.md
 │       ├── 2026-03-27-forge-architecture.md          # This document
-│       ├── 2026-03-31-claude-code-lessons-learned.md # Amendments from CC analysis
-│       └── 2026-03-31-agent-loop-anatomy.md          # Agent loop deep-dive from learn-claude-code
+│       ├── 2026-03-31-architecture-amendments.md     # Architecture amendments
+│       └── 2026-03-31-agent-loop-anatomy.md          # Agent loop deep-dive
 ├── scripts/
 │   └── mlx_server.py              # MLX inference subprocess script
 ├── vendor/
@@ -2707,7 +2707,7 @@ Level 1 validates every concept. Level 2 bakes it into the architecture. Everyth
 
 ## 13. TUI/UX Specification
 
-### 13.1 Design Philosophy: The Aider-Claude Code Marriage
+### 13.1 Design Philosophy: Best of Terminal AI Assistants
 
 **Do first, explain when it matters.**
 

@@ -449,12 +449,18 @@ pub fn render_messages(
         lines.push(Line::from(""));
     }
 
-    // Bottom-align: pad with empty lines so content sits near the input
+    // Bottom-align: pad with empty lines so content sits near the input.
+    // Use ceiling division to account for wrapped lines — a 161-char line
+    // in an 80-col terminal takes 3 visual rows, not 2.
     let total_visual_rows: usize = lines
         .iter()
         .map(|line| {
             let char_count: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            (char_count / area_width).max(1)
+            if char_count == 0 {
+                1 // empty lines still take 1 row
+            } else {
+                (char_count + area_width - 1) / area_width
+            }
         })
         .sum();
     let visible_rows = area.height as usize;

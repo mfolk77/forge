@@ -9,7 +9,7 @@
 
 ## 1. Problem Statement
 
-Tool calling is the single hardest problem in building a local Claude Code clone. Frontier models (Claude, GPT-4) have tool calling fine-tuned into the weights and use structured output APIs. Local models -- even strong ones like Qwen 3.5 -- are significantly less reliable at producing well-formed tool calls. The gap is not small. A coding assistant that cannot reliably invoke tools is useless.
+Tool calling is the single hardest problem in building a local AI coding assistant. Frontier models (Claude, GPT-4) have tool calling fine-tuned into the weights and use structured output APIs. Local models -- even strong ones like Qwen 3.5 -- are significantly less reliable at producing well-formed tool calls. The gap is not small. A coding assistant that cannot reliably invoke tools is useless.
 
 This document designs the complete tool-calling subsystem for FTAI, targeting Qwen 3.5 (9B, 27B, 35B-A3B) running via llama.cpp and MLX backends.
 

@@ -3,6 +3,16 @@ use std::path::Path;
 
 use crate::backend::types::{Message, Role, ToolCall};
 
+/// Summary of a past session for listing.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub summary: Option<String>,
+    pub message_count: i64,
+}
+
 /// Manages session persistence: messages, summaries, and continuity across restarts.
 #[derive(Debug)]
 pub struct SessionManager {
@@ -153,6 +163,63 @@ impl SessionManager {
     /// Get the current session ID, if any.
     pub fn current_session_id(&self) -> Option<&str> {
         self.current_session_id.as_deref()
+    }
+
+    /// Resume a specific session by ID. Loads its messages.
+    pub fn resume_session(&mut self, session_id: &str) -> Result<Vec<Message>> {
+        // Verify the session exists and belongs to this project
+        let exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sessions WHERE id = ?1 AND project = ?2",
+            rusqlite::params![session_id, self.project],
+            |r| r.get(0),
+        )?;
+
+        if !exists {
+            anyhow::bail!("Session '{session_id}' not found for this project");
+        }
+
+        self.current_session_id = Some(session_id.to_string());
+        self.load_messages_for_session(session_id)
+    }
+
+    /// Resume the most recent session for this project.
+    pub fn resume_latest(&mut self) -> Result<Option<(String, Vec<Message>)>> {
+        let latest: Option<String> = self.conn.query_row(
+            "SELECT id FROM sessions WHERE project = ?1 ORDER BY started_at DESC LIMIT 1",
+            [&self.project],
+            |r| r.get(0),
+        ).ok();
+
+        match latest {
+            Some(id) => {
+                let messages = self.resume_session(&id)?;
+                Ok(Some((id, messages)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List recent sessions for this project.
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, started_at, ended_at, summary, message_count
+             FROM sessions WHERE project = ?1
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+
+        let sessions = stmt
+            .query_map(rusqlite::params![self.project, limit as i64], |row| {
+                Ok(SessionSummary {
+                    id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    ended_at: row.get(2)?,
+                    summary: row.get(3)?,
+                    message_count: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(sessions)
     }
 
     fn next_seq(&self, session_id: &str) -> Result<i64> {

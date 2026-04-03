@@ -30,6 +30,10 @@ struct Cli {
     #[arg(short, long)]
     project: Option<PathBuf>,
 
+    /// Resume the most recent conversation
+    #[arg(short, long)]
+    resume: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -495,6 +499,9 @@ async fn main() -> Result<()> {
         None => {
             // Default: start interactive TUI session
             let mut app = tui::TuiApp::new(config, project_path);
+            if cli.resume {
+                app.resume_last_session();
+            }
             app.run().await?;
         }
     }

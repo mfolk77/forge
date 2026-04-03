@@ -417,7 +417,7 @@ Rust `std::path::PathBuf` handles slash differences automatically.
 
 16GB unified memory MacBook limits:
 - Model size (Qwen 35B-A3B MoE barely fits)
-- Can't run Xcode + Claude Code + local LLM + browser simultaneously
+- Can't run Xcode + AI coding assistant + local LLM + browser simultaneously
 - Fine-tuning impossible locally
 
 ### 6.2 Target Specs
@@ -554,5 +554,5 @@ All Forge Mesh components follow FolkTech Secure Coding Standard.
 
 - [Forge Architecture](2026-03-27-forge-architecture.md) — Base system design
 - [Tool Calling Subsystem](2026-03-27-tool-calling-subsystem-design.md) — Tool system details
-- [Claude Code Lessons Learned](2026-03-31-claude-code-lessons-learned.md) — 9 architecture amendments
+- [Architecture Amendments](2026-03-31-architecture-amendments.md) — 9 architecture amendments
 - [Agent Loop Anatomy](2026-03-31-agent-loop-anatomy.md) — Loop design deep-dive

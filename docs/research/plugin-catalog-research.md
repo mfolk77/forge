@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-29
 **Purpose:** Curated list of high-quality plugins, skills, and tools for Forge's built-in plugin catalog.
-**Sources:** Claude Code ecosystem, HuggingFace, GitHub, MCP server ecosystem.
+**Sources:** AI coding assistant plugin ecosystems, HuggingFace, GitHub, MCP server ecosystem.
 
 ---
 
@@ -23,8 +23,8 @@
 Name: superpowers
 Category: FolkTechCore
 Description: Multi-skill orchestration suite — brainstorming, plan writing, plan execution, TDD, systematic debugging, code review, parallel agent dispatch, and git worktree management.
-Source: Claude Code plugin "superpowers" (hesreallyhim/awesome-claude-code ecosystem, 34k+ stars on the awesome list)
-Why: Most comprehensive single plugin in the Claude Code ecosystem. Covers the entire dev lifecycle from ideation to merge. Each skill is independently invokable.
+Source: Community plugin "superpowers" (hesreallyhim/awesome-claude-code repo, 34k+ stars on the awesome list)
+Why: Most comprehensive single plugin in the AI coding assistant ecosystem. Covers the entire dev lifecycle from ideation to merge. Each skill is independently invokable.
 Priority: P1 (must have)
 ```
 
@@ -34,8 +34,8 @@ Priority: P1 (must have)
 Name: document-toolkit
 Category: Utility
 Description: Create and manipulate DOCX, XLSX, PPTX, and PDF files programmatically from the terminal.
-Source: Claude Code plugin "all-skills" (docx, xlsx, pptx, pdf skills)
-Why: Extremely popular in the Claude Code ecosystem. Fills a gap where CLI tools typically can't produce Office-format documents.
+Source: Community plugin "all-skills" (docx, xlsx, pptx, pdf skills)
+Why: Extremely popular in the AI coding assistant ecosystem. Fills a gap where CLI tools typically can't produce Office-format documents.
 Priority: P2 (should have)
 ```
 
@@ -43,7 +43,7 @@ Priority: P2 (should have)
 Name: changelog-generator
 Category: Workflow
 Description: Automatically generate user-facing changelogs from git commit history, categorizing and humanizing technical commits.
-Source: Claude Code plugin "all-skills" (changelog-generator skill)
+Source: Community plugin "all-skills" (changelog-generator skill)
 Why: Saves hours of manual changelog work. Direct git integration makes it ideal for Forge's local-first model.
 Priority: P2 (should have)
 ```
@@ -52,7 +52,7 @@ Priority: P2 (should have)
 Name: content-research-writer
 Category: Utility
 Description: Research-backed content writing with citations, outline iteration, and section-by-section feedback.
-Source: Claude Code plugin "all-skills" (content-research-writer skill)
+Source: Community plugin "all-skills" (content-research-writer skill)
 Why: Proven workflow for technical writing, blog posts, and documentation drafts.
 Priority: P3 (nice to have)
 ```
@@ -63,7 +63,7 @@ Priority: P3 (nice to have)
 Name: agent-personas
 Category: AI
 Description: Specialized agent personas — backend architect, frontend developer, iOS developer, code reviewer, security auditor — each with domain-tuned system prompts and tool access.
-Source: Claude Code plugin "all-agents" (alirezarezvani/claude-skills, 8.2k stars)
+Source: Community plugin "all-agents" (alirezarezvani/claude-skills, 8.2k stars)
 Why: Role-based personas dramatically improve output quality for domain-specific tasks. 192+ skills across engineering, product, and compliance.
 Priority: P2 (should have)
 ```
@@ -74,8 +74,8 @@ Priority: P2 (should have)
 Name: commit-commands
 Category: Workflow
 Description: Intelligent git commit, push, and PR creation with automatic message generation from staged diffs.
-Source: Claude Code plugin "commit-commands" (commit, commit-push-pr)
-Why: One of the most-used Claude Code plugins. Streamlines the most repetitive part of development.
+Source: Community plugin "commit-commands" (commit, commit-push-pr)
+Why: One of the most-used Community plugins. Streamlines the most repetitive part of development.
 Priority: P1 (must have)
 ```
 
@@ -85,7 +85,7 @@ Priority: P1 (must have)
 Name: code-review
 Category: Workflow
 Description: AI-powered pull request review with structured feedback on correctness, security, performance, and style.
-Source: Claude Code plugin "code-review"
+Source: Community plugin "code-review"
 Why: Core developer workflow. Reduces review latency and catches issues before human reviewers.
 Priority: P1 (must have)
 ```
@@ -96,7 +96,7 @@ Priority: P1 (must have)
 Name: pr-review-toolkit
 Category: Workflow
 Description: Multi-agent PR analysis — test analyzer, type design reviewer, code simplifier, and silent-failure-hunter that detects swallowed errors.
-Source: Claude Code plugin "pr-review-toolkit"
+Source: Community plugin "pr-review-toolkit"
 Why: Goes beyond basic code review with specialized sub-agents. The silent-failure-hunter alone justifies inclusion.
 Priority: P2 (should have)
 ```
@@ -107,7 +107,7 @@ Priority: P2 (should have)
 Name: feature-dev
 Category: Workflow
 Description: Guided feature development workflow — codebase analysis, architecture planning, implementation with review checkpoints.
-Source: Claude Code plugin "feature-dev"
+Source: Community plugin "feature-dev"
 Why: Structured approach prevents the "just start coding" anti-pattern. Forces architecture-first thinking.
 Priority: P2 (should have)
 ```
@@ -118,7 +118,7 @@ Priority: P2 (should have)
 Name: hookify
 Category: DevTools
 Description: Automatically create git hooks and automation rules from conversation analysis or explicit instructions.
-Source: Claude Code plugin "hookify"
+Source: Community plugin "hookify"
 Why: Bridges the gap between "I want X to happen automatically" and actually configuring it. Unique capability.
 Priority: P2 (should have)
 ```
@@ -129,7 +129,7 @@ Priority: P2 (should have)
 Name: plugin-dev
 Category: FolkTechCore
 Description: End-to-end plugin creation — scaffolding, hook development, skill authoring, command design, MCP integration, and settings management.
-Source: Claude Code plugin "plugin-dev" (create-plugin, plugin-structure, hook-development, skill-development, etc.)
+Source: Community plugin "plugin-dev" (create-plugin, plugin-structure, hook-development, skill-development, etc.)
 Why: Essential for ecosystem growth. Makes it easy for users to extend Forge with their own plugins.
 Priority: P1 (must have)
 ```
@@ -140,7 +140,7 @@ Priority: P1 (must have)
 Name: config-auditor
 Category: FolkTechCore
 Description: Audit and improve project configuration files (FTAI.md / CLAUDE.md). Scans for quality issues, suggests improvements, updates with session learnings.
-Source: Claude Code plugin "claude-md-management"
+Source: Community plugin "claude-md-management"
 Why: Configuration quality directly impacts output quality. Auto-improvement loop is high value.
 Priority: P2 (should have)
 ```
@@ -151,7 +151,7 @@ Priority: P2 (should have)
 Name: context7
 Category: Integration
 Description: Fetch up-to-date documentation for any library, framework, or SDK directly into context. Prevents hallucination from stale training data.
-Source: upstash/context7 (51k+ GitHub stars), Claude Code plugin "context7"
+Source: upstash/context7 (51k+ GitHub stars), Community plugin "context7"
 Why: One of the highest-starred tools in the entire MCP ecosystem. Solves a fundamental problem with LLM-assisted coding.
 Priority: P1 (must have)
 ```
@@ -162,7 +162,7 @@ Priority: P1 (must have)
 Name: frontend-design
 Category: Utility
 Description: Generate production-grade frontend interfaces with high design quality. Avoids generic AI aesthetics with creative, polished output.
-Source: Claude Code plugin "frontend-design"
+Source: Community plugin "frontend-design"
 Why: Addresses the common complaint that AI-generated UIs look generic. Opinionated design system approach.
 Priority: P3 (nice to have)
 ```
@@ -173,7 +173,7 @@ Priority: P3 (nice to have)
 Name: skill-creator
 Category: FolkTechCore
 Description: Create, modify, and benchmark custom skills with eval-driven development and variance analysis.
-Source: Claude Code plugin "skill-creator"
+Source: Community plugin "skill-creator"
 Why: Meta-tool that accelerates ecosystem development. Eval integration ensures skills actually work.
 Priority: P2 (should have)
 ```
@@ -324,8 +324,8 @@ Priority: P2 (should have)
 Name: session-memory
 Category: FolkTechCore
 Description: Automatically capture, compress, and reinject session context across coding sessions. Persistent memory for AI coding agents.
-Source: thedotmack/claude-mem (43.7k stars — highest-starred Claude Code plugin)
-Why: Most starred plugin in the entire Claude Code ecosystem. Solves the fundamental context loss problem between sessions.
+Source: thedotmack/claude-mem (43.7k stars — highest-starred Community plugin)
+Why: Most starred plugin in the entire AI coding assistant ecosystem. Solves the fundamental context loss problem between sessions.
 Priority: P1 (must have)
 ```
 
@@ -336,7 +336,7 @@ Name: session-hud
 Category: DevTools
 Description: Real-time observability dashboard — context usage, active tools, running agents, todo progress, and token consumption.
 Source: jarrodwatts/claude-hud (15.5k stars)
-Why: Second most starred Claude Code plugin. Critical for understanding and optimizing agent behavior.
+Why: Second most starred Community plugin. Critical for understanding and optimizing agent behavior.
 Priority: P1 (must have)
 ```
 
@@ -390,7 +390,7 @@ Priority: P2 (should have)
 Name: webapp-testing
 Category: DevTools
 Description: Interactive web app testing toolkit — verify frontend functionality, capture screenshots, read browser logs, debug UI behavior.
-Source: Claude Code plugin "all-skills" (webapp-testing skill)
+Source: Community plugin "all-skills" (webapp-testing skill)
 Why: Fills the gap between writing frontend code and verifying it actually works.
 Priority: P3 (nice to have)
 ```
@@ -401,7 +401,7 @@ Priority: P3 (nice to have)
 Name: security-audit
 Category: FolkTechCore
 Description: Automated security audit — SAST analysis, dependency scanning, secrets detection, and vulnerability reporting.
-Source: Claude Code built-in audit skill + arm/metis (495 stars, AI-driven deep security review)
+Source: Community audit skill + arm/metis (495 stars, AI-driven deep security review)
 Why: Aligns with FolkTech Secure Coding Standard requirement. Every codebase needs automated security scanning.
 Priority: P1 (must have)
 ```
@@ -434,7 +434,7 @@ Priority: P3 (nice to have)
 Name: mcp-huggingface
 Category: Integration
 Description: Search models, datasets, and papers on HuggingFace Hub. Fetch documentation, run inference on Spaces, and discover trending research.
-Source: HuggingFace official MCP server (available in Claude Code MCP ecosystem)
+Source: HuggingFace official MCP server (available in MCP ecosystem)
 Why: Official HuggingFace integration. Essential for ML/AI development workflows and model discovery.
 Priority: P2 (should have)
 ```
