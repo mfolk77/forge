@@ -568,6 +568,7 @@ pub fn render_input(
     let input_text = format!("> {text}");
     let para = Paragraph::new(input_text.as_str())
         .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::TOP)
@@ -577,8 +578,11 @@ pub fn render_input(
 
     // The block's TOP border occupies 1 row. Content starts at area.y + 1.
     // The "> " prefix occupies 2 columns.
-    let cursor_x = area.x + 2 + cursor_col as u16;
-    let cursor_y = area.y + 1;
+    // Account for line wrapping: cursor position wraps at area.width.
+    let content_width = area.width.max(1) as usize;
+    let absolute_col = 2 + cursor_col; // 2 for "> " prefix
+    let cursor_x = area.x + (absolute_col % content_width) as u16;
+    let cursor_y = area.y + 1 + (absolute_col / content_width) as u16;
 
     // Only return if cursor fits inside the area
     if cursor_x < area.x + area.width && cursor_y < area.y + area.height {

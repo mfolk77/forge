@@ -553,6 +553,9 @@ impl TuiApp {
                             _ => {}
                         }
                     }
+                    Event::Resize(_, _) => {
+                        // Terminal resized — next loop iteration will re-render at new size
+                    }
                     _ => {}
                 }
             }
@@ -605,13 +608,28 @@ impl TuiApp {
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
 
+        // Calculate input height based on text wrapping
+        let input_text_for_height = if self.is_generating {
+            "generating..."
+        } else {
+            &self.input.lines[self.input.cursor_line]
+        };
+        // "> " prefix = 2 chars, +1 for border, +1 for content line minimum
+        let input_content_width = area.width.saturating_sub(3).max(1) as usize;
+        let input_lines = if input_content_width > 0 && !input_text_for_height.is_empty() {
+            ((input_text_for_height.len() + 2 + input_content_width - 1) / input_content_width) as u16
+        } else {
+            1
+        };
+        let input_height = (input_lines + 2).min(area.height / 3); // +2 for border + padding, cap at 1/3 screen
+
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),        // Status bar
-                Constraint::Min(5),           // Messages
-                Constraint::Length(1),        // Status line
-                Constraint::Length(3),        // Input
+                Constraint::Length(1),            // Status bar
+                Constraint::Min(5),              // Messages
+                Constraint::Length(1),            // Status line
+                Constraint::Length(input_height), // Input (dynamic)
             ])
             .split(area);
 
