@@ -57,6 +57,9 @@ fastembed = "4"
 # System / resource limits (Unix)
 libc = "0.2"
 
+# Self-update from GitHub Releases
+self_update = { version = "0.41", features = ["archive-tar", "archive-zip", "compression-flate2"] }
+
 # Misc
 dirs = "6"
 sha2 = "0.10"

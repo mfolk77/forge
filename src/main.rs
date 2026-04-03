@@ -16,6 +16,7 @@ mod session;
 mod skills;
 mod tools;
 mod tui;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -53,6 +54,12 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Check for and install updates
+    Update {
+        /// Only check, don't install
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -457,6 +464,33 @@ async fn main() -> Result<()> {
             );
 
             println!("\nAll checks complete.");
+        }
+        Some(Commands::Update { check }) => {
+            // self_update uses blocking HTTP — run outside the async runtime
+            let result = tokio::task::spawn_blocking(move || {
+                if check {
+                    match update::check_for_update() {
+                        Ok((current, latest, available)) => {
+                            println!("Current: v{current}");
+                            println!("Latest:  v{latest}");
+                            if available {
+                                println!("\nUpdate available! Run `forge update` to install.");
+                            } else {
+                                println!("\nYou're on the latest version.");
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    update::perform_update()
+                }
+            }).await?;
+
+            if let Err(e) = result {
+                eprintln!("Update failed: {e}");
+                std::process::exit(1);
+            }
         }
         None => {
             // Default: start interactive TUI session
