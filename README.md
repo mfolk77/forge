@@ -14,75 +14,55 @@
 
 ---
 
-## Overview
+## Install
 
-Forge is a terminal-native AI coding assistant built in Rust. It connects to local LLMs (via MLX on Apple Silicon or llama.cpp on any platform), provides a full agentic tool-calling loop, enforces project-specific rules, and learns from your sessions over time.
-
-```
-forge                     # Start interactive session in current directory
-forge --project ~/myapp   # Start in a specific project
-forge model install Qwen/Qwen2.5-Coder-32B-Instruct-MLX
-forge model use Qwen2.5-Coder-32B-Instruct-MLX
-forge config show
-```
-
-### Key capabilities
-
-- **Agentic loop** -- streams tokens from the model, parses tool calls (XML/JSON/hybrid), checks permissions, evaluates rules, executes tools, feeds results back, and repeats
-- **10 built-in tools** -- bash, file read/write/edit, glob, grep, git, web fetch, ask user, request permissions
-- **Rule engine** -- a custom DSL for project-specific constraints (`reject`, `require`, `modify` with boolean logic and built-in functions)
-- **3-tier permission system** -- Safe (auto-approve) / Write (configurable) / Destructive (always confirm), with hard-block constants and a session grant cache
-- **Plugin system** -- extend Forge with custom tools, hooks, skills, and rules via `plugin.toml` manifests
-- **Built-in skills** -- 6 shipped skill guides (commit, review, refactor, debug, test, security) activatable via slash commands
-- **Semantic code search** -- BGE-small-en embeddings with SQLite vector store for context-aware retrieval
-- **Session memory** -- persists conversations, learns patterns, auto-generates rules via the evolution engine
-- **Cross-platform** -- macOS (Apple Silicon native via MLX) and Windows (llama.cpp + cmd.exe)
-
----
-
-## Installation
-
-### Prerequisites
-
-- **Rust** 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- **A local LLM backend** (one of):
-  - [MLX](https://github.com/ml-explore/mlx) -- `brew install mlx-lm` (Apple Silicon, recommended)
-  - [llama.cpp](https://github.com/ggerganov/llama.cpp) -- `brew install llama.cpp` or [build from source](https://github.com/ggerganov/llama.cpp#build)
-  - Any OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.)
-
-### Build from source
+### macOS / Linux
 
 ```bash
-git clone https://github.com/mfolk77/forge.git
-cd forge
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/mfolk77/forge/main/install.sh | sh
 ```
 
-### Install globally
+### Windows (PowerShell)
 
-```bash
-cargo install --path . --root ~/.local --force
-# Binary: ~/.local/bin/forge
+```powershell
+irm https://raw.githubusercontent.com/mfolk77/forge/main/install.ps1 | iex
 ```
+
+### What this does
+
+1. Detects your OS and architecture
+2. Downloads the latest pre-built binary from [GitHub Releases](https://github.com/mfolk77/forge/releases)
+3. Installs it to `~/.local/bin/forge` (customizable via `FORGE_INSTALL_DIR`)
+4. Adds it to your PATH if needed (Windows does this automatically)
+
+**No Rust, no compiler, no build tools required.**
 
 ### Verify
 
 ```bash
 forge --version
-forge model info
-forge config show
 ```
+
+### Update
+
+```bash
+forge update
+```
+
+Forge can self-update from GitHub Releases. Run `forge update --check` to check without installing.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Install a model
-forge model install Qwen/Qwen2.5-Coder-32B-Instruct-MLX
+# 1. Install a model (Forge auto-detects your hardware and recommends one)
+forge hardware
+forge model install Qwen/Qwen2.5-Coder-7B-Instruct-MLX    # macOS Apple Silicon
+forge model install Qwen/Qwen2.5-Coder-7B-Instruct-GGUF    # Linux / Windows
 
 # 2. Activate it
-forge model use Qwen2.5-Coder-32B-Instruct-MLX
+forge model use Qwen2.5-Coder-7B-Instruct-MLX
 
 # 3. Start coding
 cd ~/my-project
@@ -93,31 +73,96 @@ Forge auto-detects **Coding mode** (if `.git/` or `.ftai/` exists) or **Chat mod
 
 ---
 
+## Overview
+
+Forge is a terminal-native AI coding assistant built in Rust. It connects to local LLMs (via MLX on Apple Silicon or llama.cpp on any platform), provides a full agentic tool-calling loop, enforces project-specific rules, and learns from your sessions over time.
+
+```
+forge                     # Start interactive session in current directory
+forge --project ~/myapp   # Start in a specific project
+forge --resume            # Resume last conversation
+forge doctor              # Check backends, hardware, config
+forge config show
+```
+
+### Key capabilities
+
+- **Agentic loop** -- streams tokens from the model, parses tool calls (XML/JSON/hybrid), checks permissions, evaluates rules, executes tools, feeds results back, and repeats
+- **10 built-in tools** -- bash, file read/write/edit, glob, grep, git, web fetch, ask user, request permissions
+- **Rule engine** -- a custom DSL for project-specific constraints (`reject`, `require`, `modify` with boolean logic and built-in functions)
+- **3-tier permission system** -- Safe (auto-approve) / Write (configurable) / Destructive (always confirm), with hard-block constants and a session grant cache
+- **Plugin system** -- extend Forge with custom tools, hooks, skills, and rules via `plugin.toml` manifests
+- **38 built-in skills** -- shipped across 5 plugins, activatable via slash commands
+- **Semantic code search** -- BGE-small-en embeddings with SQLite vector store for context-aware retrieval
+- **Session memory** -- persists conversations, learns patterns, auto-generates rules via the evolution engine
+- **Self-update** -- `forge update` pulls latest release from GitHub
+- **Cross-platform** -- macOS (Apple Silicon native via MLX), Linux (llama.cpp + CUDA), Windows (llama.cpp + cmd.exe)
+
+---
+
+## Hardware support
+
+Forge auto-detects your hardware and recommends an appropriate model:
+
+| Platform | GPU | Recommended model | Backend |
+|----------|-----|-------------------|---------|
+| Apple Silicon 32GB+ | Metal | Qwen2.5-Coder-32B-Q4 | MLX |
+| Apple Silicon 16GB+ | Metal | Qwen2.5-Coder-7B-Q4 | MLX |
+| Apple Silicon <16GB | Metal | Qwen2.5-Coder-3B-Q4 | MLX |
+| NVIDIA 24GB+ VRAM | CUDA | Qwen2.5-Coder-32B-Q4 | llama.cpp |
+| NVIDIA <24GB VRAM | CUDA | DeepSeek-Coder-V2-Lite-Q4 | llama.cpp |
+| CPU-only (x86_64) | -- | Qwen2.5-Coder-7B-Q4 | llama.cpp |
+
+```bash
+forge hardware   # or /hardware in TUI
+```
+
+### LLM backends
+
+Forge needs a local LLM to run. It handles the backend automatically based on your platform:
+
+- **macOS Apple Silicon** -- MLX (native Metal acceleration). Forge starts the MLX server for you.
+- **Linux / Windows** -- llama.cpp (CUDA if available, CPU fallback). Forge starts the llama.cpp server for you.
+- **External server** -- connect to any OpenAI-compatible API (Ollama, LM Studio, vLLM) by setting `backend = "external"` in config.
+
+If you already use **Ollama** or **LM Studio**, Forge can connect to them directly -- no additional setup needed. Just point it at the server:
+
+```toml
+# ~/.ftai/config.toml
+[model]
+backend = "external"
+
+[model.external]
+url = "http://localhost:11434/v1"   # Ollama default
+```
+
+---
+
 ## Architecture
 
 ```
-                                    ┌─────────────┐
-                                    │   TUI App   │
-                                    │ (ratatui)   │
-                                    └──────┬──────┘
-                                           │
-               ┌───────────────────────────┼───────────────────────────┐
-               │                           │                           │
-        ┌──────▼──────┐          ┌─────────▼─────────┐         ┌──────▼──────┐
-        │ Conversation│          │  Backend Manager   │         │   Tools     │
-        │   Engine    │          │ (MLX/llama.cpp/    │         │  Registry   │
-        │             │          │  External)         │         │ (10 tools)  │
-        └──────┬──────┘          └─────────┬─────────┘         └──────┬──────┘
-               │                           │                          │
-    ┌──────────┼──────────┐     ┌──────────┼──────────┐    ┌─────────┼─────────┐
-    │          │          │     │          │          │    │         │         │
+                                    +---------------+
+                                    |   TUI App     |
+                                    |  (ratatui)    |
+                                    +-------+-------+
+                                            |
+               +----------------------------+----------------------------+
+               |                            |                            |
+        +------+------+          +---------+---------+           +------+------+
+        | Conversation|          |  Backend Manager   |          |   Tools     |
+        |   Engine    |          | (MLX/llama.cpp/    |          |  Registry   |
+        |             |          |  External)         |          | (10 tools)  |
+        +------+------+          +---------+---------+           +------+------+
+               |                           |                           |
+    +----------+----------+     +----------+----------+    +---------+---------+
+    |          |          |     |          |          |    |         |         |
  Adapter   Parser    Recovery  MLX     llama.cpp  HTTP   Bash   File ops   Git
  (Qwen/    (XML/     Pipeline Server   Server    Client
  Hermes/   JSON/
  Generic)  Hybrid)
-               │
-    ┌──────────┼──────────────────────┐
-    │          │          │           │
+               |
+    +----------+----------------------+
+    |          |          |           |
  Permissions  Rules    Plugins    Skills
  (3-tier)    (DSL)   (manifest)  (builtin)
 ```
@@ -158,7 +203,7 @@ Built-in defaults                     # Hardcoded fallback
 
 ```toml
 [model]
-backend = "mlx"           # "mlx", "llamacpp", or "direct"
+backend = "mlx"           # "mlx", "llamacpp", or "external"
 context_length = 32768     # Token context window
 temperature = 0.3          # Sampling temperature
 tool_calling = "hybrid"    # "native", "prompted", or "hybrid"
@@ -295,16 +340,15 @@ scope "~/Developer/my-app" {
 
 Skills are markdown guides injected into the model's context via slash commands.
 
-### Built-in skills
+### Built-in skills (38 across 5 plugins)
 
-| Trigger | Description |
-|---------|-------------|
-| `/commit` | Git commit best practices |
-| `/review` | Code review checklist |
-| `/refactor` | Refactoring guide |
-| `/debug` | Systematic debugging |
-| `/test` | Test writing guide |
-| `/security` | Security audit checklist |
+| Plugin | Skills |
+|--------|--------|
+| **folktech-dev-toolkit** | `/secure`, `/tdd`, `/perf`, `/audit-dep`, `/doc`, `/quality` |
+| **forge-superpowers** | `/brainstorm`, `/plan`, `/execute`, `/tdd-workflow`, `/debug`, `/review`, `/review-feedback`, `/parallel`, `/subagent-dev`, `/verify`, `/finish` |
+| **forge-dev-tools** | `/changelog`, `/frontend`, `/organize`, `/research`, `/webapp-test`, `/mcp`, `/create-skill`, `/audit-config`, `/enhance-image`, `/comms` |
+| **forge-document-tools** | `/pdf`, `/docx`, `/xlsx`, `/pptx`, `/canvas`, `/markdown` |
+| **forge-plugin-dev** | `/plugin-dev`, `/skill-dev`, `/hook-dev`, `/command-dev`, `/agent-dev` |
 
 ```
 /skill              # List all available skills
@@ -405,40 +449,14 @@ repo = "https://github.com/you/my-plugin"
 
 ---
 
-## Hardware support
-
-Forge auto-detects your hardware and recommends an appropriate model:
-
-| Platform | GPU | Recommended model | Backend |
-|----------|-----|-------------------|---------|
-| Apple Silicon 32GB+ | Metal | Qwen2.5-Coder-32B-Q4 | MLX |
-| Apple Silicon 16GB+ | Metal | Qwen2.5-Coder-7B-Q4 | MLX |
-| Apple Silicon <16GB | Metal | Qwen2.5-Coder-3B-Q4 | MLX |
-| NVIDIA 24GB+ VRAM | CUDA | Qwen2.5-Coder-32B-Q4 | llama.cpp |
-| NVIDIA <24GB VRAM | CUDA | DeepSeek-Coder-V2-Lite-Q4 | llama.cpp |
-| CPU-only (x86_64) | -- | Qwen2.5-Coder-7B-Q4 | llama.cpp |
-
-```bash
-forge hardware   # or /hardware in TUI
-```
-
-### Backend auto-selection
-
-- **macOS + Apple Silicon** -- defaults to MLX (native Metal acceleration)
-- **Windows / Linux** -- defaults to llama.cpp (CUDA if available)
-- **External server** -- connect to any OpenAI-compatible API (Ollama, LM Studio, vLLM)
-
-If MLX is configured on a non-Apple-Silicon platform, Forge automatically falls back to llama.cpp with a warning.
-
----
-
 ## Project context (`FTAI.md`)
 
 Create a `.ftai/FTAI.md` in your project root to give Forge project-specific instructions:
 
 ```bash
-/context init    # Creates a template FTAI.md
-/context edit    # Opens it in $EDITOR
+forge init           # Creates .ftai/ directory + template FTAI.md
+/context init        # Same thing, from inside the TUI
+/context edit        # Opens FTAI.md in $EDITOR
 ```
 
 ```markdown
@@ -469,6 +487,37 @@ Content is capped at 10,000 characters and included in the system prompt.
 
 ---
 
+## Build from source
+
+Only needed if you want to develop Forge itself or can't use the pre-built binaries.
+
+### Prerequisites
+
+- **Rust** 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+
+### Build
+
+```bash
+git clone https://github.com/mfolk77/forge.git
+cd forge
+cargo build --release
+```
+
+### Install globally
+
+```bash
+cargo install --path . --root ~/.local --force
+# Binary: ~/.local/bin/forge
+```
+
+### Run tests
+
+```
+cargo test              # 1,519 tests
+```
+
+---
+
 ## Directory structure
 
 ```
@@ -480,6 +529,7 @@ Content is capped at 10,000 characters and included in the system prompt.
   projects/            # Per-project config overrides
   rules.ftai           # Global rules
   logs/                # Execution logs
+  sessions.db          # Conversation history
 
 <project>/
   .ftai/
@@ -489,34 +539,6 @@ Content is capped at 10,000 characters and included in the system prompt.
       MEMORY.md        # Project memory notes
     FTAI.md            # Project context document
 ```
-
----
-
-## Development
-
-```bash
-cargo build              # Debug build
-cargo test               # Run all 1,519 tests
-cargo build --release    # Optimized build
-cargo install --path . --root ~/.local --force   # Install globally
-```
-
-### Test suite
-
-```
-731 lib tests      -- Unit tests across all 15 modules
-731 bin tests      -- Binary-level integration
- 57 integration    -- Cross-module integration tests
-────────────────────
-1,519 total        -- All passing
-```
-
-Tests include P0 security red tests covering:
-- Input injection and command injection
-- Path traversal (Unix and Windows variants)
-- Auth bypass and permission escalation
-- LLM output injection via tool calls
-- Plugin manifest manipulation
 
 ---
 
