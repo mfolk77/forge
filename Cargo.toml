@@ -26,12 +26,11 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Code tools
 regex = "1"
 glob = "0.3"
-git2 = "0.19"
 
 # Rendering
 syntect = "5"
@@ -58,7 +57,7 @@ fastembed = "4"
 libc = "0.2"
 
 # Self-update from GitHub Releases
-self_update = { version = "0.41", features = ["archive-tar", "archive-zip", "compression-flate2"] }
+self_update = { version = "0.41", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "rustls"] }
 
 # Misc
 dirs = "6"
