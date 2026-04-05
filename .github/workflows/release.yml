@@ -40,19 +40,21 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary (Unix)
+      - name: Prepare binary (Unix)
         if: matrix.os != 'windows-latest'
-        run: cp target/${{ matrix.target }}/release/forge ${{ matrix.name }}
+        run: |
+          cp target/${{ matrix.target }}/release/forge forge
+          chmod +x forge
 
-      - name: Rename binary (Windows)
+      - name: Prepare binary (Windows)
         if: matrix.os == 'windows-latest'
-        run: copy target\${{ matrix.target }}\release\forge.exe ${{ matrix.name }}
+        run: copy target\${{ matrix.target }}\release\forge.exe forge.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: ${{ matrix.os == 'windows-latest' && 'forge.exe' || 'forge' }}
 
   release:
     needs: build
@@ -71,9 +73,8 @@ jobs:
           cd artifacts
           for dir in forge-macos-* forge-linux-*; do
             [ -d "$dir" ] || continue
-            binary=$(ls "$dir")
-            chmod +x "$dir/$binary"
-            tar czf "${binary}.tar.gz" -C "$dir" "$binary"
+            chmod +x "$dir/forge"
+            tar czf "${dir}.tar.gz" -C "$dir" forge
           done
 
       - name: Create zip archive (Windows binary)
@@ -81,8 +82,7 @@ jobs:
           cd artifacts
           for dir in forge-windows-*; do
             [ -d "$dir" ] || continue
-            binary=$(ls "$dir")
-            zip "${binary%.exe}.zip" -j "$dir/$binary"
+            zip "${dir%.exe}.zip" -j "$dir/forge.exe"
           done
 
       - name: Create GitHub Release
