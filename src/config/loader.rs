@@ -223,8 +223,13 @@ impl Default for PluginsConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
+        let default_backend = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+            BackendType::Mlx
+        } else {
+            BackendType::LlamaCpp
+        };
         Self {
-            backend: BackendType::Mlx,
+            backend: default_backend,
             path: None,
             context_length: 32768,
             temperature: 0.3_f64,

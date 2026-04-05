@@ -161,13 +161,32 @@ impl HardwareInfo {
         let gpu = if cfg!(target_os = "macos") && arch == CpuArch::AppleSilicon {
             GpuType::Metal
         } else {
-            // TODO: CUDA detection via nvidia-smi
-            GpuType::None
+            Self::detect_cuda().unwrap_or(GpuType::None)
         };
 
         let ram_gb = Self::detect_ram_gb();
 
         Self { arch, gpu, ram_gb }
+    }
+
+    /// Detect NVIDIA GPU via nvidia-smi
+    fn detect_cuda() -> Option<GpuType> {
+        let smi = if cfg!(windows) { "nvidia-smi.exe" } else { "nvidia-smi" };
+        let output = std::process::Command::new(smi)
+            .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        // nvidia-smi returns memory in MiB; take the first GPU
+        let vram_mb = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(GpuType::Cuda { vram_gb: vram_mb / 1024 })
     }
 
     #[cfg(target_os = "macos")]
@@ -223,38 +242,58 @@ impl HardwareInfo {
             .unwrap_or(8)
     }
 
-    /// Recommend a model based on hardware
+    /// Recommend a model based on hardware.
+    /// Prefers Qwen3.5 MoE models — they use fewer active parameters,
+    /// so a 27B MoE fits comfortably where a 27B dense model would not.
     pub fn recommended_model(&self) -> ModelRecommendation {
         match (&self.arch, &self.gpu, self.ram_gb) {
+            // Apple Silicon — MLX backend
             (CpuArch::AppleSilicon, _, ram) if ram >= 32 => ModelRecommendation {
-                name: "Qwen2.5-Coder-32B-Q4".to_string(),
+                name: "Qwen3.5-35B-A3B-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
-                size_gb: 18,
+                size_gb: 5,
             },
             (CpuArch::AppleSilicon, _, ram) if ram >= 16 => ModelRecommendation {
-                name: "Qwen2.5-Coder-7B-Q4".to_string(),
+                name: "Qwen3.5-35B-A3B-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
-                size_gb: 4,
+                size_gb: 5,
             },
             (CpuArch::AppleSilicon, _, _) => ModelRecommendation {
-                name: "Qwen2.5-Coder-3B-Q4".to_string(),
+                name: "Qwen3.5-8B-A3B-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
                 size_gb: 2,
             },
+            // NVIDIA GPU — llama.cpp with CUDA
             (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 24 => ModelRecommendation {
-                name: "Qwen2.5-Coder-32B-Q4".to_string(),
+                name: "Qwen3.5-35B-A3B-Q4_K_M-GGUF".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 18,
+                size_gb: 5,
+            },
+            (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 8 => ModelRecommendation {
+                name: "Qwen3.5-27B-A7B-Q4_K_M-GGUF".to_string(),
+                backend: crate::config::BackendType::LlamaCpp,
+                size_gb: 16,
             },
             (_, GpuType::Cuda { .. }, _) => ModelRecommendation {
-                name: "DeepSeek-Coder-V2-Lite-Q4".to_string(),
+                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 9,
+                size_gb: 5,
+            },
+            // CPU-only / undetected GPU — use RAM to decide, MoE models
+            (_, _, ram) if ram >= 32 => ModelRecommendation {
+                name: "Qwen3.5-27B-A7B-Q4_K_M-GGUF".to_string(),
+                backend: crate::config::BackendType::LlamaCpp,
+                size_gb: 16,
+            },
+            (_, _, ram) if ram >= 16 => ModelRecommendation {
+                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
+                backend: crate::config::BackendType::LlamaCpp,
+                size_gb: 5,
             },
             _ => ModelRecommendation {
-                name: "Qwen2.5-Coder-7B-Q4".to_string(),
+                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 4,
+                size_gb: 5,
             },
         }
     }
@@ -290,7 +329,7 @@ mod tests {
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen2.5-Coder-7B-Q4");
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-4bit");
         assert_eq!(rec.backend, crate::config::BackendType::Mlx);
     }
 
@@ -302,29 +341,66 @@ mod tests {
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen2.5-Coder-32B-Q4");
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-4bit");
     }
 
     #[test]
-    fn test_model_recommendation_nvidia() {
+    fn test_model_recommendation_nvidia_24gb() {
         let hw = HardwareInfo {
             arch: CpuArch::X86_64,
             gpu: GpuType::Cuda { vram_gb: 24 },
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M-GGUF");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
     #[test]
-    fn test_model_recommendation_cpu_only() {
+    fn test_model_recommendation_nvidia_8gb() {
+        let hw = HardwareInfo {
+            arch: CpuArch::X86_64,
+            gpu: GpuType::Cuda { vram_gb: 8 },
+            ram_gb: 16,
+        };
+        let rec = hw.recommended_model();
+        assert_eq!(rec.name, "Qwen3.5-27B-A7B-Q4_K_M-GGUF");
+        assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
+    }
+
+    #[test]
+    fn test_model_recommendation_cpu_only_16gb() {
         let hw = HardwareInfo {
             arch: CpuArch::X86_64,
             gpu: GpuType::None,
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen2.5-Coder-7B-Q4");
+        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
+        assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
+    }
+
+    #[test]
+    fn test_model_recommendation_cpu_only_32gb() {
+        let hw = HardwareInfo {
+            arch: CpuArch::X86_64,
+            gpu: GpuType::None,
+            ram_gb: 32,
+        };
+        let rec = hw.recommended_model();
+        assert_eq!(rec.name, "Qwen3.5-27B-A7B-Q4_K_M-GGUF");
+        assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
+    }
+
+    #[test]
+    fn test_model_recommendation_cpu_only_8gb() {
+        let hw = HardwareInfo {
+            arch: CpuArch::X86_64,
+            gpu: GpuType::None,
+            ram_gb: 8,
+        };
+        let rec = hw.recommended_model();
+        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
