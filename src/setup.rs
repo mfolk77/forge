@@ -1,105 +1,157 @@
 //! One-command setup: installs llama-server backend and downloads the right model.
 //!
 //! `forge setup` detects hardware, installs llama.cpp if needed, downloads the
-//! recommended Qwen3.5 MoE model, and configures everything. One and done.
+//! model, and configures everything. One and done.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::backend::types::HardwareInfo;
+use crate::backend::types::{GpuType, HardwareInfo};
 use crate::config;
 
 const LLAMACPP_REPO: &str = "ggerganov/llama.cpp";
 
+// ── Hardcoded model URLs — no HuggingFace CLI, no auth, just curl ──────────
+// These are public Apache-2.0 models hosted on HuggingFace.
+
+/// Small model for CPU-only / low RAM. Dense 4B, ~3GB download.
+const MODEL_SMALL_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf";
+const MODEL_SMALL_FILE: &str = "Qwen3.5-4B-Q4_K_M.gguf";
+const MODEL_SMALL_NAME: &str = "Qwen3.5-4B";
+const MODEL_SMALL_SIZE: &str = "~3 GB";
+
+/// Large model for GPU or high-RAM systems. 35B MoE (3B active), ~20GB download.
+const MODEL_LARGE_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf";
+const MODEL_LARGE_FILE: &str = "Qwen3.5-35B-A3B-Q4_K_M.gguf";
+const MODEL_LARGE_NAME: &str = "Qwen3.5-35B-A3B";
+const MODEL_LARGE_SIZE: &str = "~20 GB";
+
+/// Pick the right model based on hardware.
+fn pick_model(hw: &HardwareInfo) -> (&'static str, &'static str, &'static str, &'static str) {
+    let has_gpu = !matches!(hw.gpu, GpuType::None);
+
+    // GPU with 8GB+ VRAM or native system with 48GB+ RAM → large model
+    // CPU-only or low RAM → small model (the 35B needs ~22GB, won't fit in WSL default memory)
+    if has_gpu {
+        (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
+    } else if hw.ram_gb >= 48 {
+        (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
+    } else {
+        (MODEL_SMALL_URL, MODEL_SMALL_FILE, MODEL_SMALL_NAME, MODEL_SMALL_SIZE)
+    }
+}
+
 /// Run the full setup process.
 pub async fn run_setup() -> Result<()> {
-    println!("┌─────────────────────────────────────┐");
-    println!("│          Forge Setup                 │");
-    println!("└─────────────────────────────────────┘");
+    println!();
+    println!("  Forge Setup");
+    println!("  ===========");
     println!();
 
     // Step 1: Detect hardware
     println!("[1/4] Detecting hardware...");
     let hw = HardwareInfo::detect();
-    println!("  Arch: {:?}", hw.arch);
-    println!("  GPU:  {:?}", hw.gpu);
+    let has_gpu = !matches!(hw.gpu, GpuType::None);
     println!("  RAM:  {} GB", hw.ram_gb);
+    println!("  GPU:  {}", if has_gpu { "yes" } else { "none (CPU-only)" });
 
-    let recommendation = hw.recommended_model();
-    println!("  Recommended model: {} ({} GB)", recommendation.name, recommendation.size_gb);
-    println!("  Backend: {:?}", recommendation.backend);
+    let (model_url, model_file, model_name, model_size) = pick_model(&hw);
+    println!("  Model: {} ({})", model_name, model_size);
     println!();
 
-    // Step 2: Ensure llama-server is available (skip on Apple Silicon / MLX)
-    let need_llamacpp = recommendation.backend == config::BackendType::LlamaCpp;
-
-    if need_llamacpp {
-        println!("[2/4] Checking for llama-server...");
-        if find_llama_server().is_some() {
-            println!("  llama-server found. Skipping install.");
-        } else {
-            println!("  llama-server not found. Installing...");
-            install_llama_server()?;
-        }
+    // Step 2: Ensure llama-server is available
+    println!("[2/4] Checking for llama-server...");
+    if find_llama_server().is_some() {
+        println!("  Found. Skipping install.");
     } else {
-        println!("[2/4] Using MLX backend (Apple Silicon). Skipping llama-server.");
+        println!("  Not found. Installing...");
+        install_llama_server()?;
     }
     println!();
 
     // Step 3: Download model
-    println!("[3/4] Downloading model: {}...", recommendation.name);
-    println!("  (This may take a while for large models)");
     let models_dir = config::global_config_dir()?.join("models");
     std::fs::create_dir_all(&models_dir)?;
+    let gguf_path = models_dir.join(model_file);
 
-    let model_dir = models_dir.join(&recommendation.name);
-
-    if model_dir.exists() && has_model_files(&model_dir) {
-        println!("  Model already downloaded. Skipping.");
+    println!("[3/4] Downloading model...");
+    if gguf_path.exists() && gguf_path.metadata().map(|m| m.len() > 100_000_000).unwrap_or(false) {
+        println!("  Already downloaded: {}", gguf_path.display());
     } else {
-        download_model(&recommendation.hf_repo, recommendation.hf_file.as_deref(), &model_dir).await?;
+        // Delete any partial/empty file
+        let _ = std::fs::remove_file(&gguf_path);
+        println!("  Downloading {} ({})", model_file, model_size);
+        println!("  This will take a while...");
+        download_file(model_url, &gguf_path)?;
+
+        // Verify the file actually downloaded
+        let size = gguf_path.metadata().map(|m| m.len()).unwrap_or(0);
+        if size < 100_000_000 {
+            let _ = std::fs::remove_file(&gguf_path);
+            bail!("Download failed — file too small ({} bytes). Check your internet connection.", size);
+        }
+        println!("  Done. ({} MB)", size / (1024 * 1024));
     }
     println!();
 
-    // Step 4: Configure
-    println!("[4/4] Configuring Forge...");
-    let model_path = find_model_path(&model_dir)?;
-    update_config(&hw, &recommendation, &model_path)?;
-    println!("  Backend: {:?}", recommendation.backend);
-    println!("  Model path: {}", model_path);
+    // Step 4: Write config
+    println!("[4/4] Writing config...");
+    let gguf_path_str = gguf_path.to_string_lossy().to_string();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    let gpu_layers: i32 = if has_gpu { -1 } else { 0 };
+
+    let config_path = config::global_config_dir()?.join("config.toml");
+    let config_content = format!(
+        r#"[model]
+backend = "llamacpp"
+path = "{gguf_path_str}"
+context_length = 32768
+temperature = 0.3
+tool_calling = "hybrid"
+
+[model.llamacpp]
+gpu_layers = {gpu_layers}
+threads = {threads}
+
+[model.mlx]
+quantization = "q4"
+
+[permissions]
+mode = "auto"
+
+[plugins]
+enabled = true
+auto_update = false
+"#
+    );
+    std::fs::write(&config_path, &config_content)?;
+    println!("  Model: {}", gguf_path_str);
+    println!("  GPU layers: {} ({})", gpu_layers, if gpu_layers == 0 { "CPU-only" } else { "GPU" });
+    println!("  Threads: {}", threads);
     println!();
 
-    println!("┌─────────────────────────────────────────┐");
-    println!("│  Setup complete! Run `forge` to start.   │");
-    println!("└─────────────────────────────────────────┘");
+    println!("  Setup complete! Run `forge` to start.");
+    println!();
 
     Ok(())
 }
 
-// ── llama-server detection ─────────────────────────────────────────────────
+// ── llama-server ───────────────────────────────────────────────────────────
 
-/// Find llama-server in PATH or common locations.
 fn find_llama_server() -> Option<PathBuf> {
     let install_dir = install_bin_dir();
-    let candidates: Vec<PathBuf> = if cfg!(windows) {
-        vec![
-            install_dir.join("llama-server.exe"),
-            PathBuf::from("llama-server.exe"),
-        ]
-    } else {
-        vec![
-            install_dir.join("llama-server"),
-            PathBuf::from("/usr/local/bin/llama-server"),
-            PathBuf::from("/opt/homebrew/bin/llama-server"),
-        ]
-    };
 
-    // Check direct paths first
-    for candidate in &candidates {
-        if candidate.exists() {
-            return Some(candidate.clone());
-        }
+    // Check our install dir first
+    let ours = if cfg!(windows) {
+        install_dir.join("llama-server.exe")
+    } else {
+        install_dir.join("llama-server")
+    };
+    if ours.exists() {
+        return Some(ours);
     }
 
     // Check PATH
@@ -122,13 +174,9 @@ fn find_llama_server() -> Option<PathBuf> {
     None
 }
 
-// ── llama-server installation ──────────────────────────────────────────────
-
-/// Install llama-server from pre-built GitHub releases.
 fn install_llama_server() -> Result<()> {
-    // Get the latest release tag
     let version = get_latest_llamacpp_version()?;
-    println!("  Latest llama.cpp release: {}", version);
+    println!("  llama.cpp release: {}", version);
 
     let asset_name = llama_asset_name(&version)?;
     let url = format!(
@@ -138,8 +186,7 @@ fn install_llama_server() -> Result<()> {
     let install_dir = install_bin_dir();
     std::fs::create_dir_all(&install_dir)?;
 
-    // Create a temporary directory for extraction
-    let tmp_dir = install_dir.join("_llama_setup_tmp");
+    let tmp_dir = install_dir.join("_llama_tmp");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir)?;
 
@@ -150,57 +197,35 @@ fn install_llama_server() -> Result<()> {
     println!("  Extracting...");
     extract_archive(&archive_path, &tmp_dir)?;
 
-    // Find llama-server binary in extracted contents
     let server_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
     let server_bin = find_file_recursive(&tmp_dir, server_name)
-        .with_context(|| format!("{server_name} not found in extracted archive"))?;
+        .with_context(|| format!("{server_name} not found in archive"))?;
 
     let dest = install_dir.join(server_name);
     std::fs::copy(&server_bin, &dest)?;
 
-    // Make executable on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    // Also copy any shared libraries (CUDA runtime DLLs, etc.)
     copy_shared_libs(&tmp_dir, &install_dir)?;
-
-    // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     println!("  Installed: {}", dest.display());
-
-    // Verify
-    if find_llama_server().is_some() {
-        println!("  llama-server verified and ready.");
-    } else {
-        println!();
-        println!("  llama-server installed but not in PATH.");
-        println!("  Add this to your shell profile:");
-        println!("    export PATH=\"{}:$PATH\"", install_dir.display());
-    }
-
     Ok(())
 }
 
-/// Get the latest llama.cpp release tag from GitHub.
 fn get_latest_llamacpp_version() -> Result<String> {
-    // Try curl + GitHub API
     let output = Command::new("curl")
-        .args([
-            "-sI",
-            &format!("https://github.com/{LLAMACPP_REPO}/releases/latest"),
-        ])
+        .args(["-sI", &format!("https://github.com/{LLAMACPP_REPO}/releases/latest")])
         .output()
-        .context("Failed to check llama.cpp releases (curl not available)")?;
+        .context("curl not available")?;
 
     let headers = String::from_utf8_lossy(&output.stdout);
     for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("location:") {
+        if line.to_lowercase().starts_with("location:") {
             if let Some(tag) = line.rsplit('/').next() {
                 let tag = tag.trim();
                 if !tag.is_empty() {
@@ -209,77 +234,52 @@ fn get_latest_llamacpp_version() -> Result<String> {
             }
         }
     }
-
-    bail!("Could not determine latest llama.cpp release. Check your internet connection.")
+    bail!("Could not determine latest llama.cpp release")
 }
 
-/// Build the correct asset filename for this platform.
 fn llama_asset_name(version: &str) -> Result<String> {
     if cfg!(target_os = "windows") {
-        if has_nvidia_gpu() {
-            Ok(format!("llama-{version}-bin-win-cuda-12.4-x64.zip"))
-        } else {
-            Ok(format!("llama-{version}-bin-win-cpu-x64.zip"))
-        }
+        Ok(format!("llama-{version}-bin-win-cpu-x64.zip"))
     } else if cfg!(target_os = "linux") {
-        if has_nvidia_gpu() {
-            // Try CUDA 12.4 (most common)
-            Ok(format!("llama-{version}-bin-ubuntu-x64.tar.gz"))
-            // Note: CUDA version is separate, users can install cudart package
-        } else {
-            Ok(format!("llama-{version}-bin-ubuntu-x64.tar.gz"))
-        }
+        Ok(format!("llama-{version}-bin-ubuntu-x64.tar.gz"))
     } else if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            Ok(format!("llama-{version}-bin-macos-arm64.tar.gz"))
-        } else {
-            Ok(format!("llama-{version}-bin-macos-x64.tar.gz"))
-        }
+        Ok(format!("llama-{version}-bin-macos-arm64.tar.gz"))
     } else {
-        bail!("Unsupported platform for llama-server auto-install")
+        bail!("Unsupported platform")
     }
 }
 
-/// Check if nvidia-smi is available (indicates NVIDIA GPU).
-fn has_nvidia_gpu() -> bool {
-    let smi = if cfg!(windows) { "nvidia-smi.exe" } else { "nvidia-smi" };
-    Command::new(smi)
-        .arg("--query-gpu=name")
-        .arg("--format=csv,noheader")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+// ── Helpers ────────────────────────────────────────────────────────────────
 
-// ── File download / extraction helpers ─────────────────────────────────────
-
-/// Download a file. Uses curl (available on Linux, macOS, and modern Windows).
 fn download_file(url: &str, dest: &Path) -> Result<()> {
-    // curl is available on all target platforms (Win10+, Linux, macOS)
+    // curl -L follows redirects, --progress-bar shows progress
     let status = Command::new("curl")
-        .args(["-fSL", "--progress-bar", url, "-o"])
+        .args(["-L", "--progress-bar", "-o"])
         .arg(dest)
+        .arg(url)
         .status();
 
     match status {
         Ok(s) if s.success() => return Ok(()),
-        _ => {}
+        Ok(s) => {
+            // Show the exit code for debugging
+            eprintln!("  curl exited with code: {}", s.code().unwrap_or(-1));
+        }
+        Err(e) => {
+            eprintln!("  curl error: {}", e);
+        }
     }
 
     // Windows fallback: PowerShell
     if cfg!(windows) {
+        println!("  Trying PowerShell...");
         let status = Command::new("powershell")
             .args([
                 "-Command",
-                &format!(
-                    "Invoke-WebRequest -Uri '{}' -OutFile '{}'",
-                    url,
-                    dest.display()
-                ),
+                &format!("Invoke-WebRequest -Uri '{}' -OutFile '{}'", url, dest.display()),
             ])
             .status()
-            .context("Download failed (neither curl nor PowerShell worked)")?;
-
+            .context("PowerShell failed")?;
         if status.success() {
             return Ok(());
         }
@@ -288,102 +288,62 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     bail!("Download failed: {}", url)
 }
 
-/// Extract an archive (.tar.gz or .zip).
 fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
-    let name = archive
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         let status = Command::new("tar")
-            .args(["xzf"])
-            .arg(archive)
-            .arg("-C")
-            .arg(dest_dir)
-            .status()
-            .context("Failed to run tar")?;
-        if !status.success() {
-            bail!("tar extraction failed");
-        }
+            .arg("xzf").arg(archive).arg("-C").arg(dest_dir)
+            .status().context("tar failed")?;
+        if !status.success() { bail!("tar extraction failed"); }
     } else if name.ends_with(".zip") {
         if cfg!(windows) {
             let status = Command::new("powershell")
-                .args([
-                    "-Command",
-                    &format!(
-                        "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                        archive.display(),
-                        dest_dir.display()
-                    ),
-                ])
-                .status()
-                .context("Failed to extract zip")?;
-            if !status.success() {
-                bail!("zip extraction failed");
-            }
+                .args(["-Command", &format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive.display(), dest_dir.display()
+                )])
+                .status().context("zip extraction failed")?;
+            if !status.success() { bail!("zip extraction failed"); }
         } else {
             let status = Command::new("unzip")
-                .args(["-o", "-q"])
-                .arg(archive)
-                .arg("-d")
-                .arg(dest_dir)
-                .status()
-                .context("Failed to run unzip")?;
-            if !status.success() {
-                bail!("zip extraction failed");
-            }
+                .args(["-o", "-q"]).arg(archive).arg("-d").arg(dest_dir)
+                .status().context("unzip failed")?;
+            if !status.success() { bail!("zip extraction failed"); }
         }
     } else {
         bail!("Unknown archive format: {}", name);
     }
-
     Ok(())
 }
 
-/// Copy shared libraries (.so, .dll, .dylib) from extracted dir to install dir.
 fn copy_shared_libs(src_dir: &Path, dest_dir: &Path) -> Result<()> {
-    let lib_extensions: &[&str] = if cfg!(windows) {
-        &["dll"]
-    } else if cfg!(target_os = "macos") {
-        &["dylib"]
-    } else {
-        &["so"]
-    };
-
-    copy_files_with_extensions(src_dir, dest_dir, lib_extensions)
+    let exts: &[&str] = if cfg!(windows) { &["dll"] } else if cfg!(target_os = "macos") { &["dylib"] } else { &["so"] };
+    copy_files_by_ext(src_dir, dest_dir, exts)
 }
 
-fn copy_files_with_extensions(src_dir: &Path, dest_dir: &Path, extensions: &[&str]) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(src_dir) else {
-        return Ok(());
-    };
+fn copy_files_by_ext(dir: &Path, dest: &Path, exts: &[&str]) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()); };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|&e| ext.starts_with(e)) {
-                    let dest = dest_dir.join(path.file_name().unwrap());
-                    let _ = std::fs::copy(&path, &dest);
+                if exts.iter().any(|&e| ext.starts_with(e)) {
+                    let _ = std::fs::copy(&path, dest.join(path.file_name().unwrap()));
                 }
             }
         } else if path.is_dir() {
-            copy_files_with_extensions(&path, dest_dir, extensions)?;
+            copy_files_by_ext(&path, dest, exts)?;
         }
     }
     Ok(())
 }
 
-/// Recursively find a file by name in a directory.
 fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
     let direct = dir.join(name);
-    if direct.exists() {
-        return Some(direct);
-    }
+    if direct.exists() { return Some(direct); }
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return None;
-    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return None; };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() && path.file_name().map(|n| n == name).unwrap_or(false) {
@@ -398,183 +358,10 @@ fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-// ── Model download ─────────────────────────────────────────────────────────
-
-/// Download a model. GGUF: curl single file directly. MLX: built-in downloader.
-async fn download_model(hf_repo: &str, hf_file: Option<&str>, model_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(model_dir)?;
-
-    if let Some(filename) = hf_file {
-        // GGUF: direct curl download — no huggingface-cli, no auth, no nonsense
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            hf_repo, filename
-        );
-        let dest = model_dir.join(filename);
-
-        if dest.exists() && dest.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false) {
-            println!("  File already exists: {}", dest.display());
-            return Ok(());
-        }
-
-        println!("  Downloading: {}", filename);
-        println!("  From: {}", url);
-        download_file(&url, &dest)?;
-        println!("  Model downloaded successfully.");
-    } else {
-        // MLX (whole repo): use built-in async downloader
-        println!("  Downloading MLX model repo: {}", hf_repo);
-        let downloader = crate::inference::download::ModelDownloader::new()?;
-        let progress = |downloaded: u64, total: u64| {
-            if total > 0 {
-                let pct = (downloaded as f64 / total as f64 * 100.0) as u64;
-                let mb = downloaded / (1024 * 1024);
-                let total_mb = total / (1024 * 1024);
-                eprint!("\r  Downloading: {} / {} MB ({}%)    ", mb, total_mb, pct);
-            }
-        };
-
-        let models_dir = model_dir.parent().context("invalid model dir")?;
-        downloader
-            .download_model(hf_repo, models_dir, progress)
-            .await?;
-        eprintln!();
-        println!("  Model downloaded successfully.");
-    }
-
-    Ok(())
-}
-
-// ── Model file detection ───────────────────────────────────────────────────
-
-/// Check if a model directory has actual model files.
-fn has_model_files(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    has_model_files_recursive(dir, 0)
-}
-
-fn has_model_files_recursive(dir: &Path, depth: u32) -> bool {
-    if depth > 2 {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "gguf" || ext == "safetensors" {
-                    return true;
-                }
-            }
-        } else if path.is_dir() && depth < 2 {
-            if has_model_files_recursive(&path, depth + 1) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Find the model file path (GGUF file or directory for MLX).
-fn find_model_path(model_dir: &Path) -> Result<String> {
-    // Check for GGUF files
-    if let Ok(entries) = std::fs::read_dir(model_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                return Ok(path.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    // Check for safetensors (MLX format — return directory)
-    if model_dir.join("config.json").exists() {
-        return Ok(model_dir.to_string_lossy().to_string());
-    }
-
-    // Recurse one level (huggingface-cli sometimes nests files)
-    if let Ok(entries) = std::fs::read_dir(model_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Ok(found) = find_model_path(&path) {
-                    return Ok(found);
-                }
-            }
-        }
-    }
-
-    bail!("No model files found in {}", model_dir.display())
-}
-
-// ── Config update ──────────────────────────────────────────────────────────
-
-/// Where to install binaries — ~/.local/bin on Unix, %USERPROFILE%\.local\bin on Windows.
 fn install_bin_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FORGE_INSTALL_DIR") {
         return PathBuf::from(dir);
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".local").join("bin")
-}
-
-/// Update ~/.ftai/config.toml with the model path, backend, and hardware-appropriate settings.
-fn update_config(
-    hw: &HardwareInfo,
-    recommendation: &crate::backend::types::ModelRecommendation,
-    model_path: &str,
-) -> Result<()> {
-    use crate::backend::types::GpuType;
-
-    let config_path = config::global_config_dir()?.join("config.toml");
-
-    let backend_str = match recommendation.backend {
-        config::BackendType::Mlx => "mlx",
-        config::BackendType::LlamaCpp | config::BackendType::Direct => "llamacpp",
-    };
-
-    // Determine gpu_layers: 0 for CPU-only, -1 (all) for GPU
-    let gpu_layers: i32 = match &hw.gpu {
-        GpuType::Cuda { .. } | GpuType::Metal => -1,
-        GpuType::None => 0,
-    };
-
-    // Determine thread count (use all cores, cap at 8 for efficiency)
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
-
-    // Write a clean config — easier than regex patching every field
-    let config_content = format!(
-        r#"[model]
-backend = "{backend_str}"
-path = "{model_path}"
-context_length = 32768
-temperature = 0.3
-tool_calling = "hybrid"
-
-[model.llamacpp]
-gpu_layers = {gpu_layers}
-threads = {threads}
-
-[model.mlx]
-quantization = "q4"
-
-[permissions]
-mode = "auto"
-
-[plugins]
-enabled = true
-auto_update = false
-"#
-    );
-
-    std::fs::write(&config_path, config_content)?;
-    println!("  gpu_layers: {} ({})", gpu_layers, if gpu_layers == 0 { "CPU-only" } else { "GPU offload" });
-    println!("  threads: {}", threads);
-    Ok(())
 }
