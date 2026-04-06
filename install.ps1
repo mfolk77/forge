@@ -32,8 +32,8 @@ Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
 # Extract
 Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
-# Move binary
-$binary = Get-ChildItem -Path $tmpDir -Filter "forge-windows*" -Recurse | Select-Object -First 1
+# Move binary (named 'forge.exe' inside the archive)
+$binary = Get-ChildItem -Path $tmpDir -Filter "forge.exe" -Recurse | Select-Object -First 1
 if ($binary) {
     Copy-Item $binary.FullName "$installDir\forge.exe" -Force
 } else {
@@ -57,4 +57,5 @@ if ($userPath -notlike "*$installDir*") {
 }
 
 Write-Host ""
-Write-Host "Run 'forge --version' to verify."
+Write-Host "Run 'forge setup' to install the backend and download a model."
+Write-Host "  (This is a one-time setup - it detects your hardware automatically.)"

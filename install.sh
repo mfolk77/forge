@@ -63,15 +63,13 @@ else
 fi
 
 tar xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
-chmod +x "$TMPDIR/forge-"* 2>/dev/null || true
 
-# The binary name inside the tarball matches the asset prefix (without .tar.gz)
-BINARY_NAME="${ASSET%.tar.gz}"
-if [ -f "$TMPDIR/$BINARY_NAME" ]; then
-  mv "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/forge"
+# Binary inside the archive is named 'forge'
+if [ -f "$TMPDIR/forge" ]; then
+  mv "$TMPDIR/forge" "$INSTALL_DIR/forge"
 else
   # Fallback: find any forge binary in the tmp dir
-  mv "$TMPDIR"/forge* "$INSTALL_DIR/forge" 2>/dev/null
+  find "$TMPDIR" -name "forge" -type f -exec mv {} "$INSTALL_DIR/forge" \; 2>/dev/null
 fi
 
 chmod +x "$INSTALL_DIR/forge"
@@ -90,4 +88,5 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "Run 'forge --version' to verify."
+echo "Run 'forge setup' to install the backend and download a model."
+echo "  (This is a one-time setup — it detects your hardware automatically.)"

@@ -15,6 +15,7 @@ mod search;
 mod session;
 mod skills;
 mod tools;
+mod setup;
 mod tui;
 mod update;
 
@@ -52,6 +53,8 @@ enum Commands {
     },
     /// Initialize a new Forge project in the current directory
     Init,
+    /// One-command setup: install backend, download model, configure everything
+    Setup,
     /// Check system health: backends, config, hardware
     Doctor,
     /// Manage plugins
@@ -422,6 +425,9 @@ async fn main() -> Result<()> {
             }
 
             println!("\nForge project initialized in {}", project_path.display());
+        }
+        Some(Commands::Setup) => {
+            setup::run_setup().await?;
         }
         Some(Commands::Doctor) => {
             println!("Forge Doctor");

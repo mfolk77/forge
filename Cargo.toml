@@ -1,6 +1,6 @@
 [package]
 name = "forge"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 description = "FolkTech AI terminal coding harness"
 license = "MIT"
