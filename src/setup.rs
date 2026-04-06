@@ -400,111 +400,49 @@ fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
 
 // ── Model download ─────────────────────────────────────────────────────────
 
-/// Download a model. For GGUF, downloads a single file. For MLX, downloads the whole repo.
+/// Download a model. GGUF: curl single file directly. MLX: built-in downloader.
 async fn download_model(hf_repo: &str, hf_file: Option<&str>, model_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(model_dir)?;
 
-    // Try huggingface-cli first (fastest, handles auth + resume)
-    if try_huggingface_cli(hf_repo, hf_file, model_dir) {
-        return Ok(());
-    }
-
-    // Try installing huggingface-cli and retrying
-    println!("  Installing huggingface-hub...");
-    let pip_installed = install_pip_package("huggingface-hub");
-    if pip_installed && try_huggingface_cli(hf_repo, hf_file, model_dir) {
-        return Ok(());
-    }
-
-    // Fallback: direct HTTP download for single GGUF files
     if let Some(filename) = hf_file {
-        println!("  Using direct download...");
+        // GGUF: direct curl download — no huggingface-cli, no auth, no nonsense
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             hf_repo, filename
         );
         let dest = model_dir.join(filename);
-        println!("  Downloading: {} (~{} GB)", filename, dest.metadata().map(|m| m.len() / (1024*1024*1024)).unwrap_or(0));
+
+        if dest.exists() && dest.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false) {
+            println!("  File already exists: {}", dest.display());
+            return Ok(());
+        }
+
+        println!("  Downloading: {}", filename);
+        println!("  From: {}", url);
         download_file(&url, &dest)?;
         println!("  Model downloaded successfully.");
-        return Ok(());
-    }
-
-    // Fallback for whole-repo downloads (MLX): use built-in downloader
-    println!("  Using built-in downloader...");
-    let downloader = crate::inference::download::ModelDownloader::new()?;
-    let progress = |downloaded: u64, total: u64| {
-        if total > 0 {
-            let pct = (downloaded as f64 / total as f64 * 100.0) as u64;
-            let downloaded_mb = downloaded / (1024 * 1024);
-            let total_mb = total / (1024 * 1024);
-            eprint!(
-                "\r  Downloading: {} / {} MB ({}%)    ",
-                downloaded_mb, total_mb, pct
-            );
-        }
-    };
-
-    let models_dir = model_dir.parent().context("invalid model dir")?;
-    downloader
-        .download_model(hf_repo, models_dir, progress)
-        .await?;
-    eprintln!();
-    println!("  Model downloaded successfully.");
-    Ok(())
-}
-
-/// Try downloading via huggingface-cli. Returns true on success.
-fn try_huggingface_cli(hf_repo: &str, hf_file: Option<&str>, model_dir: &Path) -> bool {
-    println!("  Trying huggingface-cli download...");
-
-    let mut args = vec![
-        "download".to_string(),
-        hf_repo.to_string(),
-    ];
-
-    // If a specific file is requested, add it as a positional arg
-    if let Some(filename) = hf_file {
-        args.push(filename.to_string());
-    }
-
-    args.push("--local-dir".to_string());
-    args.push(model_dir.to_string_lossy().to_string());
-
-    let status = Command::new("huggingface-cli")
-        .args(&args)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            println!("  Model downloaded successfully.");
-            true
-        }
-        _ => {
-            println!("  huggingface-cli not available or failed.");
-            false
-        }
-    }
-}
-
-/// Try to install a pip package. Returns true on success.
-fn install_pip_package(package: &str) -> bool {
-    // Try pip3 first, then pip
-    for pip in &["pip3", "pip"] {
-        let args = if cfg!(target_os = "linux") {
-            // Linux often needs --break-system-packages for system Python
-            vec!["install", "--break-system-packages", "-q", package]
-        } else {
-            vec!["install", "-q", package]
+    } else {
+        // MLX (whole repo): use built-in async downloader
+        println!("  Downloading MLX model repo: {}", hf_repo);
+        let downloader = crate::inference::download::ModelDownloader::new()?;
+        let progress = |downloaded: u64, total: u64| {
+            if total > 0 {
+                let pct = (downloaded as f64 / total as f64 * 100.0) as u64;
+                let mb = downloaded / (1024 * 1024);
+                let total_mb = total / (1024 * 1024);
+                eprint!("\r  Downloading: {} / {} MB ({}%)    ", mb, total_mb, pct);
+            }
         };
 
-        if let Ok(status) = Command::new(pip).args(&args).status() {
-            if status.success() {
-                return true;
-            }
-        }
+        let models_dir = model_dir.parent().context("invalid model dir")?;
+        downloader
+            .download_model(hf_repo, models_dir, progress)
+            .await?;
+        eprintln!();
+        println!("  Model downloaded successfully.");
     }
-    false
+
+    Ok(())
 }
 
 // ── Model file detection ───────────────────────────────────────────────────
