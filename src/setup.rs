@@ -53,13 +53,12 @@ pub async fn run_setup() -> Result<()> {
     let models_dir = config::global_config_dir()?.join("models");
     std::fs::create_dir_all(&models_dir)?;
 
-    let model_name = hf_repo_for_recommendation(&recommendation.name);
-    let model_dir = models_dir.join(recommendation.name.replace('/', "--"));
+    let model_dir = models_dir.join(&recommendation.name);
 
     if model_dir.exists() && has_model_files(&model_dir) {
         println!("  Model already downloaded. Skipping.");
     } else {
-        download_model(&model_name, &model_dir).await?;
+        download_model(&recommendation.hf_repo, recommendation.hf_file.as_deref(), &model_dir).await?;
     }
     println!();
 
@@ -401,35 +400,37 @@ fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
 
 // ── Model download ─────────────────────────────────────────────────────────
 
-/// Map a recommendation name to a HuggingFace repo ID.
-fn hf_repo_for_recommendation(name: &str) -> String {
-    match name {
-        "Qwen3.5-35B-A3B-4bit" => "Qwen/Qwen3.5-35B-A3B-4bit".to_string(),
-        "Qwen3.5-8B-A3B-4bit" => "Qwen/Qwen3.5-8B-A3B-4bit".to_string(),
-        "Qwen3.5-35B-A3B-Q4_K_M-GGUF" => "Qwen/Qwen3.5-35B-A3B-Q4_K_M-GGUF".to_string(),
-        "Qwen3.5-27B-A7B-Q4_K_M-GGUF" => "Qwen/Qwen3.5-27B-A7B-Q4_K_M-GGUF".to_string(),
-        "Qwen3.5-8B-A3B-Q4_K_M-GGUF" => "Qwen/Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
-        other => format!("Qwen/{other}"),
-    }
-}
-
-/// Download a model. Tries huggingface-cli first, then falls back to built-in downloader.
-async fn download_model(model_name: &str, model_dir: &Path) -> Result<()> {
+/// Download a model. For GGUF, downloads a single file. For MLX, downloads the whole repo.
+async fn download_model(hf_repo: &str, hf_file: Option<&str>, model_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(model_dir)?;
 
     // Try huggingface-cli first (fastest, handles auth + resume)
-    if try_huggingface_cli(model_name, model_dir) {
+    if try_huggingface_cli(hf_repo, hf_file, model_dir) {
         return Ok(());
     }
 
     // Try installing huggingface-cli and retrying
     println!("  Installing huggingface-hub...");
     let pip_installed = install_pip_package("huggingface-hub");
-    if pip_installed && try_huggingface_cli(model_name, model_dir) {
+    if pip_installed && try_huggingface_cli(hf_repo, hf_file, model_dir) {
         return Ok(());
     }
 
-    // Fallback: use Forge's built-in async downloader
+    // Fallback: direct HTTP download for single GGUF files
+    if let Some(filename) = hf_file {
+        println!("  Using direct download...");
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            hf_repo, filename
+        );
+        let dest = model_dir.join(filename);
+        println!("  Downloading: {} (~{} GB)", filename, dest.metadata().map(|m| m.len() / (1024*1024*1024)).unwrap_or(0));
+        download_file(&url, &dest)?;
+        println!("  Model downloaded successfully.");
+        return Ok(());
+    }
+
+    // Fallback for whole-repo downloads (MLX): use built-in downloader
     println!("  Using built-in downloader...");
     let downloader = crate::inference::download::ModelDownloader::new()?;
     let progress = |downloaded: u64, total: u64| {
@@ -446,7 +447,7 @@ async fn download_model(model_name: &str, model_dir: &Path) -> Result<()> {
 
     let models_dir = model_dir.parent().context("invalid model dir")?;
     downloader
-        .download_model(model_name, models_dir, progress)
+        .download_model(hf_repo, models_dir, progress)
         .await?;
     eprintln!();
     println!("  Model downloaded successfully.");
@@ -454,15 +455,24 @@ async fn download_model(model_name: &str, model_dir: &Path) -> Result<()> {
 }
 
 /// Try downloading via huggingface-cli. Returns true on success.
-fn try_huggingface_cli(model_name: &str, model_dir: &Path) -> bool {
+fn try_huggingface_cli(hf_repo: &str, hf_file: Option<&str>, model_dir: &Path) -> bool {
     println!("  Trying huggingface-cli download...");
+
+    let mut args = vec![
+        "download".to_string(),
+        hf_repo.to_string(),
+    ];
+
+    // If a specific file is requested, add it as a positional arg
+    if let Some(filename) = hf_file {
+        args.push(filename.to_string());
+    }
+
+    args.push("--local-dir".to_string());
+    args.push(model_dir.to_string_lossy().to_string());
+
     let status = Command::new("huggingface-cli")
-        .args([
-            "download",
-            model_name,
-            "--local-dir",
-            &model_dir.to_string_lossy(),
-        ])
+        .args(&args)
         .status();
 
     match status {

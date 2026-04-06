@@ -243,50 +243,48 @@ impl HardwareInfo {
     }
 
     /// Recommend a model based on hardware.
-    /// Prefers Qwen3.5 MoE models — they use fewer active parameters,
-    /// so a 27B MoE fits comfortably where a 27B dense model would not.
+    /// Uses Qwen3.5-35B-A3B MoE everywhere — only 3B active params per token,
+    /// fast even on CPU, smarter than dense models of similar inference cost.
     pub fn recommended_model(&self) -> ModelRecommendation {
         match (&self.arch, &self.gpu, self.ram_gb) {
-            // Apple Silicon — MLX backend
-            (CpuArch::AppleSilicon, _, ram) if ram >= 32 => ModelRecommendation {
-                name: "Qwen3.5-35B-A3B-4bit".to_string(),
-                backend: crate::config::BackendType::Mlx,
-                size_gb: 5,
-            },
+            // Apple Silicon — MLX backend (safetensors, download whole repo)
             (CpuArch::AppleSilicon, _, ram) if ram >= 16 => ModelRecommendation {
                 name: "Qwen3.5-35B-A3B-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
                 size_gb: 5,
+                hf_repo: "mlx-community/Qwen3.5-35B-A3B-4bit".to_string(),
+                hf_file: None,
             },
             (CpuArch::AppleSilicon, _, _) => ModelRecommendation {
-                name: "Qwen3.5-8B-A3B-4bit".to_string(),
+                name: "Qwen3.5-4B-Q4_K_M".to_string(),
                 backend: crate::config::BackendType::Mlx,
-                size_gb: 2,
+                size_gb: 3,
+                hf_repo: "mlx-community/Qwen3.5-35B-A3B-4bit".to_string(),
+                hf_file: None,
             },
-            // NVIDIA GPU — llama.cpp with CUDA
-            (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 24 => ModelRecommendation {
-                name: "Qwen3.5-35B-A3B-Q4_K_M-GGUF".to_string(),
-                backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 5,
-            },
+            // NVIDIA GPU or CPU-only — GGUF via llama.cpp (download single file)
             (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 8 => ModelRecommendation {
-                name: "Qwen3.5-27B-A7B-Q4_K_M-GGUF".to_string(),
+                name: "Qwen3.5-35B-A3B-Q4_K_M".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 16,
+                size_gb: 20,
+                hf_repo: "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
+                hf_file: Some("Qwen3.5-35B-A3B-Q4_K_M.gguf".to_string()),
             },
-            (_, GpuType::Cuda { .. }, _) => ModelRecommendation {
-                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
+            // CPU-only with enough RAM for the 35B MoE (3B active params)
+            (_, _, ram) if ram >= 24 => ModelRecommendation {
+                name: "Qwen3.5-35B-A3B-Q4_K_M".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 5,
+                size_gb: 20,
+                hf_repo: "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
+                hf_file: Some("Qwen3.5-35B-A3B-Q4_K_M.gguf".to_string()),
             },
-            // CPU-only — MoE models with low active params for tolerable speed.
-            // 27B MoE has 7B active params and is too slow on CPU (~1-2 tok/s).
-            // 8B-A3B MoE has only 3B active params but MoE routing makes it
-            // smarter than a dense 3B — best balance for CPU inference.
-            (_, _, _) => ModelRecommendation {
-                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
+            // Low RAM — dense 4B is safer
+            _ => ModelRecommendation {
+                name: "Qwen3.5-4B-Q4_K_M".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 5,
+                size_gb: 3,
+                hf_repo: "unsloth/Qwen3.5-4B-GGUF".to_string(),
+                hf_file: Some("Qwen3.5-4B-Q4_K_M.gguf".to_string()),
             },
         }
     }
@@ -297,6 +295,10 @@ pub struct ModelRecommendation {
     pub name: String,
     pub backend: crate::config::BackendType,
     pub size_gb: u64,
+    /// HuggingFace repo ID (e.g. "unsloth/Qwen3.5-35B-A3B-GGUF")
+    pub hf_repo: String,
+    /// Specific file to download from the repo (None = download whole repo)
+    pub hf_file: Option<String>,
 }
 
 #[cfg(test)]
@@ -345,7 +347,9 @@ mod tests {
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M-GGUF");
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
+        assert_eq!(rec.hf_repo, "unsloth/Qwen3.5-35B-A3B-GGUF");
+        assert_eq!(rec.hf_file.as_deref(), Some("Qwen3.5-35B-A3B-Q4_K_M.gguf"));
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
@@ -357,32 +361,21 @@ mod tests {
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-27B-A7B-Q4_K_M-GGUF");
-        assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
-    }
-
-    #[test]
-    fn test_model_recommendation_cpu_only_16gb() {
-        let hw = HardwareInfo {
-            arch: CpuArch::X86_64,
-            gpu: GpuType::None,
-            ram_gb: 16,
-        };
-        let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
     #[test]
     fn test_model_recommendation_cpu_only_32gb() {
-        // CPU-only always gets 8B-A3B MoE — 27B is too slow without GPU
         let hw = HardwareInfo {
             arch: CpuArch::X86_64,
             gpu: GpuType::None,
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
+        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
+        assert_eq!(rec.hf_repo, "unsloth/Qwen3.5-35B-A3B-GGUF");
+        assert_eq!(rec.hf_file.as_deref(), Some("Qwen3.5-35B-A3B-Q4_K_M.gguf"));
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
@@ -394,7 +387,21 @@ mod tests {
             ram_gb: 8,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
+        assert_eq!(rec.name, "Qwen3.5-4B-Q4_K_M");
+        assert_eq!(rec.hf_repo, "unsloth/Qwen3.5-4B-GGUF");
+        assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
+    }
+
+    #[test]
+    fn test_model_recommendation_cpu_only_16gb() {
+        let hw = HardwareInfo {
+            arch: CpuArch::X86_64,
+            gpu: GpuType::None,
+            ram_gb: 16,
+        };
+        let rec = hw.recommended_model();
+        // 16GB < 24GB threshold, falls through to low-RAM
+        assert_eq!(rec.name, "Qwen3.5-4B-Q4_K_M");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
