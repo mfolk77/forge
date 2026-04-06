@@ -59,7 +59,7 @@ Forge can self-update from GitHub Releases. Run `forge update --check` to check 
 # 1. Install a model (Forge auto-detects your hardware and recommends one)
 forge hardware
 forge model install Qwen/Qwen3.5-35B-A3B-4bit              # macOS Apple Silicon (MLX)
-forge model install Qwen/Qwen3.5-27B-A7B-Q4_K_M-GGUF       # Linux / Windows (32GB+ RAM)
+forge model install Qwen/Qwen3.5-8B-A3B-Q4_K_M-GGUF         # Linux / Windows (CPU)
 
 # 2. Activate it
 forge model use Qwen3.5-35B-A3B-4bit
@@ -110,8 +110,7 @@ Forge auto-detects your hardware and recommends an appropriate model:
 | Apple Silicon <16GB | Metal | Qwen3.5-8B-A3B-4bit (MoE, 3B active) | MLX |
 | NVIDIA 24GB+ VRAM | CUDA | Qwen3.5-35B-A3B-Q4_K_M (MoE, 3B active) | llama.cpp |
 | NVIDIA 8GB+ VRAM | CUDA | Qwen3.5-27B-A7B-Q4_K_M (MoE, 7B active) | llama.cpp |
-| 32GB+ RAM (CPU/other) | -- | Qwen3.5-27B-A7B-Q4_K_M (MoE, 7B active) | llama.cpp |
-| 16GB+ RAM (CPU/other) | -- | Qwen3.5-8B-A3B-Q4_K_M (MoE, 3B active) | llama.cpp |
+| CPU-only (any RAM) | -- | Qwen3.5-8B-A3B-Q4_K_M (MoE, 3B active) | llama.cpp |
 
 ```bash
 forge hardware   # or /hardware in TUI

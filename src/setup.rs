@@ -66,7 +66,7 @@ pub async fn run_setup() -> Result<()> {
     // Step 4: Configure
     println!("[4/4] Configuring Forge...");
     let model_path = find_model_path(&model_dir)?;
-    update_config(&recommendation, &model_path)?;
+    update_config(&hw, &recommendation, &model_path)?;
     println!("  Backend: {:?}", recommendation.backend);
     println!("  Model path: {}", model_path);
     println!();
@@ -574,44 +574,59 @@ fn install_bin_dir() -> PathBuf {
     home.join(".local").join("bin")
 }
 
-/// Update ~/.ftai/config.toml with the model path and backend.
+/// Update ~/.ftai/config.toml with the model path, backend, and hardware-appropriate settings.
 fn update_config(
+    hw: &HardwareInfo,
     recommendation: &crate::backend::types::ModelRecommendation,
     model_path: &str,
 ) -> Result<()> {
+    use crate::backend::types::GpuType;
+
     let config_path = config::global_config_dir()?.join("config.toml");
-    let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
 
     let backend_str = match recommendation.backend {
         config::BackendType::Mlx => "mlx",
         config::BackendType::LlamaCpp | config::BackendType::Direct => "llamacpp",
     };
 
-    // Update backend
-    if content.contains("backend = ") {
-        let re = regex::Regex::new(r#"(?m)^backend\s*=\s*"[^"]*""#).unwrap();
-        content = re
-            .replace(&content, format!(r#"backend = "{backend_str}""#))
-            .to_string();
-    }
+    // Determine gpu_layers: 0 for CPU-only, -1 (all) for GPU
+    let gpu_layers: i32 = match &hw.gpu {
+        GpuType::Cuda { .. } | GpuType::Metal => -1,
+        GpuType::None => 0,
+    };
 
-    // Update or insert model.path
-    if content.contains("path = ") {
-        let re = regex::Regex::new(r#"(?m)^path\s*=\s*"[^"]*""#).unwrap();
-        content = re
-            .replace(&content, format!(r#"path = "{model_path}""#))
-            .to_string();
-    } else if content.contains("[model]") {
-        content = content.replace(
-            "[model]",
-            &format!("[model]\npath = \"{model_path}\""),
-        );
-    } else {
-        content.push_str(&format!(
-            "\n[model]\nbackend = \"{backend_str}\"\npath = \"{model_path}\"\n"
-        ));
-    }
+    // Determine thread count (use all cores, cap at 8 for efficiency)
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
 
-    std::fs::write(&config_path, &content)?;
+    // Write a clean config — easier than regex patching every field
+    let config_content = format!(
+        r#"[model]
+backend = "{backend_str}"
+path = "{model_path}"
+context_length = 32768
+temperature = 0.3
+tool_calling = "hybrid"
+
+[model.llamacpp]
+gpu_layers = {gpu_layers}
+threads = {threads}
+
+[model.mlx]
+quantization = "q4"
+
+[permissions]
+mode = "auto"
+
+[plugins]
+enabled = true
+auto_update = false
+"#
+    );
+
+    std::fs::write(&config_path, config_content)?;
+    println!("  gpu_layers: {} ({})", gpu_layers, if gpu_layers == 0 { "CPU-only" } else { "GPU offload" });
+    println!("  threads: {}", threads);
     Ok(())
 }

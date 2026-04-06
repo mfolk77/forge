@@ -279,18 +279,11 @@ impl HardwareInfo {
                 backend: crate::config::BackendType::LlamaCpp,
                 size_gb: 5,
             },
-            // CPU-only / undetected GPU — use RAM to decide, MoE models
-            (_, _, ram) if ram >= 32 => ModelRecommendation {
-                name: "Qwen3.5-27B-A7B-Q4_K_M-GGUF".to_string(),
-                backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 16,
-            },
-            (_, _, ram) if ram >= 16 => ModelRecommendation {
-                name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
-                backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 5,
-            },
-            _ => ModelRecommendation {
+            // CPU-only — MoE models with low active params for tolerable speed.
+            // 27B MoE has 7B active params and is too slow on CPU (~1-2 tok/s).
+            // 8B-A3B MoE has only 3B active params but MoE routing makes it
+            // smarter than a dense 3B — best balance for CPU inference.
+            (_, _, _) => ModelRecommendation {
                 name: "Qwen3.5-8B-A3B-Q4_K_M-GGUF".to_string(),
                 backend: crate::config::BackendType::LlamaCpp,
                 size_gb: 5,
@@ -382,13 +375,14 @@ mod tests {
 
     #[test]
     fn test_model_recommendation_cpu_only_32gb() {
+        // CPU-only always gets 8B-A3B MoE — 27B is too slow without GPU
         let hw = HardwareInfo {
             arch: CpuArch::X86_64,
             gpu: GpuType::None,
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-27B-A7B-Q4_K_M-GGUF");
+        assert_eq!(rec.name, "Qwen3.5-8B-A3B-Q4_K_M-GGUF");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
