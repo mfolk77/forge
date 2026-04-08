@@ -19,6 +19,12 @@ use crate::rules::parser::Event as RuleEvent;
 use crate::plugins::PluginManager;
 use crate::skills::LoadedSkill;
 use crate::tools::{ToolContext, ToolRegistry};
+#[cfg(feature = "evolution")]
+use crate::evolution::{
+    analyzer::{OutcomeType, SessionOutcome, ToolCallRecord, ToolResultType, UserFeedback},
+    generator::EvolutionEngine,
+    store::EvolutionStore,
+};
 
 use super::autocomplete::{Autocomplete, AutocompleteResult, CommandEntry};
 use super::input::InputState;
@@ -114,6 +120,18 @@ pub struct TuiApp {
     ftai_mtime: Option<std::time::SystemTime>,
     /// Session persistence manager
     session_manager: Option<crate::session::manager::SessionManager>,
+    /// Evolution engine for session outcome analysis and rule generation
+    #[cfg(feature = "evolution")]
+    evolution_engine: Option<EvolutionEngine>,
+    /// Accumulated tool call records for the current session (evolution tracking)
+    #[cfg(feature = "evolution")]
+    session_tool_calls: Vec<ToolCallRecord>,
+    /// Count of completed sessions (for periodic evolution analysis)
+    #[cfg(feature = "evolution")]
+    session_count: usize,
+    /// First user message in the session (used as task description for evolution)
+    #[cfg(feature = "evolution")]
+    session_task_description: Option<String>,
 }
 
 impl TuiApp {
@@ -286,6 +304,14 @@ impl TuiApp {
                 ).ok()
             });
 
+        // Initialize evolution engine
+        #[cfg(feature = "evolution")]
+        let evolution_engine = crate::config::global_config_dir()
+            .ok()
+            .map(|d| d.join("evolution.db"))
+            .and_then(|db_path| EvolutionStore::open(&db_path).ok())
+            .map(EvolutionEngine::new);
+
         Self {
             config,
             backend,
@@ -315,6 +341,14 @@ impl TuiApp {
             denial_tracker,
             ftai_mtime,
             session_manager,
+            #[cfg(feature = "evolution")]
+            evolution_engine,
+            #[cfg(feature = "evolution")]
+            session_tool_calls: Vec::new(),
+            #[cfg(feature = "evolution")]
+            session_count: 0,
+            #[cfg(feature = "evolution")]
+            session_task_description: None,
         }
     }
 
@@ -486,6 +520,70 @@ impl TuiApp {
         // End session persistence
         if let Some(ref mut mgr) = self.session_manager {
             let _ = mgr.end_session("Session ended by user");
+        }
+
+        // Evolution: record session outcome and analyze patterns
+        #[cfg(feature = "evolution")]
+        {
+            if let Some(ref evo) = self.evolution_engine {
+                let session_id = self.session_manager
+                    .as_ref()
+                    .and_then(|m| m.current_session_id().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("session-{}", std::process::id()));
+
+                let has_errors = self.session_tool_calls.iter().any(|tc| {
+                    matches!(tc.result_type, ToolResultType::Error(_))
+                });
+                let outcome_type = if self.session_tool_calls.is_empty() {
+                    OutcomeType::Abandoned
+                } else if has_errors {
+                    OutcomeType::PartialSuccess
+                } else {
+                    OutcomeType::Success
+                };
+
+                let outcome = SessionOutcome {
+                    session_id,
+                    project: self.project_path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                    task_description: self.session_task_description.clone()
+                        .unwrap_or_else(|| "Interactive session".to_string()),
+                    tool_calls: std::mem::take(&mut self.session_tool_calls),
+                    success: outcome_type,
+                    user_feedback: Some(UserFeedback::NoFeedback),
+                    total_tokens: self.engine.estimated_tokens(),
+                    retries: 0,
+                };
+
+                match evo.analyze_and_evolve(&outcome) {
+                    Ok(rules) if !rules.is_empty() => {
+                        // Rules were generated — they're persisted in the evolution DB
+                        // and will be available for future sessions
+                    }
+                    _ => {}
+                }
+
+                self.session_count += 1;
+            }
+        }
+
+        // Dream: check if conditions are met and run dream analysis
+        {
+            let transcripts_dir = self.project_path.join(".ftai").join("transcripts");
+            let scheduler = crate::dream::scheduler::DreamScheduler::new(&self.project_path);
+            if scheduler.should_dream(&transcripts_dir) {
+                if let Ok(_lock) = scheduler.acquire_lock() {
+                    let runner = crate::dream::runner::DreamRunner::new(&self.project_path);
+                    let since = scheduler.last_dream_time();
+                    let _ = runner.run(since);
+                }
+            }
         }
 
         // Run session_end hook
@@ -1119,6 +1217,12 @@ author = ""
             let _ = mgr.save_message(crate::backend::types::Role::User, &text, None);
         }
 
+        // Track first user message as session task description (for evolution)
+        #[cfg(feature = "evolution")]
+        if self.session_task_description.is_none() {
+            self.session_task_description = Some(text.chars().take(200).collect());
+        }
+
         // Start the agentic loop
         self.run_agentic_loop().await
     }
@@ -1331,6 +1435,13 @@ author = ""
                     reason: reason.clone(),
                 });
                 self.engine.add_tool_result(&call.id, &format!("HARD BLOCKED: {reason}"));
+                #[cfg(feature = "evolution")]
+                self.session_tool_calls.push(ToolCallRecord {
+                    tool_name: call.name.clone(),
+                    arguments_summary: summarize_args(&call.arguments),
+                    result_type: ToolResultType::Rejected,
+                    duration_ms: 0,
+                });
                 continue;
             }
 
@@ -1360,6 +1471,13 @@ author = ""
                             tool: call.name.clone(),
                         });
                         self.engine.add_tool_result(&call.id, "DENIED: User declined permission");
+                        #[cfg(feature = "evolution")]
+                        self.session_tool_calls.push(ToolCallRecord {
+                            tool_name: call.name.clone(),
+                            arguments_summary: summarize_args(&call.arguments),
+                            result_type: ToolResultType::Rejected,
+                            duration_ms: 0,
+                        });
                         continue;
                     }
                     self.denial_tracker.reset_denials(&call.name, &call.arguments);
@@ -1389,6 +1507,13 @@ author = ""
                         reason: reason.clone(),
                     });
                     self.engine.add_tool_result(&call.id, &format!("BLOCKED: {reason}"));
+                    #[cfg(feature = "evolution")]
+                    self.session_tool_calls.push(ToolCallRecord {
+                        tool_name: call.name.clone(),
+                        arguments_summary: summarize_args(&call.arguments),
+                        result_type: ToolResultType::RuleBlocked,
+                        duration_ms: 0,
+                    });
                     continue;
                 }
                 RuleAction::Allow | RuleAction::Modify(_) => {
@@ -1451,11 +1576,13 @@ author = ""
                 project_path: self.project_path.clone(),
             };
 
+            let start_time = std::time::Instant::now();
             let futures: Vec<_> = approved_readonly.iter().map(|ac| {
                 self.tools.execute(&ac.name, ac.arguments.clone(), &ctx)
             }).collect();
 
             let results = futures_util::future::join_all(futures).await;
+            let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
             for (ac, result) in approved_readonly.iter().zip(results) {
                 match result {
@@ -1473,6 +1600,19 @@ author = ""
                             is_error: result.is_error,
                         });
                         self.engine.add_tool_result(&ac.id, &output);
+
+                        // Record tool call for evolution tracking
+                        #[cfg(feature = "evolution")]
+                        self.session_tool_calls.push(ToolCallRecord {
+                            tool_name: ac.name.clone(),
+                            arguments_summary: ac.args_summary.clone(),
+                            result_type: if result.is_error {
+                                ToolResultType::Error(output.chars().take(80).collect())
+                            } else {
+                                ToolResultType::Success
+                            },
+                            duration_ms: elapsed_ms,
+                        });
 
                         // Run post-hooks (plugin hooks)
                         let post_event = format!("post:{}", ac.name);
@@ -1496,6 +1636,15 @@ author = ""
                             is_error: true,
                         });
                         self.engine.add_tool_result(&ac.id, &err);
+
+                        // Record failed tool call for evolution tracking
+                        #[cfg(feature = "evolution")]
+                        self.session_tool_calls.push(ToolCallRecord {
+                            tool_name: ac.name.clone(),
+                            arguments_summary: ac.args_summary.clone(),
+                            result_type: ToolResultType::Error(err.chars().take(80).collect()),
+                            duration_ms: elapsed_ms,
+                        });
                     }
                 }
             }
@@ -1508,8 +1657,10 @@ author = ""
                 project_path: self.project_path.clone(),
             };
 
+            let tool_start = std::time::Instant::now();
             match self.tools.execute(&ac.name, ac.arguments.clone(), &ctx).await {
                 Ok(result) => {
+                    let tool_elapsed = tool_start.elapsed().as_millis() as u64;
                     let output = crate::tools::result_storage::maybe_persist_result(
                         &result.output,
                         &ac.name,
@@ -1523,6 +1674,19 @@ author = ""
                         is_error: result.is_error,
                     });
                     self.engine.add_tool_result(&ac.id, &output);
+
+                    // Record tool call for evolution tracking
+                    #[cfg(feature = "evolution")]
+                    self.session_tool_calls.push(ToolCallRecord {
+                        tool_name: ac.name.clone(),
+                        arguments_summary: ac.args_summary.clone(),
+                        result_type: if result.is_error {
+                            ToolResultType::Error(output.chars().take(80).collect())
+                        } else {
+                            ToolResultType::Success
+                        },
+                        duration_ms: tool_elapsed,
+                    });
 
                     // Run after_file_edit user hook for file tools
                     if ac.name == "file_edit" || ac.name == "file_write" {
@@ -1547,6 +1711,7 @@ author = ""
                     }
                 }
                 Err(e) => {
+                    let tool_elapsed = tool_start.elapsed().as_millis() as u64;
                     let err = format!("Tool error: {e}");
                     self.messages.push(DisplayMessage::ToolCall {
                         name: ac.name.clone(),
@@ -1555,6 +1720,15 @@ author = ""
                         is_error: true,
                     });
                     self.engine.add_tool_result(&ac.id, &err);
+
+                    // Record failed tool call for evolution tracking
+                    #[cfg(feature = "evolution")]
+                    self.session_tool_calls.push(ToolCallRecord {
+                        tool_name: ac.name.clone(),
+                        arguments_summary: ac.args_summary.clone(),
+                        result_type: ToolResultType::Error(err.chars().take(80).collect()),
+                        duration_ms: tool_elapsed,
+                    });
                 }
             }
         }

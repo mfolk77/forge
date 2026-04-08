@@ -235,6 +235,8 @@ impl EvolutionStore {
     }
 
     /// Increment the applied_count for a rule by name.
+    /// Used when an evolution-generated rule is applied during a session.
+    #[allow(dead_code)]
     pub fn increment_rule_applied(&self, name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE generated_rules SET applied_count = applied_count + 1 WHERE name = ?1",
@@ -244,6 +246,8 @@ impl EvolutionStore {
     }
 
     /// Increment the success_after_apply counter for a rule.
+    /// Used when a session succeeds after an evolution rule was applied.
+    #[allow(dead_code)]
     pub fn increment_rule_success(&self, name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE generated_rules SET success_after_apply = success_after_apply + 1 WHERE name = ?1",
