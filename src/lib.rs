@@ -7,6 +7,7 @@ pub mod evolution;
 pub mod formatting;
 pub mod hooks;
 pub mod inference;
+pub mod mesh;
 pub mod permissions;
 pub mod plugins;
 pub mod rules;

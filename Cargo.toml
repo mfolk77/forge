@@ -59,6 +59,12 @@ libc = "0.2"
 # Self-update from GitHub Releases
 self_update = { version = "0.41", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "rustls"] }
 
+# Mesh (Myelin communication)
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+rand_core = "0.6"
+
 # Misc
 dirs = "6"
 sha2 = "0.10"
