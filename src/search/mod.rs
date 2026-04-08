@@ -1,16 +1,17 @@
+#[allow(dead_code)]
 pub mod indexer;
+#[allow(dead_code)]
 pub mod query;
+#[allow(dead_code)]
 pub mod store;
+#[allow(dead_code)]
 pub mod watcher;
 
 #[cfg(test)]
 mod security_tests;
 
-pub use indexer::{ChunkType, CodeChunk, CodeIndexer, IndexProgress};
-pub use query::{SearchEngine, SearchResult};
-pub use store::{SearchStore, StoredChunk};
-pub use watcher::FileWatcher;
 
+#[allow(dead_code)]
 /// Known code file extensions worth indexing.
 pub(crate) const CODE_EXTENSIONS: &[&str] = &[
     "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "cpp", "h", "hpp", "java", "kt", "swift",
@@ -20,6 +21,7 @@ pub(crate) const CODE_EXTENSIONS: &[&str] = &[
     "makefile",
 ];
 
+#[allow(dead_code)]
 /// Directories that should always be skipped during indexing.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -33,6 +35,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".ftai",
 ];
 
+#[allow(dead_code)]
 /// Check whether a file extension belongs to a code file we should index.
 pub(crate) fn is_code_file(path: &std::path::Path) -> bool {
     let ext = match path.extension().and_then(|e| e.to_str()) {

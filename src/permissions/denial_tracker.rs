@@ -1,15 +1,19 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+use super::classifier::PermissionTier;
+
 /// Tracks consecutive denials per tool-key and maintains a session-scoped allowlist.
 ///
 /// Used alongside the static classifier to escalate repeatedly-denied tool calls
 /// and to fast-path allowlisted ones.
+#[allow(dead_code)]
 pub struct DenialTracker {
     denial_streak: HashMap<String, u32>,
     session_allowlist: HashSet<String>,
 }
 
+#[allow(dead_code)]
 impl DenialTracker {
     pub fn new() -> Self {
         Self {
@@ -67,13 +71,21 @@ impl DenialTracker {
     }
 
     /// Add a tool call's key to the session allowlist.
-    pub fn add_to_allowlist(&mut self, name: &str, args: &Value) {
+    /// Destructive-tier actions are NEVER allowlisted — this is a hard invariant.
+    pub fn add_to_allowlist(&mut self, name: &str, args: &Value, tier: PermissionTier) {
+        if tier == PermissionTier::Destructive {
+            return; // Destructive actions always require confirmation
+        }
         let key = Self::tool_key(name, args);
         self.session_allowlist.insert(key);
     }
 
     /// Check if a tool call is on the session allowlist.
-    pub fn is_allowlisted(&self, name: &str, args: &Value) -> bool {
+    /// Returns false for Destructive-tier actions regardless of allowlist state.
+    pub fn is_allowlisted(&self, name: &str, args: &Value, tier: PermissionTier) -> bool {
+        if tier == PermissionTier::Destructive {
+            return false;
+        }
         let key = Self::tool_key(name, args);
         self.session_allowlist.contains(&key)
     }
@@ -94,7 +106,7 @@ mod tests {
     fn test_default_state_empty() {
         let tracker = DenialTracker::new();
         assert!(!tracker.should_escalate("bash", &json!({"command": "ls"})));
-        assert!(!tracker.is_allowlisted("bash", &json!({"command": "ls"})));
+        assert!(!tracker.is_allowlisted("bash", &json!({"command": "ls"}), PermissionTier::Safe));
     }
 
     #[test]
@@ -143,9 +155,9 @@ mod tests {
     fn test_allowlist_bypasses() {
         let mut tracker = DenialTracker::new();
         let args = json!({"command": "cargo build"});
-        assert!(!tracker.is_allowlisted("bash", &args));
-        tracker.add_to_allowlist("bash", &args);
-        assert!(tracker.is_allowlisted("bash", &args));
+        assert!(!tracker.is_allowlisted("bash", &args, PermissionTier::Write));
+        tracker.add_to_allowlist("bash", &args, PermissionTier::Write);
+        assert!(tracker.is_allowlisted("bash", &args, PermissionTier::Write));
     }
 
     #[test]
@@ -188,12 +200,12 @@ mod tests {
         tracker.record_denial("bash", &args);
         tracker.record_denial("bash", &args);
         tracker.record_denial("bash", &args);
-        tracker.add_to_allowlist("bash", &json!({"command": "cargo build"}));
+        tracker.add_to_allowlist("bash", &json!({"command": "cargo build"}), PermissionTier::Write);
 
         tracker.clear();
 
         assert!(!tracker.should_escalate("bash", &args));
-        assert!(!tracker.is_allowlisted("bash", &json!({"command": "cargo build"})));
+        assert!(!tracker.is_allowlisted("bash", &json!({"command": "cargo build"}), PermissionTier::Write));
     }
 
     // ── P0 Security Red Tests ──────────────────────────────────────────────
@@ -214,6 +226,28 @@ mod tests {
         assert_eq!(
             DenialTracker::tool_key("file_edit", &json!({"path": {"nested": "obj"}})),
             "file_edit:"
+        );
+    }
+
+    #[test]
+    fn test_p0_destructive_never_allowlisted() {
+        let mut tracker = DenialTracker::new();
+        let args = json!({"command": "rm -rf /"});
+
+        // Attempt to allowlist a destructive action — must be silently rejected
+        tracker.add_to_allowlist("bash", &args, PermissionTier::Destructive);
+        assert!(
+            !tracker.is_allowlisted("bash", &args, PermissionTier::Destructive),
+            "Destructive-tier actions must NEVER be allowlisted"
+        );
+
+        // Even if the key was somehow inserted (e.g. via Write then reclassified),
+        // is_allowlisted must still return false for Destructive tier
+        tracker.add_to_allowlist("bash", &args, PermissionTier::Write);
+        assert!(tracker.is_allowlisted("bash", &args, PermissionTier::Write));
+        assert!(
+            !tracker.is_allowlisted("bash", &args, PermissionTier::Destructive),
+            "Same key queried as Destructive must be rejected"
         );
     }
 

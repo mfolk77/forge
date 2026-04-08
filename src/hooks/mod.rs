@@ -9,12 +9,14 @@ use crate::config::Config;
 
 /// When a built-in hook fires relative to tool execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum HookEvent {
     BeforeTool,
     AfterTool,
 }
 
 /// A prompt-based hook that is evaluated by the model, not executed as a shell command.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BuiltinHookPrompt {
     pub name: String,
@@ -26,6 +28,7 @@ pub struct BuiltinHookPrompt {
 
 /// Returns the default built-in hook configurations.
 /// These are prompt-based hooks that run before/after tool use.
+#[allow(dead_code)]
 pub fn builtin_hook_prompts() -> Vec<BuiltinHookPrompt> {
     vec![
         BuiltinHookPrompt {
@@ -99,6 +102,7 @@ pub struct HookRunner {
 }
 
 impl HookRunner {
+    #[allow(dead_code)]
     pub fn new(hooks: Vec<HookConfig>) -> Self {
         Self { hooks }
     }

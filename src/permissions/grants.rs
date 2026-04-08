@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::time::Instant;
 
+use super::classifier::{classify, PermissionTier};
+
 /// The scope of a permission grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantScope {
@@ -17,6 +19,7 @@ pub enum GrantScope {
 pub struct PermissionGrant {
     pub tool_name: String,
     pub scope: GrantScope,
+    #[allow(dead_code)]
     pub granted_at: Instant,
 }
 
@@ -57,7 +60,12 @@ impl GrantCache {
                     params
                         .get("command")
                         .and_then(|v| v.as_str())
-                        .map(|c| c.starts_with(cmd.as_str()))
+                        .map(|c| {
+                            // Prefix must match AND full command must not escalate to Destructive.
+                            // This prevents "cargo ; rm -rf /" from matching a "cargo " grant.
+                            c.starts_with(cmd.as_str())
+                                && classify(tool_name, params) != PermissionTier::Destructive
+                        })
                         .unwrap_or(false)
                 }
             }
@@ -85,10 +93,12 @@ impl GrantCache {
     }
 
     /// Number of active grants.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.grants.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.grants.is_empty()
     }
@@ -151,6 +161,28 @@ mod tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(!cache.matches("file_write", &json!({})));
+    }
+
+    #[test]
+    fn test_p0_grant_command_prefix_injection_blocked() {
+        let mut cache = GrantCache::new();
+        cache.add(PermissionGrant {
+            tool_name: "bash".to_string(),
+            scope: GrantScope::ToolWithCommand("bash".to_string(), "cargo ".to_string()),
+            granted_at: Instant::now(),
+        });
+
+        // Clean cargo command should match
+        assert!(cache.matches("bash", &json!({"command": "cargo build"})));
+        // Compound command with destructive payload must NOT match
+        assert!(
+            !cache.matches("bash", &json!({"command": "cargo build ; rm -rf /"})),
+            "Compound destructive command must not be covered by prefix grant"
+        );
+        assert!(
+            !cache.matches("bash", &json!({"command": "cargo build && rm important.txt"})),
+            "Compound destructive command must not be covered by prefix grant"
+        );
     }
 
     #[test]

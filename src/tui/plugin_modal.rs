@@ -1,6 +1,5 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::*;
 
 use crate::plugins::catalog::{self, CatalogEntry};
 use super::modal::{Modal, ModalAction};
@@ -61,6 +60,7 @@ pub struct PluginModal {
 
 impl PluginModal {
     /// Create a new plugin modal with catalog entries and installed plugins.
+    #[allow(dead_code)]
     pub fn new(installed: Vec<InstalledPluginEntry>) -> Self {
         Self {
             active_tab: PluginTab::Discover,

@@ -29,7 +29,7 @@ mod tests {
     use std::collections::HashMap;
     use crate::conversation::adapter::{
         parse_hermes_json, parse_qwen35_xml, ParsedToolCall,
-        Qwen35Adapter, HermesAdapter, GenericAdapter, ModelAdapter,
+        Qwen35Adapter, GenericAdapter, ModelAdapter,
     };
     use crate::conversation::streaming::{StreamingToolCallParser, StreamEvent};
     use crate::conversation::validator::{ToolCallValidator, ValidationResult};

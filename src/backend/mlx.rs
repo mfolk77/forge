@@ -18,6 +18,7 @@ pub struct MlxServer {
 }
 
 impl MlxServer {
+    #[allow(dead_code)]
     pub fn new(port: u16) -> Self {
         let client = HttpModelClient::new(&format!("http://127.0.0.1:{port}"));
         Self {
@@ -119,8 +120,8 @@ impl MlxServer {
         self.process = Some(child);
         self.model_path = Some(model_path.to_string());
 
-        // Wait for server to be ready
-        for i in 0..60 {
+        // Wait for server to be ready (90s — large models on 16GB can take 30-60s)
+        for i in 0..180 {
             if self.client.health_check().await {
                 return Ok(());
             }
@@ -140,7 +141,7 @@ impl MlxServer {
         }
 
         self.stop();
-        anyhow::bail!("mlx_lm.server failed to start within 30 seconds")
+        anyhow::bail!("mlx_lm.server failed to start within 90 seconds")
     }
 
     pub fn stop(&mut self) {
@@ -154,10 +155,12 @@ impl MlxServer {
         &self.client
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.process.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn model_path(&self) -> Option<&str> {
         self.model_path.as_deref()
     }

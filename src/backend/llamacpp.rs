@@ -108,8 +108,8 @@ impl LlamaCppServer {
         self.process = Some(child);
         self.model_path = Some(model_path.to_string());
 
-        // Wait for server to be ready
-        for i in 0..30 {
+        // Wait for server to be ready (90s — large GGUF models need time on slow disks)
+        for i in 0..180 {
             if self.client.health_check().await {
                 return Ok(());
             }
@@ -130,7 +130,7 @@ impl LlamaCppServer {
         }
 
         self.stop();
-        anyhow::bail!("llama-server failed to start within 15 seconds")
+        anyhow::bail!("llama-server failed to start within 90 seconds")
     }
 
     pub fn stop(&mut self) {
@@ -144,10 +144,12 @@ impl LlamaCppServer {
         &self.client
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.process.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn model_path(&self) -> Option<&str> {
         self.model_path.as_deref()
     }

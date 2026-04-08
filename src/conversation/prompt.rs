@@ -236,7 +236,7 @@ pub fn load_memory_context(project_path: &Path) -> Option<String> {
 /// Load memories from a single directory layer.
 /// Reads all `.md` files and also supports legacy `MEMORY.md` bullet format.
 fn load_memory_layer(dir: &std::path::Path) -> Option<String> {
-    use crate::tools::memory_tool::{read_memory_dir, strip_frontmatter};
+    use crate::tools::memory_tool::read_memory_dir;
 
     if !dir.exists() {
         return None;

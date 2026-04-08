@@ -1,4 +1,3 @@
-use anyhow::Result;
 use std::path::PathBuf;
 use crate::backend::types::{ChatRequest, ChatResponse, Message, Role, ToolDefinition};
 use crate::config::Config;
@@ -45,6 +44,7 @@ impl ConversationEngine {
     /// Add an assistant response
     pub fn add_assistant_message(&mut self, response: ChatResponse) {
         self.estimated_tokens += estimate_tokens(&response.message.content);
+        self.estimated_tokens += estimate_tool_calls_tokens(&response.message.tool_calls);
         self.messages.push(response.message);
     }
 
@@ -66,21 +66,41 @@ impl ConversationEngine {
 
     /// Build request optimized for mode. In chat mode, tools are omitted
     /// so the model doesn't waste prefill time on tool schemas.
+    ///
+    /// Merges all `Role::System` messages into a single system message at
+    /// position 0. Many local models (Qwen, Llama) enforce "system must be
+    /// first and only" via their Jinja chat templates.
     pub fn build_request_with_mode(&self, config: &Config, chat_mode: bool) -> ChatRequest {
-        let mut messages = vec![Message {
+        // Start with the main system prompt
+        let mut system_content = self.system_prompt.clone();
+        let mut messages = Vec::new();
+
+        // Merge any mid-conversation system messages into the system prompt;
+        // keep all other messages in order.
+        for msg in &self.messages {
+            if msg.role == Role::System {
+                system_content.push_str("\n\n");
+                system_content.push_str(&msg.content);
+            } else {
+                messages.push(msg.clone());
+            }
+        }
+
+        // Insert the unified system message at position 0
+        messages.insert(0, Message {
             role: Role::System,
-            content: self.system_prompt.clone(),
+            content: system_content,
             tool_calls: None,
             tool_call_id: None,
-        }];
-        messages.extend(self.messages.clone());
+        });
 
         ChatRequest {
             messages,
             tools: if chat_mode { vec![] } else { self.tools.clone() },
             temperature: config.model.temperature,
             max_tokens: Some(4096),
-            model_id: config.model.path.clone(),
+            model_id: config.model.path.as_deref()
+                .map(|p| crate::backend::manager::BackendManager::resolve_path(p)),
         }
     }
 
@@ -128,13 +148,10 @@ impl ConversationEngine {
                     // Tier 4: extract session memory before summarize
                     let _ = compactor::extract_session_memory(&self.messages, path);
                     let _ = compactor::summarize_compact(&mut self.messages, path);
-                    // Reinject system identity as first message
+                    // Reinject full system prompt (identity, rules, FTAI.md, skills, tools)
                     self.messages.insert(0, Message {
                         role: Role::System,
-                        content: format!(
-                            "[System context reinjected after compaction]\nTools available: {}",
-                            self.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
-                        ),
+                        content: self.system_prompt.clone(),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -186,7 +203,8 @@ impl ConversationEngine {
             match msg.role {
                 Role::User => {
                     if msg.content.len() > 100 {
-                        summary_parts.push(format!("User asked: {}...", &msg.content[..100]));
+                        let preview: String = msg.content.chars().take(100).collect();
+                        summary_parts.push(format!("User asked: {preview}..."));
                     }
                 }
                 Role::Assistant => {
@@ -211,7 +229,7 @@ impl ConversationEngine {
         self.estimated_tokens = self
             .messages
             .iter()
-            .map(|m| estimate_tokens(&m.content))
+            .map(|m| estimate_tokens(&m.content) + estimate_tool_calls_tokens(&m.tool_calls))
             .sum();
     }
 
@@ -221,6 +239,7 @@ impl ConversationEngine {
         self.estimated_tokens = 0;
     }
 
+    #[allow(dead_code)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -229,10 +248,12 @@ impl ConversationEngine {
         self.estimated_tokens
     }
 
+    #[allow(dead_code)]
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
 
+    #[allow(dead_code)]
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
@@ -241,6 +262,7 @@ impl ConversationEngine {
         self.system_prompt = prompt;
     }
 
+    #[allow(dead_code)]
     pub fn update_tools(&mut self, tools: Vec<ToolDefinition>) {
         self.tools = tools;
     }
@@ -260,6 +282,18 @@ impl ConversationEngine {
 /// Rough token estimate: ~4 chars per token for English text
 fn estimate_tokens(text: &str) -> usize {
     (text.len() / 4).max(1)
+}
+
+/// Estimate tokens for tool_calls payloads (serialized JSON size / 4).
+fn estimate_tool_calls_tokens(tool_calls: &Option<Vec<crate::backend::types::ToolCall>>) -> usize {
+    match tool_calls {
+        Some(calls) if !calls.is_empty() => {
+            serde_json::to_string(calls)
+                .map(|s| s.len() / 4)
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

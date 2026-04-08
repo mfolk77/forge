@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// Built-in functions available in rules expressions
 
@@ -57,6 +58,7 @@ pub fn builtin_adds_lines_matching(pattern: &str, diff: &str) -> bool {
 }
 
 /// A match found by the secret scanner.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SecretMatch {
     /// 1-based line number where the secret was found.
@@ -67,105 +69,56 @@ pub struct SecretMatch {
     pub snippet: String,
 }
 
+/// Compiled dangerous command patterns — FolkTech Coding Rules v1.3 deny list.
+static DANGEROUS_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
+        // Unix: recursive delete
+        (r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+[/~]", "Recursive delete of root or home directory"),
+        (r"chmod\s+777", "World-writable permissions (chmod 777)"),
+        // Piping remote content to shell
+        (r"(curl|wget)\s+.*\|\s*(sh|bash|zsh|dash)", "Piping remote content to shell"),
+        // Raw disk operations
+        (r"dd\s+if=.*of=/dev/", "Raw disk write via dd"),
+        (r">\s*/dev/[sh]d[a-z]", "Raw disk write"),
+        (r"mkfs\.", "Filesystem format command"),
+        // Git force push to main/master (v1.3 deny list)
+        (r"git\s+push\s+--force\s+(origin\s+)?(main|master)", "Force push to main/master"),
+        (r"git\s+reset\s+--hard", "Hard reset"),
+        // Windows: recursive delete
+        (r"(?i)(rd|rmdir)\s+/s\s+/q\s+[a-zA-Z]:\\", "Recursive delete of drive root (rd /s /q)"),
+        (r"(?i)del\s+/[sf]\s+.*/[sq]\s+[a-zA-Z]:\\", "Recursive delete of drive root (del /s /q)"),
+        (r"(?i)format\s+[a-zA-Z]:", "Disk format command"),
+        (r"(?i)Remove-Item\s+.*-Recurse.*-Force.*[a-zA-Z]:\\", "PowerShell recursive delete of drive root"),
+        (r"(?i)(IEX|Invoke-Expression)\s*\(?\s*(New-Object|Invoke-WebRequest|iwr|curl)", "PowerShell remote code execution"),
+        (r"(?i)reg\s+delete\s+HK(LM|CR|CU)\\", "Registry deletion"),
+    ]
+    .into_iter()
+    .filter_map(|(pat, msg)| Regex::new(pat).ok().map(|re| (re, msg)))
+    .collect()
+});
+
 /// Check a bash command for dangerous patterns. Returns a warning message if dangerous.
+#[allow(dead_code)]
 pub fn check_dangerous_command(command: &str) -> Option<&'static str> {
     let trimmed = command.trim();
 
-    // Fork bomb
+    // Fork bomb (simple string match, no regex needed)
     if trimmed.contains(":(){ :|:&};:") || trimmed.contains(":(){:|:&};:") {
         return Some("Fork bomb detected");
     }
 
-    // rm -rf / or rm -rf ~
-    if let Ok(re) = Regex::new(r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+[/~]") {
+    for (re, msg) in DANGEROUS_PATTERNS.iter() {
         if re.is_match(trimmed) {
-            return Some("Recursive delete of root or home directory detected");
-        }
-    }
-
-    // chmod 777
-    if let Ok(re) = Regex::new(r"chmod\s+777") {
-        if re.is_match(trimmed) {
-            return Some("World-writable permissions (chmod 777) detected");
-        }
-    }
-
-    // curl/wget piped to shell
-    if let Ok(re) = Regex::new(r"(curl|wget)\s+.*\|\s*(sh|bash|zsh)") {
-        if re.is_match(trimmed) {
-            return Some("Piping remote content to shell detected");
-        }
-    }
-
-    // dd if=/dev/zero
-    if trimmed.contains("dd if=/dev/zero") {
-        return Some("Disk wipe via dd detected");
-    }
-
-    // Raw disk write
-    if let Ok(re) = Regex::new(r">\s*/dev/[sh]d[a-z]") {
-        if re.is_match(trimmed) {
-            return Some("Raw disk write detected");
-        }
-    }
-
-    // mkfs (Unix)
-    if let Ok(re) = Regex::new(r"mkfs\.") {
-        if re.is_match(trimmed) {
-            return Some("Filesystem format command detected");
-        }
-    }
-
-    // ── Windows-specific dangerous commands ───────────────────────────
-
-    // rd /s /q C:\ or rmdir /s /q C:\  (recursive delete of drive root)
-    if let Ok(re) = Regex::new(r"(?i)(rd|rmdir)\s+/s\s+/q\s+[a-zA-Z]:\\") {
-        if re.is_match(trimmed) {
-            return Some("Recursive delete of drive root detected (rd /s /q)");
-        }
-    }
-
-    // del /s /q C:\  (recursive delete)
-    if let Ok(re) = Regex::new(r"(?i)del\s+/[sf]\s+.*/[sq]\s+[a-zA-Z]:\\") {
-        if re.is_match(trimmed) {
-            return Some("Recursive delete of drive root detected (del /s /q)");
-        }
-    }
-
-    // format C: (disk format)
-    if let Ok(re) = Regex::new(r"(?i)format\s+[a-zA-Z]:") {
-        if re.is_match(trimmed) {
-            return Some("Disk format command detected");
-        }
-    }
-
-    // PowerShell: Remove-Item -Recurse -Force C:\
-    if let Ok(re) = Regex::new(r"(?i)Remove-Item\s+.*-Recurse.*-Force.*[a-zA-Z]:\\") {
-        if re.is_match(trimmed) {
-            return Some("PowerShell recursive delete of drive root detected");
-        }
-    }
-
-    // PowerShell download + execute: IEX (Invoke-Expression) with download
-    if let Ok(re) = Regex::new(r"(?i)(IEX|Invoke-Expression)\s*\(?\s*(New-Object|Invoke-WebRequest|iwr|curl)") {
-        if re.is_match(trimmed) {
-            return Some("PowerShell remote code execution detected");
-        }
-    }
-
-    // reg delete (registry wipe)
-    if let Ok(re) = Regex::new(r"(?i)reg\s+delete\s+HK(LM|CR|CU)\\") {
-        if re.is_match(trimmed) {
-            return Some("Registry deletion detected");
+            return Some(msg);
         }
     }
 
     None
 }
 
-/// Scan code content for hardcoded secrets. Returns all matches found.
-pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
-    let patterns: &[(&str, &str)] = &[
+/// Compiled secret-detection patterns — built once, reused across calls.
+static SECRET_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
         (r"AKIA[0-9A-Z]{16}", "AWS access key"),
         (r#"(?i)(password|passwd|pwd)\s*=\s*["'][^"']+["']"#, "Hardcoded password"),
         (r#"(?i)(secret|secret_key)\s*=\s*["'][^"']+["']"#, "Hardcoded secret"),
@@ -176,26 +129,31 @@ pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
         (r"sk-[A-Za-z0-9]{20,}", "OpenAI-style API key"),
         (r"ghp_[A-Za-z0-9]{36,}", "GitHub personal access token"),
         (r"gho_[A-Za-z0-9]{36,}", "GitHub OAuth token"),
-    ];
+    ]
+    .into_iter()
+    .filter_map(|(pat, kind)| Regex::new(pat).ok().map(|re| (re, kind)))
+    .collect()
+});
 
+/// Scan code content for hardcoded secrets. Returns all matches found.
+#[allow(dead_code)]
+pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
     let mut matches = Vec::new();
 
-    for (pattern, kind) in patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            for (line_idx, line) in content.lines().enumerate() {
-                for mat in re.find_iter(line) {
-                    let matched = mat.as_str();
-                    let snippet = if matched.len() > 20 {
-                        format!("{}...", &matched[..20])
-                    } else {
-                        format!("{matched}...")
-                    };
-                    matches.push(SecretMatch {
-                        line: line_idx + 1,
-                        kind: kind.to_string(),
-                        snippet,
-                    });
-                }
+    for (re, kind) in SECRET_PATTERNS.iter() {
+        for (line_idx, line) in content.lines().enumerate() {
+            for mat in re.find_iter(line) {
+                let matched = mat.as_str();
+                let snippet = if matched.len() > 20 {
+                    format!("{}...", &matched[..20])
+                } else {
+                    format!("{matched}...")
+                };
+                matches.push(SecretMatch {
+                    line: line_idx + 1,
+                    kind: kind.to_string(),
+                    snippet,
+                });
             }
         }
     }

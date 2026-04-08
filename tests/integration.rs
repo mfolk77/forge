@@ -125,7 +125,7 @@ scope "/some/other/project" {
     async fn test_tool_execution_with_rules_pipeline() {
         use forge::rules::{RulesEngine, EvalContext, RuleAction};
         use forge::rules::parser::Event as RuleEvent;
-        use forge::tools::{ToolRegistry, ToolContext};
+        use forge::tools::ToolRegistry;
 
         let tools = ToolRegistry::with_defaults();
         let mut rules = RulesEngine::new();
@@ -272,7 +272,7 @@ mod conversation_integration {
 
 mod tool_integration {
     use forge::tools::{ToolRegistry, ToolContext};
-    use std::path::PathBuf;
+    
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -351,7 +351,7 @@ mod tool_integration {
 }
 
 mod formatting_integration {
-    use forge::formatting::{FormattingConfig, TemplateSet, load_templates, enabled_templates};
+    use forge::formatting::{FormattingConfig, TemplateSet, load_templates};
     use forge::conversation::prompt::build_system_prompt;
     use std::path::PathBuf;
     use tempfile::TempDir;

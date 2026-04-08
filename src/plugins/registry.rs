@@ -22,6 +22,7 @@ pub struct RegistryEntry {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub author: String,
     #[serde(default)]
     pub repo: String,
@@ -78,6 +79,7 @@ impl RegistryClient {
     }
 
     /// Get info about a specific plugin from the registry.
+    #[allow(dead_code)]
     pub async fn fetch_info(&self, name: &str) -> Result<Option<RegistryEntry>> {
         let index = self.fetch_index().await?;
         Ok(index.plugins.into_iter().find(|p| p.name == name))
@@ -97,9 +99,12 @@ pub struct MarketplaceSource {
 #[derive(Debug, Clone)]
 pub struct MarketplacePlugin {
     pub name: String,
+    #[allow(dead_code)]
     pub version: String,
     pub description: String,
+    #[allow(dead_code)]
     pub source_name: String,
+    #[allow(dead_code)]
     pub install_url: String,
 }
 
@@ -127,6 +132,7 @@ struct CcPluginJson {
     #[serde(default)]
     description: String,
     #[serde(default)]
+    #[allow(dead_code)]
     author: Option<CcAuthor>,
 }
 
@@ -298,6 +304,7 @@ impl MarketplaceRegistry {
     }
 
     /// Find a plugin by exact name across all cached sources.
+    #[allow(dead_code)]
     pub fn find_plugin(&self, name: &str) -> Option<MarketplacePlugin> {
         for source in &self.sources {
             let source_dir = self.cache_dir.join(&source.name);

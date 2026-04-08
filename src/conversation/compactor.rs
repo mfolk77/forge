@@ -16,11 +16,6 @@ use crate::backend::types::{Message, Role};
 /// - Tier 3 (Summarize compact): When token usage > 85%, save full transcript and replace
 ///   all messages with a deterministic summary. Reinjects identity + tool list.
 
-/// Rough token estimate: ~4 chars per token.
-fn estimate_tokens(text: &str) -> usize {
-    (text.len() / 4).max(1)
-}
-
 /// Tier 1 — Microcompact: replace old tool_result messages with one-line placeholders.
 /// Preserves `file_read` results (reference material).
 /// Returns the number of messages compacted.

@@ -362,6 +362,19 @@ fn install_bin_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FORGE_INSTALL_DIR") {
         return PathBuf::from(dir);
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local").join("bin")
+    #[cfg(windows)]
+    {
+        // Windows: %LOCALAPPDATA%\forge\bin (e.g. C:\Users\Michelle\AppData\Local\forge\bin)
+        let base = std::env::var("LOCALAPPDATA")
+            .or_else(|_| std::env::var("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        base.join("forge").join("bin")
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix: ~/.local/bin
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".local").join("bin")
+    }
 }

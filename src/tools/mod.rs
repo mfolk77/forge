@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub mod registry;
 pub mod bash;
 pub mod file_read;
@@ -9,7 +10,9 @@ pub mod git;
 pub mod web_fetch;
 pub mod ask_user;
 pub mod request_permissions;
+#[allow(dead_code)]
 pub mod execution_log;
+#[allow(dead_code)]
 pub mod validator;
 pub mod memory_tool;
 pub mod agent_spawn;
@@ -17,6 +20,7 @@ pub mod task_tool;
 pub mod research_tool;
 pub mod result_storage;
 
+#[allow(unused_imports)]
 pub use registry::{
     CancelToken, Tool, ToolContext, ToolExecution, ToolProgress, ToolRegistry, ToolResult,
 };

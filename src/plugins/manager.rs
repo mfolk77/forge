@@ -80,6 +80,15 @@ impl PluginManager {
             anyhow::bail!("Plugin '{}' is already installed", manifest.plugin.name);
         }
 
+        // Verify destination resolves within plugins dir (prevent symlink escape)
+        std::fs::create_dir_all(&dest)?;
+        let canonical_dest = dest.canonicalize()?;
+        let canonical_plugins = self.plugins_dir.canonicalize()?;
+        if !canonical_dest.starts_with(&canonical_plugins) {
+            let _ = std::fs::remove_dir_all(&dest);
+            anyhow::bail!("Plugin install path escapes plugins directory");
+        }
+
         copy_dir_recursive(source, &dest)?;
 
         let name = manifest.plugin.name.clone();
@@ -127,6 +136,16 @@ impl PluginManager {
         if dest.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             anyhow::bail!("Plugin '{}' is already installed", manifest.plugin.name);
+        }
+
+        // Verify destination resolves within plugins dir (prevent symlink escape)
+        std::fs::create_dir_all(&dest)?;
+        let canonical_dest = dest.canonicalize()?;
+        let canonical_plugins = self.plugins_dir.canonicalize()?;
+        if !canonical_dest.starts_with(&canonical_plugins) {
+            let _ = std::fs::remove_dir_all(&dest);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            anyhow::bail!("Plugin install path escapes plugins directory");
         }
 
         copy_dir_recursive(&tmp_dir, &dest)?;

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::builtins;
-use super::parser::{BinOperator, Event, Expression, Parser, Rule, RuleAction as ParsedAction, RuleSet};
+use super::parser::{BinOperator, Event, Expression, Parser, Rule, RuleAction as ParsedAction};
 
 /// Result of evaluating rules against an action
 #[derive(Debug, Clone, PartialEq)]
@@ -22,8 +22,11 @@ pub struct EvalContext {
 #[derive(Debug, Clone)]
 pub enum EvalValue {
     String(String),
+    #[allow(dead_code)]
     Bool(bool),
+    #[allow(dead_code)]
     Number(f64),
+    #[allow(dead_code)]
     List(Vec<String>),
 }
 
@@ -44,6 +47,7 @@ impl EvalContext {
         self.set(key, EvalValue::String(value.to_string()))
     }
 
+    #[allow(dead_code)]
     pub fn set_bool(&mut self, key: &str, value: bool) -> &mut Self {
         self.set(key, EvalValue::Bool(value))
     }
@@ -94,6 +98,7 @@ impl RulesEngine {
     /// Scans `dir` for `.ftai` rule files with optional YAML frontmatter,
     /// filters by glob match against `file_path`, and loads matching rules
     /// via `load_string()`. Returns the total count of rules loaded.
+    #[allow(dead_code)]
     pub fn load_glob_rules(&mut self, dir: &Path, file_path: Option<&str>) -> Result<usize, String> {
         let glob_rules = super::glob_matcher::load_rules_for_context(dir, file_path);
         let mut total = 0;

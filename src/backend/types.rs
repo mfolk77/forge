@@ -64,6 +64,7 @@ pub struct ChatRequest {
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub message: Message,
+    #[allow(dead_code)]
     pub tokens_used: TokenUsage,
     pub stop_reason: StopReason,
 }
@@ -71,11 +72,14 @@ pub struct ChatResponse {
 /// Token usage statistics
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    #[allow(dead_code)]
     pub prompt_tokens: usize,
+    #[allow(dead_code)]
     pub completion_tokens: usize,
 }
 
 impl TokenUsage {
+    #[allow(dead_code)]
     pub fn total(&self) -> usize {
         self.prompt_tokens + self.completion_tokens
     }
@@ -93,6 +97,7 @@ pub enum StopReason {
 pub type TokenStream = mpsc::Receiver<Token>;
 
 /// The core backend trait — implemented by llama.cpp and MLX
+#[allow(dead_code)]
 pub trait ModelBackend: Send + Sync {
     /// Load a model from the given path
     fn load_model(
@@ -141,6 +146,7 @@ pub enum CpuArch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum GpuType {
     Metal,
     Cuda { vram_gb: u64 },
@@ -256,10 +262,10 @@ impl HardwareInfo {
                 hf_file: None,
             },
             (CpuArch::AppleSilicon, _, _) => ModelRecommendation {
-                name: "Qwen3.5-4B-Q4_K_M".to_string(),
+                name: "Qwen3.5-4B-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
                 size_gb: 3,
-                hf_repo: "mlx-community/Qwen3.5-35B-A3B-4bit".to_string(),
+                hf_repo: "mlx-community/Qwen3.5-4B-4bit".to_string(),
                 hf_file: None,
             },
             // NVIDIA GPU or CPU-only — GGUF via llama.cpp (download single file)

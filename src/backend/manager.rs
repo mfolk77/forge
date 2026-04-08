@@ -16,6 +16,7 @@ pub enum BackendManager {
     LlamaCpp(LlamaCppServer),
     Mlx(MlxServer),
     /// External OpenAI-compatible server (Ollama, LM Studio, etc.)
+    #[allow(dead_code)]
     External(HttpModelClient),
     /// Cloud API backend (Anthropic, OpenAI, etc.)
     Api(ApiClient),
@@ -60,8 +61,24 @@ impl BackendManager {
     }
 
     /// Create a backend that connects to an external server
+    #[allow(dead_code)]
     pub fn external(base_url: &str) -> Self {
         BackendManager::External(HttpModelClient::new(base_url))
+    }
+
+    /// Resolve a bare model name to a full local path.
+    /// If the path already contains separators, returns it as-is.
+    pub fn resolve_path(raw_path: &str) -> String {
+        if !raw_path.contains('/') && !raw_path.contains('\\') {
+            if let Ok(config_dir) = crate::config::global_config_dir() {
+                let models_dir = config_dir.join("models").join(raw_path);
+                if models_dir.exists() {
+                    return resolve_model_path(&models_dir)
+                        .unwrap_or_else(|| models_dir.to_string_lossy().to_string());
+                }
+            }
+        }
+        raw_path.to_string()
     }
 
     /// Load and start the model
@@ -72,11 +89,14 @@ impl BackendManager {
                 Ok(())
             }
             _ => {
-                let model_path = config
+                let raw_path = config
                     .model
                     .path
                     .as_deref()
                     .context("No model path configured. Run `forge model install` or set model.path in config.")?;
+
+                let resolved = Self::resolve_path(raw_path);
+                let model_path = resolved.as_str();
 
                 match self {
                     BackendManager::LlamaCpp(server) => {
@@ -171,12 +191,39 @@ impl BackendManager {
     }
 
     /// Get a reference to the Api client, if this is an API backend
+    #[allow(dead_code)]
     pub fn api_client(&self) -> Option<&ApiClient> {
         match self {
             BackendManager::Api(client) => Some(client),
             _ => None,
         }
     }
+}
+
+/// Resolve a model directory to the appropriate path for the backend.
+/// Safetensors/MLX models (directory) take priority over GGUF (single file),
+/// because if both exist, MLX is the preferred backend on Apple Silicon.
+fn resolve_model_path(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut has_safetensors = false;
+    let mut gguf_path: Option<String> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            match ext {
+                "safetensors" => has_safetensors = true,
+                "gguf" if gguf_path.is_none() => {
+                    gguf_path = Some(path.to_string_lossy().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    // Prefer safetensors (MLX directory) over GGUF
+    if has_safetensors {
+        return Some(dir.to_string_lossy().to_string());
+    }
+    gguf_path
 }
 
 #[cfg(test)]

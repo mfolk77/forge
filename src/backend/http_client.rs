@@ -25,12 +25,18 @@ struct OaiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
     stream: bool,
+    /// MLX-specific: control chat template behavior (e.g. disable thinking mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct OaiMessage {
     role: String,
     content: Option<String>,
+    /// Qwen3/3.5 thinking mode: reasoning goes here when enable_thinking=true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +127,39 @@ impl HttpModelClient {
         }
     }
 
+    /// Enforce single system message at position 0 for strict chat templates
+    /// (Qwen, Llama). Merges all system messages into the first; demotes any
+    /// remaining to user role.
+    fn sanitize_messages(messages: &[Message]) -> Vec<OaiMessage> {
+        // Collect all system message content
+        let mut system_content = String::new();
+        let mut non_system: Vec<OaiMessage> = Vec::new();
+
+        for msg in messages {
+            if msg.role == Role::System {
+                if !system_content.is_empty() {
+                    system_content.push_str("\n\n");
+                }
+                system_content.push_str(&msg.content);
+            } else {
+                non_system.push(Self::convert_message(msg));
+            }
+        }
+
+        let mut result = Vec::with_capacity(non_system.len() + 1);
+        if !system_content.is_empty() {
+            result.push(OaiMessage {
+                role: "system".to_string(),
+                content: Some(system_content),
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        result.extend(non_system);
+        result
+    }
+
     fn convert_message(msg: &Message) -> OaiMessage {
         let role = match msg.role {
             Role::System => "system",
@@ -132,6 +171,7 @@ impl HttpModelClient {
         OaiMessage {
             role: role.to_string(),
             content: Some(msg.content.clone()),
+            reasoning: None,
             tool_calls: msg.tool_calls.as_ref().map(|tcs| {
                 tcs.iter()
                     .map(|tc| OaiToolCall {
@@ -165,7 +205,7 @@ impl HttpModelClient {
     pub async fn generate(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let oai_req = OaiRequest {
             model: request.model_id.clone().unwrap_or_default(),
-            messages: request.messages.iter().map(Self::convert_message).collect(),
+            messages: Self::sanitize_messages(&request.messages),
             tools: if request.tools.is_empty() {
                 None
             } else {
@@ -174,6 +214,7 @@ impl HttpModelClient {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: false,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
 
         let resp = self
@@ -197,6 +238,14 @@ impl HttpModelClient {
             .into_iter()
             .next()
             .context("No choices in response")?;
+
+        // If content is empty but reasoning has text (thinking mode), use reasoning
+        let content = match (&choice.message.content, &choice.message.reasoning) {
+            (Some(c), _) if !c.is_empty() => c.clone(),
+            (_, Some(r)) if !r.is_empty() => r.clone(),
+            (Some(c), _) => c.clone(),
+            _ => String::new(),
+        };
 
         let tool_calls = choice.message.tool_calls.map(|tcs| {
             tcs.into_iter()
@@ -223,7 +272,7 @@ impl HttpModelClient {
         Ok(ChatResponse {
             message: Message {
                 role: Role::Assistant,
-                content: choice.message.content.unwrap_or_default(),
+                content,
                 tool_calls,
                 tool_call_id: None,
             },
@@ -238,7 +287,7 @@ impl HttpModelClient {
     ) -> Result<(mpsc::Receiver<Token>, tokio::task::JoinHandle<Result<ChatResponse>>)> {
         let oai_req = OaiRequest {
             model: request.model_id.clone().unwrap_or_default(),
-            messages: request.messages.iter().map(Self::convert_message).collect(),
+            messages: Self::sanitize_messages(&request.messages),
             tools: if request.tools.is_empty() {
                 None
             } else {
@@ -247,6 +296,7 @@ impl HttpModelClient {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: true,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
 
         let resp = self
@@ -277,12 +327,20 @@ impl HttpModelClient {
                 let chunk = chunk.context("Stream read error")?;
                 bytes.extend_from_slice(&chunk);
 
-                // Parse SSE lines
+                // Parse SSE lines from raw bytes, tracking actual byte offsets
                 let text = String::from_utf8_lossy(&bytes);
                 let mut consumed = 0;
 
                 for line in text.lines() {
-                    consumed += line.len() + 1; // +1 for newline
+                    // Advance past the line content + actual line ending (\n or \r\n)
+                    consumed += line.len();
+                    // Skip the line ending characters
+                    if consumed < text.len() && text.as_bytes().get(consumed) == Some(&b'\r') {
+                        consumed += 1;
+                    }
+                    if consumed < text.len() && text.as_bytes().get(consumed) == Some(&b'\n') {
+                        consumed += 1;
+                    }
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data.trim() == "[DONE]" {

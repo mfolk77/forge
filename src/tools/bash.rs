@@ -342,8 +342,8 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext {
-            cwd: PathBuf::from(if cfg!(windows) { "C:\\Windows\\Temp" } else { "/tmp" }),
-            project_path: PathBuf::from(if cfg!(windows) { "C:\\Windows\\Temp" } else { "/tmp" }),
+            cwd: std::env::temp_dir(),
+            project_path: std::env::temp_dir(),
         }
     }
 

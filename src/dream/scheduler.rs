@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// RAII lock guard — removes lock file on drop.
+#[allow(dead_code)]
 pub struct DreamLock {
     path: PathBuf,
 }
@@ -19,6 +20,7 @@ impl Drop for DreamLock {
 }
 
 /// Summary metadata for a single dream file.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DreamSummary {
     pub filename: String,
@@ -31,6 +33,7 @@ pub struct DreamScheduler {
     lock_path: PathBuf,
 }
 
+#[allow(dead_code)]
 impl DreamScheduler {
     pub fn new(project_path: &Path) -> Self {
         let dream_dir = project_path.join(".ftai").join("dreams");
@@ -177,6 +180,7 @@ impl DreamScheduler {
     }
 }
 
+#[allow(dead_code)]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

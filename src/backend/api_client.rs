@@ -132,6 +132,7 @@ impl ApiClient {
     }
 
     /// Return masked key for safe display
+    #[allow(dead_code)]
     pub fn masked_key(&self) -> String {
         mask_api_key(&self.api_key)
     }
@@ -600,8 +601,12 @@ impl ApiClient {
         for msg in &request.messages {
             match msg.role {
                 Role::System => {
-                    // Anthropic: system prompt goes in the top-level `system` field
-                    system = Some(msg.content.clone());
+                    // Anthropic: system prompt goes in the top-level `system` field.
+                    // Concatenate if multiple system messages exist (e.g. after compaction).
+                    system = Some(match system {
+                        Some(existing) => format!("{existing}\n\n{}", msg.content),
+                        None => msg.content.clone(),
+                    });
                 }
                 Role::User => {
                     messages.push(serde_json::json!({

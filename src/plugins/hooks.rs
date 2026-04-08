@@ -182,7 +182,7 @@ mod tests {
         let (name, content) = passing_script();
         let hook = make_hook(&tmp, name, content, "pre:bash");
 
-        let result = run_pre_hook(&hook, "bash", "{}", Path::new(if cfg!(windows) { "C:\\Temp" } else { "/tmp" })).await;
+        let result = run_pre_hook(&hook, "bash", "{}", &std::env::temp_dir()).await;
         assert!(matches!(result, HookResult::Passed));
     }
 
@@ -192,7 +192,7 @@ mod tests {
         let (name, content) = blocking_script();
         let hook = make_hook(&tmp, name, content, "pre:bash");
 
-        let result = run_pre_hook(&hook, "bash", "{}", Path::new(if cfg!(windows) { "C:\\Temp" } else { "/tmp" })).await;
+        let result = run_pre_hook(&hook, "bash", "{}", &std::env::temp_dir()).await;
         match result {
             HookResult::Blocked(msg) => assert!(msg.contains("not allowed")),
             _ => panic!("Expected Blocked"),
@@ -206,7 +206,7 @@ mod tests {
         // we test with a script that returns quickly instead
         let (name, content) = passing_script();
         let hook = make_hook(&tmp, name, content, "pre:bash");
-        let result = run_pre_hook(&hook, "bash", "{}", Path::new(if cfg!(windows) { "C:\\Temp" } else { "/tmp" })).await;
+        let result = run_pre_hook(&hook, "bash", "{}", &std::env::temp_dir()).await;
         assert!(matches!(result, HookResult::Passed));
     }
 }

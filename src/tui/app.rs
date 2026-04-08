@@ -17,13 +17,25 @@ use crate::permissions::{self, DenialTracker, GrantCache, GrantScope, Permission
 use crate::rules::{EvalContext, RuleAction, RulesEngine};
 use crate::rules::parser::Event as RuleEvent;
 use crate::plugins::PluginManager;
-use crate::session::budget::TokenBudgetTracker;
 use crate::skills::LoadedSkill;
 use crate::tools::{ToolContext, ToolRegistry};
 
 use super::autocomplete::{Autocomplete, AutocompleteResult, CommandEntry};
 use super::input::InputState;
 use super::modal::{Modal, ModalAction};
+
+/// RAII guard that restores the terminal on drop — covers panics, early `?`
+/// returns, and normal exit. Created immediately after `enable_raw_mode()`.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = stdout().execute(crossterm::event::DisableBracketedPaste);
+        let _ = stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = terminal::disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+    }
+}
 use super::plugin_modal::{InstalledPluginEntry, PluginModal};
 use super::render::{self, DisplayMessage};
 use super::skill_modal::{SkillEntry, SkillModal};
@@ -98,8 +110,6 @@ pub struct TuiApp {
     hook_runner: HookRunner,
     /// Denial streak tracker for permission escalation
     denial_tracker: DenialTracker,
-    /// Diminishing-returns tracker for the agentic loop
-    budget_tracker: TokenBudgetTracker,
     /// Last-known mtime of FTAI.md for hot-reload detection
     ftai_mtime: Option<std::time::SystemTime>,
     /// Session persistence manager
@@ -263,7 +273,6 @@ impl TuiApp {
         let autocomplete = Autocomplete::new(ac_commands);
         let hook_runner = HookRunner::from_config(&config);
         let denial_tracker = DenialTracker::new();
-        let budget_tracker = TokenBudgetTracker::new();
         let ftai_mtime = Self::read_ftai_mtime(&project_path);
 
         // Initialize session persistence
@@ -304,7 +313,6 @@ impl TuiApp {
             rounds_since_task_update: 0,
             hook_runner,
             denial_tracker,
-            budget_tracker,
             ftai_mtime,
             session_manager,
         }
@@ -433,8 +441,9 @@ impl TuiApp {
         // Enter TUI mode FIRST so the user can see the splash and exit
         terminal::enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
-        // Enable mouse capture to intercept scroll events (prevents terminal scrollback bleed)
         stdout().execute(crossterm::event::EnableMouseCapture)?;
+        stdout().execute(crossterm::event::EnableBracketedPaste)?;
+        let _guard = TerminalGuard; // restores terminal on any exit path
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
         // Show splash immediately
@@ -452,9 +461,7 @@ impl TuiApp {
         match start_result {
             Ok(()) => {}
             Err(StartErr::UserQuit) => {
-                terminal::disable_raw_mode()?;
-                stdout().execute(LeaveAlternateScreen)?;
-                return Ok(());
+                return Ok(()); // _guard handles cleanup
             }
             Err(StartErr::BackendFailed(e)) => {
                 self.messages
@@ -488,10 +495,7 @@ impl TuiApp {
             let _ = self.hook_runner.run("session_end", &env).await;
         }
 
-        // Restore terminal
-        stdout().execute(crossterm::event::DisableMouseCapture)?;
-        terminal::disable_raw_mode()?;
-        stdout().execute(LeaveAlternateScreen)?;
+        // _guard restores terminal on drop (covers normal exit, ?, and panic)
 
         // Intentionally DO NOT stop the backend server here.
         // Keeping it warm means the next `forge` invocation connects instantly
@@ -551,6 +555,16 @@ impl TuiApp {
                                 self.scroll_offset = self.scroll_offset.saturating_sub(3);
                             }
                             _ => {}
+                        }
+                    }
+                    Event::Paste(text) => {
+                        // Bracketed paste — insert all text at once, preserving newlines
+                        for ch in text.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                self.input.insert_newline();
+                            } else {
+                                self.input.insert_char(ch);
+                            }
                         }
                     }
                     Event::Resize(_, _) => {
@@ -1599,7 +1613,8 @@ author = ""
                 tools: subagent_tools.clone(),
                 temperature: self.config.model.temperature,
                 max_tokens: Some(4096),
-                model_id: self.config.model.path.clone(),
+                model_id: self.config.model.path.as_deref()
+                    .map(|p| crate::backend::manager::BackendManager::resolve_path(p)),
             };
 
             let response = match self.backend.generate(&request).await {

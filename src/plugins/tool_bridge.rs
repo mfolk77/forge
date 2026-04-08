@@ -37,6 +37,7 @@ impl PluginTool {
         }
     }
 
+    #[allow(dead_code)]
     pub fn to_definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.tool_name.clone(),
@@ -141,8 +142,8 @@ mod tests {
 
     fn make_ctx() -> ToolContext {
         ToolContext {
-            cwd: PathBuf::from(if cfg!(windows) { "C:\\Temp" } else { "/tmp" }),
-            project_path: PathBuf::from(if cfg!(windows) { "C:\\Temp" } else { "/tmp" }),
+            cwd: std::env::temp_dir(),
+            project_path: std::env::temp_dir(),
         }
     }
 

@@ -50,6 +50,7 @@ pub fn builtin_skills() -> Vec<LoadedSkill> {
 }
 
 /// Validates that a skill name contains only safe characters (alphanumeric, hyphen, underscore).
+#[allow(dead_code)]
 pub fn is_valid_skill_name(name: &str) -> bool {
     !name.is_empty()
         && name

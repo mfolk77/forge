@@ -7,4 +7,5 @@ pub mod render;
 pub mod skill_modal;
 pub mod theme_modal;
 
+#[allow(unused_imports)]
 pub use app::{TuiApp, Mode, detect_mode};

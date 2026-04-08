@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::analyzer::{OutcomeType, SessionOutcome, ToolResultType};
+use super::analyzer::{SessionOutcome, ToolResultType};
 use super::store::EvolutionStore;
 
 /// Where a generated rule came from.

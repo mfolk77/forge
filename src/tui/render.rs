@@ -45,6 +45,7 @@ pub struct Theme {
     pub status_line_fg: Color,
     pub status_line_bg: Color,
     pub dim: Color,
+    #[allow(dead_code)]
     pub code_bg: Color,
 }
 

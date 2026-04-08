@@ -65,6 +65,7 @@ pub fn load_skill(
 }
 
 /// Format loaded skills into a system prompt section.
+#[allow(dead_code)]
 pub fn format_skills_for_prompt(skills: &[LoadedSkill]) -> String {
     if skills.is_empty() {
         return String::new();

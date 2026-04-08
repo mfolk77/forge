@@ -89,7 +89,7 @@
 - Models stored in `~/.ftai/models/<name>/`
 - MLX (safetensors): `find_model_file()` returns directory path, not individual shards
 - GGUF: returns the .gguf file path
-- Active model: Qwen3.5-35B-A3B-4bit (MoE, 3B active params, ~5GB RAM, MLX backend)
+- Active model: Qwen3.5-9B-4bit (dense 9B, ~6GB disk, ~7-8GB RAM, MLX backend)
 - Hardware detection in `src/backend/types.rs` — `HardwareInfo::detect()` and `recommended_model()`
 - MLX server logs to `~/.ftai/mlx-server.log` for crash debugging
 - Prompt cache capped by RAM: 8192 on 16GB, 16384 on 32GB (prevents Metal OOM)
@@ -118,10 +118,10 @@
 - Built-in hook prompts: confidence gate, TDD reminder, perf check, mental model checkpoint
 
 ## Gotchas
-- ~240 dead code warnings expected — types defined across modules not all consumed yet
+- Zero warnings — test-only modules use `#[allow(dead_code)]` on `mod` declarations, don't remove those
 - `build_system_prompt()` has 8 params — update all call sites when changing signature (including tests/integration.rs)
 - TUI requires real terminal — tests that call `app.run()` will fail without TTY
-- MLX on 16GB: use MoE models (Qwen3.5-35B-A3B) or 7B dense. 14B+ dense models will Metal OOM crash.
+- MLX on 16GB: use 9B or smaller dense models. 14B+ dense models will Metal OOM crash.
 - After editing src/, always `cargo install --path . --root ~/.local --force` to update the live binary
 
 ## Git & GitHub

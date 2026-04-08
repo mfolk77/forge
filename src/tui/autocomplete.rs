@@ -163,7 +163,7 @@ impl Autocomplete {
         let scroll_end = (scroll_start + max_visible).min(self.filtered.len());
 
         let mut items: Vec<Line> = Vec::new();
-        for (vi, fi) in (scroll_start..scroll_end).enumerate() {
+        for (_vi, fi) in (scroll_start..scroll_end).enumerate() {
             let idx = self.filtered[fi];
             let cmd = &self.commands[idx];
             let is_selected = fi == self.selected;

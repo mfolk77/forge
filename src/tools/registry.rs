@@ -566,7 +566,7 @@ mod tests {
     async fn test_serial_mutating_execution_order() {
         // Mutating tools execute serially — verify they all succeed in order
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        
 
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         COUNTER.store(0, Ordering::SeqCst);
