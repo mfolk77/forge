@@ -127,66 +127,23 @@ impl HttpModelClient {
         }
     }
 
-    /// Sanitize messages for strict Jinja chat templates (Qwen, Llama):
-    /// 1. Merge all system messages into a single one at position 0
-    /// 2. Convert `tool` role messages to `user` role (many small models lack native tool support)
-    /// 3. Flatten assistant tool_calls into text content (same reason)
-    /// This ensures tool calling works with ANY model, not just those with native tool support.
+    /// Sanitize messages for strict Jinja chat templates (Qwen, Llama).
+    /// Merges all `Role::System` messages into a single message at position 0,
+    /// preserving native tool call structure (`tool_calls`, `role: "tool"`).
+    /// The Qwen3.5 template enforces "system must be first and only" — this
+    /// function guarantees that invariant.
     fn sanitize_messages(messages: &[Message]) -> Vec<OaiMessage> {
         let mut system_content = String::new();
         let mut non_system: Vec<OaiMessage> = Vec::new();
 
         for msg in messages {
-            match msg.role {
-                Role::System => {
-                    if !system_content.is_empty() {
-                        system_content.push_str("\n\n");
-                    }
-                    system_content.push_str(&msg.content);
+            if msg.role == Role::System {
+                if !system_content.is_empty() {
+                    system_content.push_str("\n\n");
                 }
-                Role::Tool => {
-                    // Convert tool results to user messages for template compatibility
-                    let tool_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
-                    non_system.push(OaiMessage {
-                        role: "user".to_string(),
-                        content: Some(format!(
-                            "[Tool Result (call_id: {tool_id})]\n{}",
-                            msg.content
-                        )),
-                        reasoning: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-                Role::Assistant => {
-                    // Flatten tool_calls into text content for template compatibility
-                    let mut content = msg.content.clone();
-                    if let Some(tcs) = &msg.tool_calls {
-                        for tc in tcs {
-                            let call_text = format!(
-                                "\n[Tool Call: {} (call_id: {})]\n{}",
-                                tc.name, tc.id, tc.arguments
-                            );
-                            content.push_str(&call_text);
-                        }
-                    }
-                    non_system.push(OaiMessage {
-                        role: "assistant".to_string(),
-                        content: Some(content),
-                        reasoning: None,
-                        tool_calls: None, // flattened into content
-                        tool_call_id: None,
-                    });
-                }
-                Role::User => {
-                    non_system.push(OaiMessage {
-                        role: "user".to_string(),
-                        content: Some(msg.content.clone()),
-                        reasoning: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
+                system_content.push_str(&msg.content);
+            } else {
+                non_system.push(Self::convert_message(msg));
             }
         }
 
@@ -576,8 +533,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_no_tool_role_in_output() {
+    fn test_sanitize_preserves_native_tool_calling() {
         // Simulate Michelle's exact scenario: user -> assistant (tool_call) -> tool result
+        // Native tool calling must be PRESERVED so Qwen3.5's Jinja template can render it.
         let messages = vec![
             Message {
                 role: Role::System,
@@ -611,31 +569,25 @@ mod tests {
 
         let result = HttpModelClient::sanitize_messages(&messages);
 
-        // Verify structure: system, user, assistant, user (converted from tool)
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].role, "system");
         assert_eq!(result[1].role, "user");
         assert_eq!(result[2].role, "assistant");
-        assert_eq!(result[3].role, "user"); // NOT "tool"
+        assert_eq!(result[3].role, "tool"); // native role preserved
 
-        // No message after the first should have role "tool" or "system"
-        assert_eq!(result[0].role, "system");
+        // Only the first message is system
         for msg in &result[1..] {
-            assert_ne!(msg.role, "tool", "No 'tool' role messages should reach the model");
             assert_ne!(msg.role, "system", "Only first message should be system");
         }
 
-        // Assistant message should have tool call flattened into content
-        let assistant_content = result[2].content.as_ref().unwrap();
-        assert!(assistant_content.contains("[Tool Call: bash"));
-        assert!(assistant_content.contains("git status"));
-        // tool_calls field should be None (flattened)
-        assert!(result[2].tool_calls.is_none());
+        // Assistant tool_calls are preserved (not flattened)
+        assert!(result[2].tool_calls.is_some(), "Native tool_calls must be preserved");
+        let tcs = result[2].tool_calls.as_ref().unwrap();
+        assert_eq!(tcs[0].function.name, "bash");
 
-        // Tool result should be wrapped as user message
-        let tool_result_content = result[3].content.as_ref().unwrap();
-        assert!(tool_result_content.contains("[Tool Result"));
-        assert!(tool_result_content.contains("On branch main"));
+        // Tool result preserves tool_call_id for matching
+        assert_eq!(result[3].tool_call_id.as_deref(), Some("call_1"));
+        assert!(result[3].content.as_ref().unwrap().contains("On branch main"));
     }
 
     #[test]

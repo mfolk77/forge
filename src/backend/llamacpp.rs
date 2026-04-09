@@ -101,6 +101,8 @@ impl LlamaCppServer {
             .arg(context_length.to_string())
             .arg("--host")
             .arg("127.0.0.1")
+            // Use the model's native Jinja chat template (required for native tool calling)
+            .arg("--jinja")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
