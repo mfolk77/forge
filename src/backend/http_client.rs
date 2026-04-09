@@ -127,22 +127,66 @@ impl HttpModelClient {
         }
     }
 
-    /// Enforce single system message at position 0 for strict chat templates
-    /// (Qwen, Llama). Merges all system messages into the first; demotes any
-    /// remaining to user role.
+    /// Sanitize messages for strict Jinja chat templates (Qwen, Llama):
+    /// 1. Merge all system messages into a single one at position 0
+    /// 2. Convert `tool` role messages to `user` role (many small models lack native tool support)
+    /// 3. Flatten assistant tool_calls into text content (same reason)
+    /// This ensures tool calling works with ANY model, not just those with native tool support.
     fn sanitize_messages(messages: &[Message]) -> Vec<OaiMessage> {
-        // Collect all system message content
         let mut system_content = String::new();
         let mut non_system: Vec<OaiMessage> = Vec::new();
 
         for msg in messages {
-            if msg.role == Role::System {
-                if !system_content.is_empty() {
-                    system_content.push_str("\n\n");
+            match msg.role {
+                Role::System => {
+                    if !system_content.is_empty() {
+                        system_content.push_str("\n\n");
+                    }
+                    system_content.push_str(&msg.content);
                 }
-                system_content.push_str(&msg.content);
-            } else {
-                non_system.push(Self::convert_message(msg));
+                Role::Tool => {
+                    // Convert tool results to user messages for template compatibility
+                    let tool_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+                    non_system.push(OaiMessage {
+                        role: "user".to_string(),
+                        content: Some(format!(
+                            "[Tool Result (call_id: {tool_id})]\n{}",
+                            msg.content
+                        )),
+                        reasoning: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                Role::Assistant => {
+                    // Flatten tool_calls into text content for template compatibility
+                    let mut content = msg.content.clone();
+                    if let Some(tcs) = &msg.tool_calls {
+                        for tc in tcs {
+                            let call_text = format!(
+                                "\n[Tool Call: {} (call_id: {})]\n{}",
+                                tc.name, tc.id, tc.arguments
+                            );
+                            content.push_str(&call_text);
+                        }
+                    }
+                    non_system.push(OaiMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content),
+                        reasoning: None,
+                        tool_calls: None, // flattened into content
+                        tool_call_id: None,
+                    });
+                }
+                Role::User => {
+                    non_system.push(OaiMessage {
+                        role: "user".to_string(),
+                        content: Some(msg.content.clone()),
+                        reasoning: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
             }
         }
 
@@ -499,5 +543,121 @@ mod tests {
         assert!(oai.tool_calls.is_some());
         let tcs = oai.tool_calls.unwrap();
         assert_eq!(tcs[0].function.name, "bash");
+    }
+
+    // ── sanitize_messages tests (Jinja template compatibility) ──────────
+
+    #[test]
+    fn test_sanitize_only_system_user_assistant() {
+        let messages = vec![
+            Message { role: Role::System, content: "You are an AI.".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::User, content: "Hello".into(), tool_calls: None, tool_call_id: None },
+        ];
+        let result = HttpModelClient::sanitize_messages(&messages);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "system");
+        assert_eq!(result[1].role, "user");
+    }
+
+    #[test]
+    fn test_sanitize_merges_multiple_system_messages() {
+        let messages = vec![
+            Message { role: Role::System, content: "Identity.".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::User, content: "Hi".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::System, content: "Extra context.".into(), tool_calls: None, tool_call_id: None },
+        ];
+        let result = HttpModelClient::sanitize_messages(&messages);
+        // Should be 2: one merged system + user. No system at position 2.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "system");
+        assert!(result[0].content.as_ref().unwrap().contains("Identity."));
+        assert!(result[0].content.as_ref().unwrap().contains("Extra context."));
+        assert_eq!(result[1].role, "user");
+    }
+
+    #[test]
+    fn test_sanitize_no_tool_role_in_output() {
+        // Simulate Michelle's exact scenario: user -> assistant (tool_call) -> tool result
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "You are Forge.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "Can you check the git?".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "git status"}),
+                }]),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "On branch main\nYour branch is up to date.".into(),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+
+        let result = HttpModelClient::sanitize_messages(&messages);
+
+        // Verify structure: system, user, assistant, user (converted from tool)
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].role, "system");
+        assert_eq!(result[1].role, "user");
+        assert_eq!(result[2].role, "assistant");
+        assert_eq!(result[3].role, "user"); // NOT "tool"
+
+        // No message after the first should have role "tool" or "system"
+        assert_eq!(result[0].role, "system");
+        for msg in &result[1..] {
+            assert_ne!(msg.role, "tool", "No 'tool' role messages should reach the model");
+            assert_ne!(msg.role, "system", "Only first message should be system");
+        }
+
+        // Assistant message should have tool call flattened into content
+        let assistant_content = result[2].content.as_ref().unwrap();
+        assert!(assistant_content.contains("[Tool Call: bash"));
+        assert!(assistant_content.contains("git status"));
+        // tool_calls field should be None (flattened)
+        assert!(result[2].tool_calls.is_none());
+
+        // Tool result should be wrapped as user message
+        let tool_result_content = result[3].content.as_ref().unwrap();
+        assert!(tool_result_content.contains("[Tool Result"));
+        assert!(tool_result_content.contains("On branch main"));
+    }
+
+    #[test]
+    fn test_sanitize_no_system_except_first() {
+        // Even with compaction injecting system messages mid-conversation
+        let messages = vec![
+            Message { role: Role::System, content: "Main prompt.".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::User, content: "Do something".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::Assistant, content: "OK".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::System, content: "Compaction reinjection.".into(), tool_calls: None, tool_call_id: None },
+            Message { role: Role::User, content: "Continue".into(), tool_calls: None, tool_call_id: None },
+        ];
+
+        let result = HttpModelClient::sanitize_messages(&messages);
+
+        // Only the first message should be system
+        assert_eq!(result[0].role, "system");
+        for msg in &result[1..] {
+            assert_ne!(msg.role, "system");
+        }
+        // System content should be merged
+        assert!(result[0].content.as_ref().unwrap().contains("Main prompt."));
+        assert!(result[0].content.as_ref().unwrap().contains("Compaction reinjection."));
     }
 }
