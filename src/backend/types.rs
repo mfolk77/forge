@@ -150,6 +150,7 @@ pub enum CpuArch {
 pub enum GpuType {
     Metal,
     Cuda { vram_gb: u64 },
+    Vulkan,
     None,
 }
 
@@ -167,7 +168,9 @@ impl HardwareInfo {
         let gpu = if cfg!(target_os = "macos") && arch == CpuArch::AppleSilicon {
             GpuType::Metal
         } else {
-            Self::detect_cuda().unwrap_or(GpuType::None)
+            Self::detect_cuda()
+                .or_else(Self::detect_vulkan)
+                .unwrap_or(GpuType::None)
         };
 
         let ram_gb = Self::detect_ram_gb();
@@ -195,6 +198,27 @@ impl HardwareInfo {
         Some(GpuType::Cuda { vram_gb: vram_mb / 1024 })
     }
 
+    /// Detect Vulkan-capable GPU (AMD, Intel, or NVIDIA without nvidia-smi).
+    fn detect_vulkan() -> Option<GpuType> {
+        // Check for Vulkan SDK environment variable
+        if std::env::var("VULKAN_SDK").is_ok() {
+            return Some(GpuType::Vulkan);
+        }
+        // Check for vulkaninfo on PATH
+        let cmd = if cfg!(windows) { "vulkaninfo.exe" } else { "vulkaninfo" };
+        if std::process::Command::new(cmd)
+            .arg("--summary")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(GpuType::Vulkan);
+        }
+        None
+    }
+
     #[cfg(target_os = "macos")]
     fn detect_ram_gb() -> u64 {
         use std::process::Command;
@@ -215,16 +239,18 @@ impl HardwareInfo {
 
     #[cfg(target_os = "windows")]
     fn detect_ram_gb() -> u64 {
-        // Use wmic to query total physical memory on Windows
+        // wmic is removed in Windows 11 25H2+, use PowerShell instead
         use std::process::Command;
-        Command::new("wmic")
-            .args(["computersystem", "get", "TotalPhysicalMemory"])
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                   "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
             .output()
             .ok()
             .and_then(|out| {
                 String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .find_map(|l| l.trim().parse::<u64>().ok())
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
             })
             .map(|bytes| bytes / (1024 * 1024 * 1024))
             .unwrap_or(8)
@@ -283,6 +309,14 @@ impl HardwareInfo {
                 size_gb: 20,
                 hf_repo: "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
                 hf_file: Some("Qwen3.5-35B-A3B-Q4_K_M.gguf".to_string()),
+            },
+            // Vulkan GPU or 12+ GB RAM — dense 9B is the sweet spot
+            (_, _, ram) if ram >= 12 => ModelRecommendation {
+                name: "Qwen3.5-9B-Q4_K_M".to_string(),
+                backend: crate::config::BackendType::LlamaCpp,
+                size_gb: 6,
+                hf_repo: "unsloth/Qwen3.5-9B-GGUF".to_string(),
+                hf_file: Some("Qwen3.5-9B-Q4_K_M.gguf".to_string()),
             },
             // Low RAM — dense 4B is safer
             _ => ModelRecommendation {

@@ -24,40 +24,63 @@ impl LlamaCppServer {
         }
     }
 
-    /// Find the llama-server binary
+    /// Find the llama-server binary.
+    /// Checks: 1) Forge's own install dir, 2) PATH via where/which, 3) common locations.
     fn find_server_binary() -> Result<PathBuf> {
-        // Check common locations (platform-specific)
-        let candidates: Vec<&str> = if cfg!(windows) {
-            vec![
-                "llama-server.exe",
-                "llama-server",
-            ]
+        let server_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+
+        // 1) Check Forge's install directory first (where `forge setup` puts it)
+        if let Ok(config_dir) = crate::config::global_config_dir() {
+            let install_dir = config_dir.parent()
+                .map(|p| p.join("bin"))
+                .unwrap_or_else(|| config_dir.join("bin"));
+            let ours = install_dir.join(server_name);
+            if ours.exists() {
+                return Ok(ours);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let ours = PathBuf::from(&local).join("forge").join("bin").join(server_name);
+                if ours.exists() {
+                    return Ok(ours);
+                }
+                // Also check llamacpp subdirectory (manual install location)
+                let llamacpp = PathBuf::from(&local).join("forge").join("llamacpp").join(server_name);
+                if llamacpp.exists() {
+                    return Ok(llamacpp);
+                }
+            }
+        }
+
+        // 2) Check PATH via where/which
+        let which_cmd = if cfg!(windows) { "where" } else { "which" };
+        if let Ok(output) = Command::new(which_cmd).arg(server_name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !path.is_empty() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+        }
+
+        // 3) Check common locations
+        let extra_candidates: Vec<&str> = if cfg!(windows) {
+            vec![]
         } else {
             vec![
-                "llama-server",
                 "llama.cpp/build/bin/llama-server",
                 "/usr/local/bin/llama-server",
                 "/opt/homebrew/bin/llama-server",
             ]
         };
-
-        // Use `where` on Windows, `which` on Unix
-        let which_cmd = if cfg!(windows) { "where" } else { "which" };
-
-        for candidate in &candidates {
-            if let Ok(output) = Command::new(which_cmd).arg(candidate).output() {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if !path.is_empty() {
-                        return Ok(PathBuf::from(path));
-                    }
-                }
-            }
+        for candidate in &extra_candidates {
             let path = PathBuf::from(candidate);
             if path.exists() {
                 return Ok(path);
@@ -65,25 +88,25 @@ impl LlamaCppServer {
         }
 
         let install_hint = if cfg!(windows) {
-            "llama-server not found. Download llama.cpp from https://github.com/ggerganov/llama.cpp/releases\n\
-             and add it to your PATH."
+            "llama-server not found. Run `forge setup` to install automatically,\n\
+             or download from https://github.com/ggerganov/llama.cpp/releases"
         } else {
-            "llama-server not found. Install llama.cpp: brew install llama.cpp\n\
-             Or build from source: https://github.com/ggerganov/llama.cpp"
+            "llama-server not found. Run `forge setup` to install automatically,\n\
+             or: brew install llama.cpp"
         };
 
         anyhow::bail!(install_hint)
     }
 
-    /// Start the llama-server process with the given model
-    pub async fn start(
+    /// Spawn the llama-server process WITHOUT waiting for it to become ready.
+    /// Returns as soon as the process is started. Call `wait_until_ready()` later.
+    pub fn spawn_only(
         &mut self,
         model_path: &str,
         gpu_layers: i32,
         threads: usize,
         context_length: usize,
     ) -> Result<()> {
-        // Stop any existing server
         self.stop();
 
         let server_bin = Self::find_server_binary()?;
@@ -101,7 +124,6 @@ impl LlamaCppServer {
             .arg(context_length.to_string())
             .arg("--host")
             .arg("127.0.0.1")
-            // Use the model's native Jinja chat template (required for native tool calling)
             .arg("--jinja")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -109,30 +131,43 @@ impl LlamaCppServer {
         let child = cmd.spawn().context("Failed to start llama-server")?;
         self.process = Some(child);
         self.model_path = Some(model_path.to_string());
+        Ok(())
+    }
 
-        // Wait for server to be ready (90s — large GGUF models need time on slow disks)
+    /// Wait for an already-spawned server to become ready (up to 90s).
+    pub async fn wait_until_ready(&mut self) -> Result<()> {
         for i in 0..180 {
             if self.client.health_check().await {
                 return Ok(());
             }
             if i > 0 && i % 10 == 0 {
-                // Check if process is still alive
                 if let Some(ref mut proc) = self.process {
                     match proc.try_wait() {
                         Ok(Some(status)) => {
                             self.process = None;
                             anyhow::bail!("llama-server exited with status: {status}");
                         }
-                        Ok(None) => {} // still running
+                        Ok(None) => {}
                         Err(e) => anyhow::bail!("Failed to check llama-server status: {e}"),
                     }
                 }
             }
             sleep(Duration::from_millis(500)).await;
         }
-
         self.stop();
         anyhow::bail!("llama-server failed to start within 90 seconds")
+    }
+
+    /// Start the llama-server process with the given model (spawn + wait).
+    pub async fn start(
+        &mut self,
+        model_path: &str,
+        gpu_layers: i32,
+        threads: usize,
+        context_length: usize,
+    ) -> Result<()> {
+        self.spawn_only(model_path, gpu_layers, threads, context_length)?;
+        self.wait_until_ready().await
     }
 
     pub fn stop(&mut self) {

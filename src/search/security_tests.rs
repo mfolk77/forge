@@ -227,6 +227,7 @@ mod security_tests {
     // P0: Symlink escape detection
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)]
     #[test]
     fn test_p0_indexer_symlink_escape_blocked_by_default() {
         // ATTACK: An attacker creates a symlink inside the project root
