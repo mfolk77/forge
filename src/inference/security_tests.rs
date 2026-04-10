@@ -573,6 +573,7 @@ mod security_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_p0_context_non_utf8_path_rejected() {
         // ATTACK: Non-UTF-8 path could cause undefined behavior in CString conversion.
@@ -581,6 +582,8 @@ mod security_tests {
         // VERIFY: The code path handles this correctly.
         // NOTE: On macOS/Linux, paths can contain non-UTF-8 bytes, but PathBuf::from(&str)
         //       always produces UTF-8. Non-UTF-8 paths would come from filesystem enumeration.
+        //       Windows paths are WTF-8/UTF-16 and can't construct OsStr from raw bytes,
+        //       so this attack vector doesn't apply — gated to unix only.
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 

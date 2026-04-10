@@ -503,6 +503,24 @@ async fn main() -> Result<()> {
             }
         }
         None => {
+            // Auto-run setup if no model is configured
+            let config = if config.model.path.is_none() {
+                let config_path = config::global_config_dir()?.join("config.toml");
+                if !config_path.exists() || std::fs::read_to_string(&config_path)
+                    .map(|s| !s.contains("path"))
+                    .unwrap_or(true)
+                {
+                    println!("No model configured. Running first-time setup...\n");
+                    setup::run_setup().await?;
+                    // Reload config after setup
+                    load_config(Some(&project_path))?
+                } else {
+                    config
+                }
+            } else {
+                config
+            };
+
             // Default: start interactive TUI session
             let mut app = tui::TuiApp::new(config, project_path);
             if cli.resume {

@@ -81,7 +81,42 @@ impl BackendManager {
         raw_path.to_string()
     }
 
-    /// Load and start the model
+    /// Spawn the backend server without waiting for it to be ready.
+    /// Call `wait_until_ready()` later to block until the model is loaded.
+    pub fn spawn_only(&mut self, config: &Config) -> Result<()> {
+        match self {
+            BackendManager::Api(_) | BackendManager::External(_) => Ok(()),
+            _ => {
+                let raw_path = config
+                    .model
+                    .path
+                    .as_deref()
+                    .context("No model path configured. Run `forge model install` or set model.path in config.")?;
+                let resolved = Self::resolve_path(raw_path);
+                match self {
+                    BackendManager::LlamaCpp(server) => server.spawn_only(
+                        &resolved,
+                        config.model.llamacpp.gpu_layers,
+                        config.model.llamacpp.threads,
+                        config.model.context_length,
+                    ),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Wait for an already-spawned backend to become ready.
+    pub async fn wait_until_ready(&mut self) -> Result<()> {
+        match self {
+            BackendManager::LlamaCpp(server) => server.wait_until_ready().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Load and start the model (blocking — waits for model to be ready).
+    /// Used by non-TUI paths (CLI commands, tests). The TUI uses spawn_only + wait_until_ready.
+    #[allow(dead_code)]
     pub async fn start(&mut self, config: &Config) -> Result<()> {
         match self {
             BackendManager::Api(_) => {
@@ -123,6 +158,7 @@ impl BackendManager {
     }
 
     /// Stop the backend server
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         match self {
             BackendManager::LlamaCpp(server) => server.stop(),

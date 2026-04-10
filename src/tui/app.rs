@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
@@ -45,12 +45,6 @@ impl Drop for TerminalGuard {
 use super::plugin_modal::{InstalledPluginEntry, PluginModal};
 use super::render::{self, DisplayMessage};
 use super::skill_modal::{SkillEntry, SkillModal};
-
-/// Error type for interruptible backend startup.
-enum StartErr {
-    UserQuit,
-    BackendFailed(String),
-}
 
 /// Operating mode for the TUI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +126,8 @@ pub struct TuiApp {
     /// First user message in the session (used as task description for evolution)
     #[cfg(feature = "evolution")]
     session_task_description: Option<String>,
+    /// True while the backend is still loading the model in the background
+    backend_loading: bool,
 }
 
 impl TuiApp {
@@ -349,6 +345,7 @@ impl TuiApp {
             session_count: 0,
             #[cfg(feature = "evolution")]
             session_task_description: None,
+            backend_loading: false,
         }
     }
 
@@ -483,25 +480,29 @@ impl TuiApp {
         // Show splash immediately
         terminal.draw(|frame| self.render(frame))?;
 
-        // Start the backend — this can take a while for large models.
-        // We poll for quit keys during the wait so the user isn't trapped.
-        self.messages.push(DisplayMessage::System(
-            format!("Starting {} backend...", self.backend.backend_name()),
-        ));
-        terminal.draw(|frame| self.render(frame))?;
-
-        let start_result = self.start_backend_interruptible(&mut terminal).await;
-
-        match start_result {
-            Ok(()) => {}
-            Err(StartErr::UserQuit) => {
-                return Ok(()); // _guard handles cleanup
-            }
-            Err(StartErr::BackendFailed(e)) => {
-                self.messages
-                    .push(DisplayMessage::System(format!("Backend error: {e}\nRunning offline. Use /model to configure.")));
+        // Start the backend — spawn the server process immediately (fast),
+        // then let the model load in the background while the user can interact.
+        if self.backend.health_check().await {
+            // Server already running from a previous session — instant start!
+            self.messages.push(DisplayMessage::System(
+                format!("{} backend connected.", self.backend.backend_name()),
+            ));
+        } else {
+            match self.backend.spawn_only(&self.config) {
+                Ok(()) => {
+                    self.backend_loading = true;
+                    self.messages.push(DisplayMessage::System(
+                        "Model loading in background... you can start typing.".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    self.messages.push(DisplayMessage::System(
+                        format!("Backend error: {e}\nRunning offline. Use /model to configure."),
+                    ));
+                }
             }
         }
+        terminal.draw(|frame| self.render(frame))?;
 
         // Start a new session for persistence
         if let Some(ref mut mgr) = self.session_manager {
@@ -603,46 +604,35 @@ impl TuiApp {
         result
     }
 
-    /// Start the backend with Ctrl+C support via tokio::select.
-    async fn start_backend_interruptible(
-        &mut self,
-        _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> std::result::Result<(), StartErr> {
-        // Quick check — maybe a server is already running
-        if self.backend.health_check().await {
-            return Ok(());
-        }
+    async fn main_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+        let mut health_check_counter: u32 = 0;
 
-        self.messages.push(DisplayMessage::System(
-            "Connecting to backend...".to_string(),
-        ));
-
-        // Use tokio::select to race backend start against Ctrl+C signal
-        let config = self.config.clone();
-        tokio::select! {
-            result = self.backend.start(&config) => {
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(StartErr::BackendFailed(e.to_string())),
+        loop {
+            // Periodically check if the backend finished loading (~every 500ms)
+            if self.backend_loading {
+                health_check_counter += 1;
+                if health_check_counter % 30 == 0 { // 30 * 16ms ≈ 480ms
+                    if self.backend.health_check().await {
+                        self.backend_loading = false;
+                        self.messages.push(DisplayMessage::System(
+                            "Model ready.".to_string(),
+                        ));
+                    }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                self.backend.stop();
-                Err(StartErr::UserQuit)
-            }
-        }
-    }
 
-    async fn main_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-        loop {
             // Render
             terminal.draw(|frame| self.render(frame))?;
 
             // Poll for events (non-blocking)
             if event::poll(std::time::Duration::from_millis(16))? {
                 match event::read()? {
-                    Event::Key(key) => {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key).await?;
+                    }
+                    Event::Key(_) => {
+                        // Ignore KeyRelease and KeyRepeat events — on Windows,
+                        // crossterm fires both Press and Release, causing double input.
                     }
                     Event::Mouse(mouse) => {
                         match mouse.kind {
@@ -1207,6 +1197,25 @@ author = ""
             let cmd = text.split_whitespace().next().unwrap_or("");
             if Self::SLASH_COMMANDS.contains(&cmd) {
                 return self.handle_slash_command(&text).await;
+            }
+        }
+
+        // If backend is still loading, wait for it before proceeding
+        if self.backend_loading {
+            self.messages.push(DisplayMessage::System(
+                "Waiting for model to finish loading...".to_string(),
+            ));
+            match self.backend.wait_until_ready().await {
+                Ok(()) => {
+                    self.backend_loading = false;
+                    self.messages.push(DisplayMessage::System("Model ready.".to_string()));
+                }
+                Err(e) => {
+                    self.messages.push(DisplayMessage::System(
+                        format!("Backend failed: {e}"),
+                    ));
+                    return Ok(());
+                }
             }
         }
 

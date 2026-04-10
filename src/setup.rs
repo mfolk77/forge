@@ -21,6 +21,12 @@ const MODEL_SMALL_FILE: &str = "Qwen3.5-4B-Q4_K_M.gguf";
 const MODEL_SMALL_NAME: &str = "Qwen3.5-4B";
 const MODEL_SMALL_SIZE: &str = "~3 GB";
 
+/// Medium model for 12-23 GB RAM or Vulkan iGPU systems. Dense 9B, ~6GB download.
+const MODEL_MEDIUM_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf";
+const MODEL_MEDIUM_FILE: &str = "Qwen3.5-9B-Q4_K_M.gguf";
+const MODEL_MEDIUM_NAME: &str = "Qwen3.5-9B";
+const MODEL_MEDIUM_SIZE: &str = "~6 GB";
+
 /// Large model for GPU or high-RAM systems. 35B MoE (3B active), ~20GB download.
 const MODEL_LARGE_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf";
 const MODEL_LARGE_FILE: &str = "Qwen3.5-35B-A3B-Q4_K_M.gguf";
@@ -29,14 +35,14 @@ const MODEL_LARGE_SIZE: &str = "~20 GB";
 
 /// Pick the right model based on hardware.
 fn pick_model(hw: &HardwareInfo) -> (&'static str, &'static str, &'static str, &'static str) {
-    let has_gpu = !matches!(hw.gpu, GpuType::None);
+    let has_dedicated_gpu = matches!(hw.gpu, GpuType::Cuda { vram_gb } if vram_gb >= 8);
 
-    // GPU with 8GB+ VRAM or native system with 48GB+ RAM → large model
-    // CPU-only or low RAM → small model (the 35B needs ~22GB, won't fit in WSL default memory)
-    if has_gpu {
+    if has_dedicated_gpu {
         (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
     } else if hw.ram_gb >= 48 {
         (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
+    } else if hw.ram_gb >= 12 {
+        (MODEL_MEDIUM_URL, MODEL_MEDIUM_FILE, MODEL_MEDIUM_NAME, MODEL_MEDIUM_SIZE)
     } else {
         (MODEL_SMALL_URL, MODEL_SMALL_FILE, MODEL_SMALL_NAME, MODEL_SMALL_SIZE)
     }
@@ -237,9 +243,26 @@ fn get_latest_llamacpp_version() -> Result<String> {
     bail!("Could not determine latest llama.cpp release")
 }
 
+fn has_vulkan() -> bool {
+    std::env::var("VULKAN_SDK").is_ok() || {
+        let cmd = if cfg!(windows) { "vulkaninfo.exe" } else { "vulkaninfo" };
+        std::process::Command::new(cmd)
+            .arg("--summary")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 fn llama_asset_name(version: &str) -> Result<String> {
     if cfg!(target_os = "windows") {
-        Ok(format!("llama-{version}-bin-win-cpu-x64.zip"))
+        if has_vulkan() {
+            Ok(format!("llama-{version}-bin-win-vulkan-x64.zip"))
+        } else {
+            Ok(format!("llama-{version}-bin-win-cpu-x64.zip"))
+        }
     } else if cfg!(target_os = "linux") {
         Ok(format!("llama-{version}-bin-ubuntu-x64.tar.gz"))
     } else if cfg!(target_os = "macos") {
