@@ -206,14 +206,11 @@ impl TuiApp {
         let skills = crate::skills::loader::load_all_skills(plugin_loaded_skills);
 
         let skills_prompt = if !skills.is_empty() {
-            let mut out = String::from("Available skills via slash commands:\n\n");
-            for skill in &skills {
-                out.push_str(&format!(
-                    "- `{}` ({}) — {}\n",
-                    skill.trigger, skill.source, skill.description
-                ));
-            }
-            Some(out)
+            let triggers: Vec<&str> = skills.iter().map(|s| s.trigger.as_str()).collect();
+            Some(format!(
+                "Slash command skills: {}\nType any command to activate it.",
+                triggers.join(", ")
+            ))
         } else {
             None
         };
@@ -379,14 +376,11 @@ impl TuiApp {
             None
         };
         let skills_prompt = if !self.skills.is_empty() {
-            let mut out = String::from("Available skills via slash commands:\n\n");
-            for skill in &self.skills {
-                out.push_str(&format!(
-                    "- `{}` ({}) — {}\n",
-                    skill.trigger, skill.source, skill.description
-                ));
-            }
-            Some(out)
+            let triggers: Vec<&str> = self.skills.iter().map(|s| s.trigger.as_str()).collect();
+            Some(format!(
+                "Slash command skills: {}\nType any command to activate it.",
+                triggers.join(", ")
+            ))
         } else {
             None
         };
@@ -615,7 +609,16 @@ impl TuiApp {
                     if self.backend.health_check().await {
                         self.backend_loading = false;
                         self.messages.push(DisplayMessage::System(
-                            "Model ready.".to_string(),
+                            "Model ready — warming up prompt cache...".to_string(),
+                        ));
+                        // Pre-warm: send the system prompt so it's cached before
+                        // the user's first message. This happens in the background
+                        // while the user is typing.
+                        let system_prompt = self.engine.system_prompt().to_string();
+                        let tool_defs = self.tools.tool_definitions();
+                        self.backend.warm_up_prompt(&system_prompt, tool_defs).await;
+                        self.messages.push(DisplayMessage::System(
+                            "Ready.".to_string(),
                         ));
                     }
                 }
@@ -1987,14 +1990,11 @@ author = ""
                     None
                 };
                 let skills_prompt = if !self.skills.is_empty() {
-                    let mut out = String::from("Available skills via slash commands:\n\n");
-                    for skill in &self.skills {
-                        out.push_str(&format!(
-                            "- `{}` ({}) — {}\n",
-                            skill.trigger, skill.source, skill.description
-                        ));
-                    }
-                    Some(out)
+                    let triggers: Vec<&str> = self.skills.iter().map(|s| s.trigger.as_str()).collect();
+                    Some(format!(
+                        "Slash command skills: {}\nType any command to activate it.",
+                        triggers.join(", ")
+                    ))
                 } else {
                     None
                 };
