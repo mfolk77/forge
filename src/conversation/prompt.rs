@@ -4,6 +4,45 @@ use crate::formatting::TemplateSet;
 
 const FTAI_CONTEXT_MAX_CHARS: usize = 10_000;
 
+/// Convert a JSON Schema parameters object into a compact one-line-per-param format.
+/// e.g. "Params: command (string, required), timeout (integer)" instead of verbose JSON.
+fn compact_params(schema: &serde_json::Value) -> String {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return String::new();
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let params: Vec<String> = props
+        .iter()
+        .map(|(name, def)| {
+            let typ = def.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+            let is_req = required.contains(&name.as_str());
+            let desc = def.get("description").and_then(|d| d.as_str()).unwrap_or("");
+            // Truncate long descriptions to keep things tight
+            let short_desc = if desc.len() > 80 {
+                format!("{}...", &desc[..77])
+            } else {
+                desc.to_string()
+            };
+            if is_req {
+                format!("  {name} ({typ}, required): {short_desc}")
+            } else {
+                format!("  {name} ({typ}): {short_desc}")
+            }
+        })
+        .collect();
+
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("Params:\n{}", params.join("\n"))
+    }
+}
+
 /// Load FTAI.md / context.ftai from global and project layers.
 /// Priority: FTAI.md first, then context.ftai. Both layers concatenated.
 pub fn load_ftai_context(project_path: &Path) -> Option<String> {
@@ -82,15 +121,16 @@ pub fn build_system_prompt(
         ));
     }
 
-    // Tool descriptions
+    // Tool descriptions (compact format for local model efficiency)
     if !tool_defs.is_empty() {
         parts.push("# Available Tools\n".to_string());
         for tool in tool_defs {
+            let params_compact = compact_params(&tool.parameters);
             parts.push(format!(
-                "## {}\n{}\nParameters: {}\n",
+                "## {}\n{}\n{}\n",
                 tool.name,
                 tool.description,
-                serde_json::to_string_pretty(&tool.parameters).unwrap_or_default()
+                params_compact
             ));
         }
     }
@@ -134,31 +174,12 @@ pub fn build_system_prompt(
         parts.push(format!("# Environment\n{git_ctx}\n"));
     }
 
-    // False-claims mitigation
+    // Behavioral guidelines (compact)
     parts.push(
-        "# Accuracy\n\
-         Report outcomes faithfully: if tests fail, say so with the relevant output; if you \
-         did not run a verification step, say that rather than implying it succeeded. Never \
-         claim \"all tests pass\" when output shows failures. Equally, when a check did pass, \
-         state it plainly — do not hedge confirmed results with unnecessary disclaimers.\n"
-            .to_string(),
-    );
-
-    // Thoroughness anchor
-    parts.push(
-        "# Verification\n\
-         Before reporting a task complete, verify it actually works: run the test, execute \
-         the script, check the output. If you can't verify (no test exists, can't run the \
-         code), say so explicitly rather than claiming success.\n"
-            .to_string(),
-    );
-
-    // Output efficiency (for local models)
-    parts.push(
-        "# Output Efficiency\n\
-         Go straight to the point. Lead with the action, not the reasoning. Skip filler \
-         words and preamble. Do not narrate each step or list every file you read. \
-         If you can say it in one sentence, don't use three.\n"
+        "# Guidelines\n\
+         Be concise — lead with action, not reasoning. Report outcomes faithfully. \
+         Verify work before claiming success (run tests, check output). \
+         If you cannot verify, say so.\n"
             .to_string(),
     );
 

@@ -124,9 +124,17 @@ impl LlamaCppServer {
             .arg(context_length.to_string())
             .arg("--host")
             .arg("127.0.0.1")
-            .arg("--jinja")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .arg("--jinja");
+
+        // Log server output for diagnostics
+        let log_path = crate::config::global_config_dir()
+            .map(|d| d.join("llama-server.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("llama-server.log"));
+        let log_file = std::fs::File::create(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        cmd.stdout(Stdio::null())
+            .stderr(log_file);
 
         let child = cmd.spawn().context("Failed to start llama-server")?;
         self.process = Some(child);

@@ -5,7 +5,7 @@ use super::api_client::ApiClient;
 use super::http_client::HttpModelClient;
 use super::llamacpp::LlamaCppServer;
 use super::mlx::MlxServer;
-use super::types::{ChatRequest, ChatResponse, HardwareInfo, Token};
+use super::types::{ChatRequest, ChatResponse, HardwareInfo, Token, ToolDefinition};
 use tokio::sync::mpsc;
 
 const LLAMACPP_PORT: u16 = 8411;
@@ -202,6 +202,33 @@ impl BackendManager {
             BackendManager::Api(client) => client.health_check().await,
             _ => self.http_client().unwrap().health_check().await,
         }
+    }
+
+    /// Pre-warm the prompt cache by sending the system prompt to the server.
+    /// This processes and caches the system prompt so the first real user message
+    /// only needs to process the new tokens. Fire-and-forget — errors are ignored.
+    pub async fn warm_up_prompt(&self, system_prompt: &str, tools: Vec<ToolDefinition>) {
+        let request = ChatRequest {
+            messages: vec![
+                crate::backend::types::Message {
+                    role: crate::backend::types::Role::System,
+                    content: system_prompt.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                crate::backend::types::Message {
+                    role: crate::backend::types::Role::User,
+                    content: "hi".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            temperature: 0.0,
+            max_tokens: Some(1),
+            model_id: None,
+            tools,
+        };
+        let _ = self.generate(&request).await;
     }
 
     /// Get hardware info and model recommendation
