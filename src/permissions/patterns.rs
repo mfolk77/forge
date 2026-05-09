@@ -18,8 +18,15 @@ pub const HARD_BLOCKED_COMMANDS: &[&str] = &[
 /// Path prefixes that are always hard-blocked for writes.
 /// Covers FolkTech Coding Rules v1.3 CAT 2 + CAT 6 blocklist.
 /// All paths use forward slashes — classifier normalizes backslashes before matching.
+///
+/// **macOS canonical equivalents are listed alongside the surface paths.** On
+/// macOS, `/etc`, `/var`, `/tmp`, etc. are symlinks to `/private/etc`,
+/// `/private/var`, `/private/tmp`. After path canonicalization
+/// (`path_validator::canonical_match_form`), a path like `/etc/passwd`
+/// resolves to `/private/etc/passwd`. Both prefixes are listed so the
+/// blocklist matches whichever form the canonicalizer produced.
 pub const HARD_BLOCKED_PATH_PREFIXES: &[&str] = &[
-    // Unix/macOS
+    // Unix/macOS surface paths
     "/etc/",
     "/system/",
     "/library/",
@@ -27,6 +34,10 @@ pub const HARD_BLOCKED_PATH_PREFIXES: &[&str] = &[
     "/var/",
     "/bin/",
     "/sbin/",
+    // macOS canonical equivalents (symlink targets in /private)
+    "/private/etc/",
+    "/private/var/",
+    "/private/system/",
     // Windows (lowercased, forward-slash normalized)
     "c:/windows/",
     "c:/program files/",
@@ -85,6 +96,34 @@ pub const SENSITIVE_PATH_PATTERNS: &[&str] = &[
     // Windows credential stores
     "appdata/roaming/microsoft/credentials/",
     "appdata/roaming/microsoft/protect/",
+];
+
+/// Additional paths blocked specifically for READS. These are files that hold
+/// secrets but live under directories where many other files are legitimately
+/// readable (so we can't blanket-block the whole directory). Checked as
+/// `contains` patterns against the canonicalized lowercased path.
+///
+/// Intentionally narrow: directory-level credential blocklists are already
+/// in `SENSITIVE_PATH_PATTERNS` (`.ssh/`, `keychains/`, `.gnupg/`,
+/// `.aws/credentials`). This list only adds *specific files* that don't
+/// live under one of those directories.
+///
+/// SECURITY (CAT 2 — Path & File Security):
+/// Without this list, `file_read` of `/etc/shadow` succeeds (the dir
+/// `/etc/` is full of legitimately-readable config files like `/etc/hosts`,
+/// so we can't blocklist the whole directory). AUDIT-forge-2026-04-28.md P0 #7.
+///
+/// Generic credential filenames like `id_rsa` are NOT in this list because
+/// `.ssh/` already covers them via `SENSITIVE_PATH_PATTERNS`. Listing
+/// `id_rsa` standalone would false-positive on legitimate file names that
+/// happen to contain that substring.
+pub const READ_BLOCKED_PATH_FRAGMENTS: &[&str] = &[
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/master.passwd",   // BSD/macOS shadow equivalent
+    "/private/etc/shadow",  // macOS canonical
+    "/private/etc/sudoers", // macOS canonical
+    "/private/etc/master.passwd",
 ];
 
 /// Windows reserved device names (CAT 6).

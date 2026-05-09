@@ -46,16 +46,58 @@ pub fn hard_block_check(tool_name: &str, params: &Value) -> Option<String> {
 
             None
         }
-        "file_write" | "file_edit" => {
+        "file_read" => {
+            // SECURITY (CAT 2 — Path & File Security):
+            // file_read was previously classified as Safe, so hard_block_check
+            // was never called for it. Reads of `~/.ssh/id_rsa`, `/etc/shadow`,
+            // and `~/Library/Keychains/*` exfiltrated secrets directly into
+            // LLM context. AUDIT-forge-2026-04-28.md P0 #7.
+            //
+            // We block the credential directories from `SENSITIVE_PATH_PATTERNS`
+            // and the specific credential files from `READ_BLOCKED_PATH_FRAGMENTS`.
+            // We do NOT apply `HARD_BLOCKED_PATH_PREFIXES` here — `/usr/bin/`,
+            // `/etc/hosts`, etc. are legitimately readable.
             let raw_path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            // Normalize: strip null bytes, backslashes → forward slashes, lowercase
-            let normalized = raw_path
+            let canonical = super::path_validator::canonical_match_form(raw_path);
+            let surface = raw_path
                 .replace('\0', "")
                 .replace('\\', "/")
                 .to_lowercase();
 
-            // Check Windows reserved device names (CAT 6)
-            if let Some(filename) = normalized.rsplit('/').next() {
+            for pattern in SENSITIVE_PATH_PATTERNS {
+                if canonical.contains(pattern) || surface.contains(pattern) {
+                    return Some(format!("Sensitive path blocked for read: {pattern}"));
+                }
+            }
+            for fragment in READ_BLOCKED_PATH_FRAGMENTS {
+                if canonical.contains(fragment) || surface.contains(fragment) {
+                    return Some(format!("Credential file blocked for read: {fragment}"));
+                }
+            }
+
+            None
+        }
+        "file_write" | "file_edit" => {
+            let raw_path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+            // SECURITY (CAT 2 — Path & File Security):
+            // Canonicalize first. Without this, `../../etc/passwd` slips past
+            // `starts_with("/etc/")`. `canonical_match_form` resolves `..`,
+            // follows symlinks where the path (or its parent) exists, and
+            // returns a lowercased forward-slash form for matching.
+            let canonical = super::path_validator::canonical_match_form(raw_path);
+
+            // Also keep the raw lowercased form for surface-level checks like
+            // Windows reserved names (where canonicalization would lose the
+            // bare filename context).
+            let surface = raw_path
+                .replace('\0', "")
+                .replace('\\', "/")
+                .to_lowercase();
+
+            // Check Windows reserved device names (CAT 6) — based on surface
+            // form, since canonicalization may rewrite the filename.
+            if let Some(filename) = surface.rsplit('/').next() {
                 let stem = filename.split('.').next().unwrap_or(filename);
                 for reserved in WINDOWS_RESERVED_NAMES {
                     if stem.eq_ignore_ascii_case(reserved) {
@@ -64,16 +106,25 @@ pub fn hard_block_check(tool_name: &str, params: &Value) -> Option<String> {
                 }
             }
 
-            // All blocklist patterns are already lowercased with forward slashes
+            // Blocklist matches against the canonicalized form so traversal
+            // attempts cannot bypass.
             for prefix in HARD_BLOCKED_PATH_PREFIXES {
-                if normalized.starts_with(prefix) {
+                if canonical.starts_with(prefix) {
+                    return Some(format!("Hard-blocked path prefix: {prefix}"));
+                }
+                // Also check surface form so the user gets a clear diagnosis
+                // when they pass an absolute hard-blocked path directly (no
+                // symlink resolution needed in that case).
+                if surface.starts_with(prefix) {
                     return Some(format!("Hard-blocked path prefix: {prefix}"));
                 }
             }
 
-            // Check sensitive user directory patterns (CAT 2 + CAT 6)
+            // Sensitive patterns are substring matches; check both forms so
+            // we catch `~/.ssh/...` (surface) AND a path that resolves to it
+            // (canonical). (CAT 2 + CAT 6)
             for pattern in SENSITIVE_PATH_PATTERNS {
-                if normalized.contains(pattern) {
+                if canonical.contains(pattern) || surface.contains(pattern) {
                     return Some(format!("Sensitive path blocked: {pattern}"));
                 }
             }
@@ -788,5 +839,165 @@ mod tests {
         // Normal user paths should not be blocked
         assert!(hard_block_check("file_write", &json!({"path": "C:\\Users\\dev\\project\\src\\main.rs"})).is_none());
         assert!(hard_block_check("file_write", &json!({"path": "D:\\repos\\forge\\Cargo.toml"})).is_none());
+    }
+
+    // ── CAT 2 path-canonicalization red tests (companion to path_validator) ─
+
+    /// SECURITY (CAT 2 — Path & File Security):
+    /// Pre-fix: `../../etc/passwd` slipped past `starts_with("/etc/")` because
+    /// the raw string didn't begin with `/etc/`. Post-fix: canonicalization
+    /// resolves `..` against cwd, yielding a path that contains `/etc/passwd`
+    /// (or just is `/etc/passwd` if cwd is shallow), and the blocklist
+    /// catches it. AUDIT-forge-2026-04-28.md P0 #4.
+    #[test]
+    fn test_security_dot_dot_traversal_blocked_after_canonicalize() {
+        let path = "../../../../../../../../etc/passwd";
+        let result = hard_block_check("file_write", &json!({"path": path}));
+        assert!(
+            result.is_some(),
+            "../-traversal to /etc/passwd MUST be hard-blocked (CAT 2)"
+        );
+    }
+
+    /// SECURITY (CAT 2):
+    /// Same attack vector for `file_edit`.
+    #[test]
+    fn test_security_dot_dot_traversal_blocked_for_file_edit() {
+        let result = hard_block_check(
+            "file_edit",
+            &json!({"path": "../../../../../../../../etc/shadow"}),
+        );
+        assert!(result.is_some(), "../-traversal must also be blocked for file_edit");
+    }
+
+    /// SECURITY (CAT 2):
+    /// `./foo/../../etc/passwd` is the same attack with extra confusion.
+    /// Canonicalization must resolve through it.
+    #[test]
+    fn test_security_mixed_dots_traversal_blocked() {
+        let result = hard_block_check(
+            "file_write",
+            &json!({"path": "./foo/bar/../../../../../../../../etc/passwd"}),
+        );
+        assert!(result.is_some(), "mixed ./../ traversal must still be blocked");
+    }
+
+    /// Functional: ordinary paths under cwd must NOT be blocked just because
+    /// the canonical form happens to mention `/private/` (macOS prefixes
+    /// `/tmp` with `/private/tmp` after canonicalize). The blocklist must
+    /// only fire on actually-sensitive prefixes.
+    #[test]
+    fn test_canonical_normal_path_not_blocked() {
+        // A path under the project should pass.
+        let result = hard_block_check(
+            "file_write",
+            &json!({"path": "src/main.rs"}),
+        );
+        assert!(
+            result.is_none(),
+            "normal in-project paths must not be blocked by canonicalization (was {result:?})"
+        );
+    }
+
+    /// SECURITY (CAT 2):
+    /// Direct absolute path to `/etc/passwd` was already blocked pre-fix
+    /// (surface-form check). Confirm the post-fix code didn't regress that.
+    #[test]
+    fn test_security_direct_etc_passwd_still_blocked() {
+        let result = hard_block_check(
+            "file_write",
+            &json!({"path": "/etc/passwd"}),
+        );
+        assert!(result.is_some(), "direct /etc/passwd write must remain blocked");
+    }
+
+    // ── CAT 2 file_read hard-block tests (Task #9) ──────────────────────────
+    //
+    // file_read was previously classified as Safe → hard_block_check skipped →
+    // reads of credentials succeeded. AUDIT-forge-2026-04-28.md P0 #7.
+
+    /// SECURITY (CAT 2):
+    /// Reading `~/.ssh/id_rsa` (or any file under `.ssh/`) must be blocked.
+    /// This is the canonical SSH private key location across Unix.
+    #[test]
+    fn test_security_file_read_ssh_key_blocked() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".into());
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": format!("{home}/.ssh/id_rsa")}),
+        );
+        assert!(
+            result.is_some(),
+            "file_read of ~/.ssh/id_rsa MUST be hard-blocked (CAT 2 — credential exfil)"
+        );
+    }
+
+    /// SECURITY (CAT 2):
+    /// Reading `/etc/shadow` (Linux password hashes). On macOS this file
+    /// doesn't exist but we still block by name — defense in depth for
+    /// portable agent behavior.
+    #[test]
+    fn test_security_file_read_etc_shadow_blocked() {
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": "/etc/shadow"}),
+        );
+        assert!(result.is_some(), "file_read of /etc/shadow MUST be blocked");
+    }
+
+    /// SECURITY (CAT 2):
+    /// Reading via traversal — `../../../../../../etc/shadow` should
+    /// canonicalize to a path containing `/etc/shadow` and get blocked.
+    #[test]
+    fn test_security_file_read_traversal_to_shadow_blocked() {
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": "../../../../../../../../etc/shadow"}),
+        );
+        assert!(result.is_some(), "..-traversal to /etc/shadow MUST be blocked for file_read");
+    }
+
+    /// SECURITY (CAT 2):
+    /// Reading `.aws/credentials` — common AWS credential exfil vector.
+    #[test]
+    fn test_security_file_read_aws_credentials_blocked() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".into());
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": format!("{home}/.aws/credentials")}),
+        );
+        assert!(result.is_some(), "file_read of ~/.aws/credentials MUST be blocked");
+    }
+
+    /// Functional: reading legitimate config files like /etc/hosts must NOT
+    /// be blocked. Forge needs this to understand the user's network setup.
+    #[test]
+    fn test_file_read_etc_hosts_not_blocked() {
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": "/etc/hosts"}),
+        );
+        assert!(result.is_none(), "/etc/hosts must remain readable (was {result:?})");
+    }
+
+    /// Functional: reading project files must work normally.
+    #[test]
+    fn test_file_read_project_file_not_blocked() {
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": "src/main.rs"}),
+        );
+        assert!(result.is_none(), "project files must remain readable");
+    }
+
+    /// Functional: reading `/usr/bin/git` and similar — Forge legitimately
+    /// uses these for hardware/tool detection.
+    #[test]
+    fn test_file_read_usr_bin_not_blocked() {
+        let result = hard_block_check(
+            "file_read",
+            &json!({"path": "/usr/bin/git"}),
+        );
+        assert!(result.is_none(), "/usr/bin/* must remain readable");
     }
 }
