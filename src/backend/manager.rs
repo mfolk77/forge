@@ -128,9 +128,14 @@ impl BackendManager {
                     .model
                     .path
                     .as_deref()
-                    .context("No model path configured. Run `forge model install` or set model.path in config.")?;
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string())
+                    .or_else(discover_first_installed_model)
+                    .context(
+                        "No model path configured. Run `forge model install` then `forge model use <name>`, or set model.path in config.",
+                    )?;
 
-                let resolved = Self::resolve_path(raw_path);
+                let resolved = Self::resolve_path(&raw_path);
                 let model_path = resolved.as_str();
 
                 match self {
@@ -261,6 +266,26 @@ impl BackendManager {
             _ => None,
         }
     }
+}
+
+/// If `model.path` is unset, use the first usable model under `~/.ftai/models/`
+/// (alphabetical by directory name). Matches the "first run" expectation when
+/// the user ran `forge model install` but not `forge model use`.
+fn discover_first_installed_model() -> Option<String> {
+    let models_dir = crate::config::global_config_dir().ok()?.join("models");
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&models_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        if let Some(path) = resolve_model_path(&dir) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Resolve a model directory to the appropriate path for the backend.

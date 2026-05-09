@@ -264,7 +264,9 @@ async fn main() -> Result<()> {
                 if let Some(path) = &config.model.path {
                     println!("Model path: {path}");
                 } else {
-                    println!("Model path: (none — will auto-detect on first run)");
+                    println!(
+                        "Model path: (none — Forge uses the first model under ~/.ftai/models at startup)"
+                    );
                 }
             }
         },
