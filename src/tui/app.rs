@@ -128,6 +128,12 @@ pub struct TuiApp {
     session_task_description: Option<String>,
     /// True while the backend is still loading the model in the background
     backend_loading: bool,
+    /// Schema validator for parsed tool calls. Populated at startup from the
+    /// tool registry's definitions; consulted in the dispatch loop before
+    /// every `tools.execute` call. Catches missing required params and wrong
+    /// types before they reach tool implementations. (CAT 7 — LLM Output
+    /// Injection.) AUDIT-forge-2026-04-28.md P0 #1.
+    tool_validator: crate::conversation::validator::ToolCallValidator,
 }
 
 impl TuiApp {
@@ -166,6 +172,14 @@ impl TuiApp {
         }
 
         let tool_defs = tools.tool_definitions();
+
+        // Build the tool validator from the registered tool definitions so the
+        // dispatch loop can reject malformed calls (missing required params,
+        // wrong types, unknown tool names) before they reach `tools.execute`.
+        let mut tool_validator = crate::conversation::validator::ToolCallValidator::new();
+        for def in &tool_defs {
+            tool_validator.register_tool(&def.name, &def.parameters);
+        }
 
         let mut rules = RulesEngine::new();
         // Load global rules
@@ -343,6 +357,7 @@ impl TuiApp {
             #[cfg(feature = "evolution")]
             session_task_description: None,
             backend_loading: false,
+            tool_validator,
         }
     }
 
@@ -1524,6 +1539,49 @@ author = ""
                 continue;
             }
 
+            // Step 1.5: Schema validation (CAT 7 — LLM Output Injection).
+            // Reject malformed tool calls (unknown tool name, missing required
+            // parameter, wrong parameter type) before they reach
+            // `tools.execute`. Pre-fix, the `ToolCallValidator` existed in
+            // src/conversation/validator.rs but was never instantiated or
+            // called — a model could emit `<tool_call><function=bash>` with
+            // no `command` parameter and the dispatch path would forward it
+            // to the bash tool, which would either crash or do something
+            // unexpected. AUDIT-forge-2026-04-28.md P0 #1.
+            {
+                let parsed = crate::conversation::adapter::ParsedToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.as_object()
+                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default(),
+                    raw_text: String::new(),
+                };
+                use crate::conversation::validator::ValidationResult;
+                let validation = self.tool_validator.validate(&parsed);
+                if !matches!(validation, ValidationResult::Valid) {
+                    let reason = match &validation {
+                        ValidationResult::UnknownTool(n) => format!("unknown tool: {n}"),
+                        ValidationResult::MissingParam(p) => format!("missing required parameter: {p}"),
+                        ValidationResult::InvalidParamType { param, expected, got } =>
+                            format!("parameter '{param}' must be {expected}, got {got}"),
+                        ValidationResult::Valid => unreachable!(),
+                    };
+                    self.messages.push(DisplayMessage::PermissionBlocked {
+                        tool: call.name.clone(),
+                        reason: reason.clone(),
+                    });
+                    self.engine.add_tool_result(&call.id, &format!("INVALID TOOL CALL: {reason}"));
+                    #[cfg(feature = "evolution")]
+                    self.session_tool_calls.push(ToolCallRecord {
+                        tool_name: call.name.clone(),
+                        arguments_summary: summarize_args(&call.arguments),
+                        result_type: ToolResultType::Rejected,
+                        duration_ms: 0,
+                    });
+                    continue;
+                }
+            }
+
             // Step 2: Permission tier check
             let tier = permissions::classify(&call.name, &call.arguments);
             let verdict = permissions::check_permission(
@@ -1618,9 +1676,24 @@ author = ""
                                 break;
                             }
                             crate::plugins::hooks::HookResult::Error(msg) => {
+                                // SECURITY (CAT 4 — Auth & Authorization Bypass):
+                                // Fail-closed. A pre-hook that errored has NOT
+                                // vetted this call — treating it as success
+                                // would silently bypass security hooks
+                                // (plugin dir missing, hook command invalid,
+                                // timeout, IO error). The user's plugins
+                                // declared this hook as a gate; a gate that
+                                // can't run does not approve.
+                                // AUDIT-forge-2026-04-28.md P0 #3.
                                 self.messages.push(DisplayMessage::System(
-                                    format!("Hook error: {msg}"),
+                                    format!("Hook error (failing closed for safety): {msg}"),
                                 ));
+                                self.engine.add_tool_result(
+                                    &call.id,
+                                    &format!("BLOCKED: pre-hook errored — {msg}"),
+                                );
+                                hook_blocked = true;
+                                break;
                             }
                             crate::plugins::hooks::HookResult::Passed => {}
                         }
@@ -1906,14 +1979,52 @@ author = ""
                         continue;
                     }
 
-                    let ctx = ToolContext {
-                        cwd: self.project_path.clone(),
-                        project_path: self.project_path.clone(),
-                    };
-
-                    let result = match self.tools.execute(&tc.name, tc.arguments.clone(), &ctx).await {
-                        Ok(r) => r.output,
-                        Err(e) => format!("Tool error: {e}"),
+                    // SECURITY (CAT 4 — Auth & Authorization Bypass):
+                    // Subagent tool dispatch must go through the same gates as
+                    // the primary agent. Pre-fix, this path called
+                    // `tools.execute` directly with no `hard_block_check`,
+                    // `classify`, `check_permission`, rules, or hooks —
+                    // a prompt-injected subagent could run `bash rm -rf ~`,
+                    // write to `/etc/passwd`, etc. AUDIT-forge-2026-04-28.md P0 #2.
+                    //
+                    // Subagent policy:
+                    //  1. Hard-block check applies same as main agent (no override).
+                    //  2. Permission tier must be Safe OR already granted in the
+                    //     session grant cache. Otherwise the subagent cannot
+                    //     trigger an interactive confirmation — that would let
+                    //     a hijacked subagent flood the user with prompts. We
+                    //     deny silently and tell the subagent it cannot do
+                    //     that in this context, so it can adapt or ask the
+                    //     primary agent to perform the action.
+                    //  3. Rules engine and hooks are NOT applied here for
+                    //     simplicity in this iteration — the rules+hooks
+                    //     pipeline is structured around the main agent's
+                    //     event loop and inheriting it is a larger refactor.
+                    //     Hard-block + tier gating is the floor.
+                    let result = if let Some(reason) = crate::permissions::hard_block_check(&tc.name, &tc.arguments) {
+                        format!("Subagent BLOCKED: hard-block — {reason}")
+                    } else {
+                        let tier = crate::permissions::classify(&tc.name, &tc.arguments);
+                        let allowed = matches!(tier, crate::permissions::PermissionTier::Safe)
+                            || self.grant_cache.matches(&tc.name, &tc.arguments);
+                        if !allowed {
+                            format!(
+                                "Subagent BLOCKED: tool '{}' is tier {:?} and not in the session grant cache. \
+                                 Subagents cannot trigger interactive permission prompts. \
+                                 Ask the primary agent to perform this action, or have the user grant \
+                                 permission once in the main session before re-spawning the subagent.",
+                                tc.name, tier
+                            )
+                        } else {
+                            let ctx = ToolContext {
+                                cwd: self.project_path.clone(),
+                                project_path: self.project_path.clone(),
+                            };
+                            match self.tools.execute(&tc.name, tc.arguments.clone(), &ctx).await {
+                                Ok(r) => r.output,
+                                Err(e) => format!("Tool error: {e}"),
+                            }
+                        }
                     };
 
                     messages.push(Message {
