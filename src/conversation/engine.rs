@@ -48,15 +48,21 @@ impl ConversationEngine {
         self.messages.push(response.message);
     }
 
-    /// Add a tool result
+    /// Add a tool result. The `result` is sanitized to neutralize Forge's
+    /// XML tool-call markers so a fetched page or command output that
+    /// contains `<tool_call>`, `</tool_response>`, etc. cannot be
+    /// re-interpreted by the agentic loop as a model-emitted tool call.
+    /// (CAT 7 — LLM Output Injection. AUDIT P0 #5.)
     pub fn add_tool_result(&mut self, tool_call_id: &str, result: &str) {
+        let safe = crate::conversation::adapter::sanitize_tool_result_for_message(result);
+        let token_estimate = estimate_tokens(&safe);
         self.messages.push(Message {
             role: Role::Tool,
-            content: result.to_string(),
+            content: safe,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
         });
-        self.estimated_tokens += estimate_tokens(result);
+        self.estimated_tokens += token_estimate;
     }
 
     /// Build a ChatRequest for the model
