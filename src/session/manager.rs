@@ -98,6 +98,14 @@ impl SessionManager {
     }
 
     /// Save a message to the current session.
+    ///
+    /// SECURITY (CAT 3 / CAT 9): Both `content` and the JSON-serialized
+    /// `tool_calls` are passed through `permissions::sensitive_filter::redact_sensitive`
+    /// before being written to SQLite. Pasted credentials (API keys, bearer
+    /// tokens, AWS access keys, GitHub PATs, private keys, etc.) are
+    /// replaced with `[REDACTED]` markers so they are not persisted in
+    /// `~/.ftai/sessions.db` and re-injected into future system prompts.
+    /// AUDIT P0 #9.
     pub fn save_message(
         &self,
         role: Role,
@@ -112,13 +120,18 @@ impl SessionManager {
         let seq = self.next_seq(session_id)?;
         let now = now_epoch();
         let role_str = role_to_str(&role);
-        let tc_json = tool_calls.map(|tcs| serde_json::to_string(tcs).unwrap_or_default());
-        let tokens_est = crate::session::budget::TokenBudget::estimate_tokens(content);
+
+        let safe_content = crate::permissions::sensitive_filter::redact_sensitive(content);
+        let tc_json = tool_calls.map(|tcs| {
+            let raw = serde_json::to_string(tcs).unwrap_or_default();
+            crate::permissions::sensitive_filter::redact_sensitive(&raw)
+        });
+        let tokens_est = crate::session::budget::TokenBudget::estimate_tokens(&safe_content);
 
         self.conn.execute(
             "INSERT INTO messages (session_id, seq, role, content, tool_calls, tokens_estimated, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![session_id, seq, role_str, content, tc_json, tokens_est, now],
+            rusqlite::params![session_id, seq, role_str, safe_content, tc_json, tokens_est, now],
         )?;
 
         // Update message count.

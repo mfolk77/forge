@@ -3,6 +3,7 @@ pub mod classifier;
 pub mod denial_tracker;
 pub mod grants;
 pub mod path_validator;
+pub mod sensitive_filter;
 
 pub use classifier::{PermissionTier, PermissionVerdict, classify, hard_block_check, check_permission};
 pub use denial_tracker::DenialTracker;
