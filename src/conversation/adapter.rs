@@ -106,6 +106,15 @@ fn strip_code_fences(text: &str) -> String {
     fence_re.replace_all(text, "").to_string()
 }
 
+/// Remove `<tool_call>...</tool_call>` blocks from assistant content after the
+/// inline-tool-call fallback has lifted them into structured calls. Leaves
+/// any natural-language prefix/suffix intact so the user still sees the
+/// model's reasoning around the call.
+pub fn strip_tool_call_blocks(text: &str) -> String {
+    let block_re = Regex::new(r"(?s)<tool_call>.*?</tool_call>").unwrap();
+    block_re.replace_all(text, "").trim().to_string()
+}
+
 /// Core Qwen 3.5 XML parsing logic, exposed for reuse by recovery/streaming.
 pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
     // SECURITY (P0 #7): Strip markdown code fences before parsing to prevent
