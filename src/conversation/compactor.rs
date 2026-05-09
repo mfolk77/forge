@@ -119,6 +119,12 @@ pub fn snip_compact(
 
     let remove_count = messages.len() - keep;
     let removed: Vec<Message> = messages.drain(..remove_count).collect();
+    let recent_has_user = messages.iter().any(|m| m.role == Role::User);
+    let last_removed_user = if recent_has_user {
+        None
+    } else {
+        last_user_message(&removed)
+    };
 
     // Save to transcript
     save_transcript(project_path, &removed)?;
@@ -134,6 +140,9 @@ pub fn snip_compact(
             tool_call_id: None,
         },
     );
+    if let Some(user) = last_removed_user {
+        messages.insert(1, user);
+    }
 
     Ok(remove_count)
 }
@@ -167,6 +176,7 @@ pub fn summarize_compact(
 
     // Build summary from all messages using the 9-category structure
     let summary = summarize_removed(messages);
+    let last_user = last_user_message(messages);
 
     // Replace all messages with the summary
     messages.clear();
@@ -180,6 +190,9 @@ pub fn summarize_compact(
         tool_calls: None,
         tool_call_id: None,
     });
+    if let Some(user) = last_user {
+        messages.push(user);
+    }
 
     Ok(summary)
 }
@@ -226,6 +239,10 @@ fn summarize_removed(messages: &[Message]) -> String {
         let limit = parts.len().min(20);
         parts[..limit].join("; ")
     }
+}
+
+fn last_user_message(messages: &[Message]) -> Option<Message> {
+    messages.iter().rev().find(|m| m.role == Role::User).cloned()
 }
 
 /// Save messages to a JSONL transcript file.
@@ -392,6 +409,11 @@ pub fn emergency_truncate(messages: &mut Vec<Message>, project_path: &Path) {
     // Keep last 3 messages
     let tail_count = 3.min(messages.len());
     let tail: Vec<Message> = messages.iter().rev().take(tail_count).cloned().collect();
+    let last_user = if tail.iter().any(|m| m.role == Role::User) {
+        None
+    } else {
+        last_user_message(messages)
+    };
 
     messages.clear();
     if let Some(sys) = system_msg {
@@ -406,6 +428,9 @@ pub fn emergency_truncate(messages: &mut Vec<Message>, project_path: &Path) {
         tool_calls: None,
         tool_call_id: None,
     });
+    if let Some(user) = last_user {
+        messages.push(user);
+    }
     for msg in tail.into_iter().rev() {
         messages.push(msg);
     }
@@ -608,6 +633,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    #[test]
+    fn test_snip_compact_preserves_last_user_when_tail_has_only_tools() {
+        let tmp = TempDir::new().unwrap();
+        let mut messages = vec![
+            make_user("original request"),
+            make_assistant_with_call("tc1", "file_write"),
+            make_tool_result("tc1", "wrote file"),
+        ];
+
+        snip_compact(&mut messages, tmp.path(), 2).unwrap();
+
+        assert!(messages.iter().any(|m| m.role == Role::User));
+        assert!(messages.iter().any(|m| m.content == "original request"));
+    }
+
     // ── Summarize compact tests ────────────────────────────────────────────
 
     #[test]
@@ -622,8 +662,10 @@ mod tests {
 
         let summary = summarize_compact(&mut messages, tmp.path()).unwrap();
         assert!(!summary.is_empty());
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
         assert!(messages[0].content.contains("Session summary"));
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].content, "another question");
     }
 
     // ── Transcript saving tests ────────────────────────────────────────────
@@ -712,7 +754,8 @@ mod tests {
         ];
 
         summarize_compact(&mut messages, tmp.path()).unwrap();
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, Role::User);
 
         let content = &messages[0].content;
         // Must include the 9-category summarization prompt
@@ -921,6 +964,28 @@ mod tests {
         assert_eq!(messages[2].content, "recent 1");
         assert_eq!(messages[3].content, "recent 2");
         assert_eq!(messages[4].content, "recent 3");
+    }
+
+    #[test]
+    fn test_emergency_truncate_preserves_last_user_when_tail_has_only_tools() {
+        let tmp = TempDir::new().unwrap();
+        let mut messages = vec![
+            Message {
+                role: Role::System,
+                content: "system".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            make_user("original request"),
+            make_assistant_with_call("tc1", "file_write"),
+            make_tool_result("tc1", "wrote file"),
+            make_assistant_with_call("tc2", "bash"),
+        ];
+
+        emergency_truncate(&mut messages, tmp.path());
+
+        assert!(messages.iter().any(|m| m.role == Role::User));
+        assert!(messages.iter().any(|m| m.content == "original request"));
     }
 
     #[test]
