@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -6,7 +6,7 @@ use ratatui::prelude::*;
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use crate::backend::manager::BackendManager;
-use crate::backend::types::ChatResponse;
+use crate::backend::types::{ChatRequest, ChatResponse, Token};
 use crate::config::Config;
 use crate::conversation::engine::ConversationEngine;
 use crate::conversation::parser::ToolCallParser;
@@ -1260,7 +1260,7 @@ author = ""
 
             if turn == 0 {
                 // First turn: try streaming for live token display
-                match self.backend.generate_stream(&request).await {
+                match self.generate_stream_with_recovery(&request).await {
                     Ok((rx, handle)) => {
                         self.streaming_text.clear();
                         self.token_rx = Some(rx);
@@ -1276,7 +1276,7 @@ author = ""
             }
 
             // Sync generate (fallback for first turn, default for continuations)
-            let response = match self.backend.generate(&request).await {
+            let response = match self.generate_with_recovery(&request).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.messages.push(DisplayMessage::System(format!("Error: {e}")));
@@ -1297,6 +1297,73 @@ author = ""
 
         self.is_generating = false;
         Ok(())
+    }
+
+    async fn generate_with_recovery(&mut self, request: &ChatRequest) -> Result<ChatResponse> {
+        match self.backend.generate(request).await {
+            Ok(response) => Ok(response),
+            Err(e) if Self::is_backend_transport_error(&e) => {
+                self.messages.push(DisplayMessage::System(
+                    format!("Backend disconnected ({e}). Restarting and shrinking request..."),
+                ));
+                self.backend.stop();
+                self.backend
+                    .start(&self.config)
+                    .await
+                    .context("Failed to restart local model server after disconnect")?;
+
+                // Shrink-before-retry: a same-size request is what likely
+                // caused the disconnect (memory pressure, prompt too big,
+                // transient OOM). Force compaction so the retry is smaller.
+                self.engine.shrink_for_retry();
+                let smaller = self.engine.build_request(&self.config);
+
+                self.backend
+                    .generate(&smaller)
+                    .await
+                    .context("Model request failed after backend restart + shrink")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn generate_stream_with_recovery(
+        &mut self,
+        request: &ChatRequest,
+    ) -> Result<(tokio::sync::mpsc::Receiver<Token>, tokio::task::JoinHandle<Result<ChatResponse>>)> {
+        match self.backend.generate_stream(request).await {
+            Ok(stream) => Ok(stream),
+            Err(e) if Self::is_backend_transport_error(&e) => {
+                self.messages.push(DisplayMessage::System(
+                    format!("Backend disconnected ({e}). Restarting and shrinking request..."),
+                ));
+                self.backend.stop();
+                self.backend
+                    .start(&self.config)
+                    .await
+                    .context("Failed to restart local model server after disconnect")?;
+
+                // Shrink-before-retry — see generate_with_recovery for rationale.
+                self.engine.shrink_for_retry();
+                let smaller = self.engine.build_request(&self.config);
+
+                self.backend
+                    .generate_stream(&smaller)
+                    .await
+                    .context("Streaming request failed after backend restart + shrink")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn is_backend_transport_error(error: &anyhow::Error) -> bool {
+        let text = format!("{error:#}");
+        text.contains("Failed to connect to model server")
+            || text.contains("connection refused")
+            || text.contains("connection closed")
+            || text.contains("error sending request")
+            || text.contains("operation timed out")
+            || text.contains("Stream read error")
     }
 
     /// Called after streaming completes. Processes tool calls from the streamed
@@ -1322,7 +1389,7 @@ author = ""
                 self.engine.compact();
                 let request = self.engine.build_request(&self.config);
 
-                let response = match self.backend.generate(&request).await {
+                let response = match self.generate_with_recovery(&request).await {
                     Ok(r) => r,
                     Err(e) => {
                         self.messages.push(DisplayMessage::System(format!("Error: {e}")));

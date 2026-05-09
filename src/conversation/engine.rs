@@ -94,9 +94,13 @@ impl ConversationEngine {
             tool_call_id: None,
         });
 
+        let use_native_tools = !chat_mode
+            && !(config.model.backend == crate::config::BackendType::Mlx
+                && config.model.tool_calling != crate::config::ToolCallingMode::Native);
+
         ChatRequest {
             messages,
-            tools: if chat_mode { vec![] } else { self.tools.clone() },
+            tools: if use_native_tools { self.tools.clone() } else { vec![] },
             temperature: config.model.temperature,
             max_tokens: Some(4096),
             model_id: config.model.path.as_deref()
@@ -114,10 +118,55 @@ impl ConversationEngine {
         compacted
     }
 
+    /// Forcibly shrink the conversation before retrying after a backend
+    /// transport failure. This is independent of the tier threshold logic in
+    /// `compact()` — when we've just hit a server disconnect, we want to send
+    /// a smaller request next time regardless of where token counts sit.
+    ///
+    /// Order:
+    /// 1. Tier 1 (microcompact) — drops old tool result bodies cheaply.
+    /// 2. Tier 2 (snip) — removes oldest messages keeping the most recent 6.
+    ///    A keep-window of 6 (vs. compact()'s 10) is intentionally tighter:
+    ///    a recovery is a degraded state and aggressive shrinkage is the right
+    ///    call.
+    ///
+    /// SECURITY (CAT 9 — Memory & Persistence): preserves at least the most
+    /// recent user message so the request shape stays valid (server-side
+    /// validators on some backends require a trailing user message).
+    pub fn shrink_for_retry(&mut self) {
+        self.micro_compact();
+
+        const KEEP_RECENT_ON_RETRY: usize = 6;
+        if self.messages.len() <= KEEP_RECENT_ON_RETRY {
+            return;
+        }
+
+        if let Some(ref path) = self.project_path.clone() {
+            let _ = compactor::snip_compact(&mut self.messages, path, KEEP_RECENT_ON_RETRY);
+        } else {
+            let keep_recent = KEEP_RECENT_ON_RETRY.min(self.messages.len());
+            let summary = Self::summarize_messages(
+                &self.messages[..self.messages.len() - keep_recent],
+            );
+            let mut new_messages = vec![Message {
+                role: Role::System,
+                content: format!("[Conversation summary (retry shrink): {summary}]"),
+                tool_calls: None,
+                tool_call_id: None,
+            }];
+            new_messages.extend_from_slice(
+                &self.messages[self.messages.len() - keep_recent..],
+            );
+            self.messages = new_messages;
+        }
+
+        self.recalculate_tokens();
+    }
+
     /// Check if compaction is needed based on token thresholds.
     /// Returns the tier (2 or 3) or None.
     pub fn should_compact(&self) -> Option<u8> {
-        compactor::should_compact(self.estimated_tokens, self.max_context_tokens)
+        compactor::should_compact(self.estimated_request_tokens(false), self.usable_context_tokens())
     }
 
     /// Five-tier compaction system:
@@ -248,6 +297,28 @@ impl ConversationEngine {
         self.estimated_tokens
     }
 
+    /// Estimate the full prompt sent to the model, including system prompt and
+    /// tool schemas. `estimated_tokens` tracks only conversation messages.
+    pub fn estimated_request_tokens(&self, chat_mode: bool) -> usize {
+        let mut total = self.estimated_tokens + estimate_tokens(&self.system_prompt);
+        if !chat_mode {
+            total += self.tools.iter().map(|tool| {
+                estimate_tokens(&tool.name)
+                    + estimate_tokens(&tool.description)
+                    + serde_json::to_string(&tool.parameters)
+                        .map(|s| estimate_tokens(&s))
+                        .unwrap_or(0)
+            }).sum::<usize>();
+        }
+        total
+    }
+
+    /// Leave room for the response; prompt-only fit is not enough for local
+    /// servers with fixed context windows.
+    fn usable_context_tokens(&self) -> usize {
+        self.max_context_tokens.saturating_sub(4096).max(self.max_context_tokens / 2)
+    }
+
     #[allow(dead_code)]
     pub fn messages(&self) -> &[Message] {
         &self.messages
@@ -341,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn test_mlx_hybrid_uses_prompted_tools() {
+        let mut engine = ConversationEngine::new(
+            "You are a coding assistant.".to_string(),
+            vec![ToolDefinition {
+                name: "bash".to_string(),
+                description: "Run a command".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            32768,
+        );
+        engine.add_user_message("list files");
+
+        let mut config = Config::default();
+        config.model.backend = crate::config::BackendType::Mlx;
+        config.model.tool_calling = crate::config::ToolCallingMode::Hybrid;
+
+        let request = engine.build_request(&config);
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
     fn test_compact() {
         let mut engine = ConversationEngine::new(
             "system".to_string(),
@@ -358,6 +450,102 @@ mod tests {
         let after = engine.message_count();
 
         assert!(after < before, "compact should reduce message count");
+    }
+
+    #[test]
+    fn test_shrink_for_retry_reduces_message_count() {
+        let mut engine = ConversationEngine::new(
+            "system".to_string(),
+            vec![],
+            32768,
+        );
+
+        // Add many messages so shrink has work to do
+        for i in 0..30 {
+            engine.add_user_message(&format!("message {i}"));
+            engine.add_assistant_message(ChatResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: format!("response {i}"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                tokens_used: Default::default(),
+                stop_reason: crate::backend::types::StopReason::EndOfText,
+            });
+        }
+        let before = engine.message_count();
+        assert!(before >= 60);
+
+        engine.shrink_for_retry();
+
+        let after = engine.message_count();
+        assert!(
+            after < before,
+            "shrink_for_retry must reduce message count after a transport error (was {before}, now {after})"
+        );
+        // Keep window of 6 + 1 system summary = 7 expected
+        assert!(
+            after <= 8,
+            "shrink_for_retry should keep no more than ~7 messages (got {after})"
+        );
+    }
+
+    #[test]
+    fn test_shrink_for_retry_preserves_recent_user_message() {
+        // CRITICAL: some backends require a trailing user message in the
+        // request shape. The shrink must NOT drop the most recent user
+        // message or the retry will 404 with "No user query found in messages".
+        let mut engine = ConversationEngine::new(
+            "system".to_string(),
+            vec![],
+            32768,
+        );
+
+        for i in 0..10 {
+            engine.add_user_message(&format!("user_{i}"));
+            engine.add_assistant_message(ChatResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: format!("asst_{i}"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                tokens_used: Default::default(),
+                stop_reason: crate::backend::types::StopReason::EndOfText,
+            });
+        }
+        engine.add_user_message("MOST_RECENT_USER_QUERY");
+
+        engine.shrink_for_retry();
+
+        let has_recent_user = engine.messages().iter().any(|m| {
+            m.role == Role::User && m.content == "MOST_RECENT_USER_QUERY"
+        });
+        assert!(
+            has_recent_user,
+            "shrink_for_retry MUST preserve the most recent user message (request shape requirement)"
+        );
+    }
+
+    #[test]
+    fn test_shrink_for_retry_idempotent_on_short_conversation() {
+        // If the conversation is already short, shrink should not corrupt it.
+        let mut engine = ConversationEngine::new(
+            "system".to_string(),
+            vec![],
+            32768,
+        );
+        engine.add_user_message("hi");
+        let before = engine.message_count();
+
+        engine.shrink_for_retry();
+
+        assert_eq!(
+            engine.message_count(),
+            before,
+            "short conversations must not be shrunk further"
+        );
     }
 
     #[test]
