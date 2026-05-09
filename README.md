@@ -51,6 +51,10 @@ forge update
 
 Forge can self-update from GitHub Releases. Run `forge update --check` to check without installing.
 
+### Troubleshooting
+
+If install or first run hits a snag, see [docs/troubleshooting.md](docs/troubleshooting.md). It covers the Apple Silicon `mlx-lm` extra step, what Forge auto-fixes for you on startup, and how to read the local model server logs.
+
 ---
 
 ## Quick start
