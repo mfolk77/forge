@@ -75,6 +75,25 @@ pub fn builtin_hook_prompts() -> Vec<BuiltinHookPrompt> {
     ]
 }
 
+/// Sanitize a hook env-var value to neutralize shell injection vectors.
+///
+/// SECURITY (CAT 1 — Input Injection):
+/// Strips null bytes (which can truncate downstream consumers) and replaces
+/// newlines with spaces (which can split a single env-var reference into
+/// multiple shell commands when used unquoted). Backticks and `$(...)` are
+/// preserved because bash does not recursively re-evaluate them when
+/// expanding a variable's value.
+///
+/// Hook authors should ALWAYS quote env-var references in shell hooks
+/// (`"$FORGE_FILE_PATH"` not `$FORGE_FILE_PATH`); this sanitizer is the
+/// belt-and-suspenders second layer.
+pub(crate) fn sanitize_env_value(value: &str) -> String {
+    value
+        .replace('\0', "")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
 fn default_timeout() -> u64 {
     10000
 }
@@ -132,6 +151,21 @@ impl HookRunner {
     pub async fn run(&self, event: &str, env: &HashMap<String, String>) -> Result<()> {
         let blocking = Self::is_blocking_event(event);
 
+        // SECURITY (CAT 1 — Input Injection):
+        // Env values come from tool params (model output) and can contain
+        // shell metacharacters. When a hook's command uses `$VAR` unquoted,
+        // bash word-splits the value — a value of `; rm -rf ~` makes
+        // `echo $VAR` run as `echo; rm -rf ~`. Backticks and `$(...)` inside
+        // expanded values are NOT recursively re-evaluated by bash, so they
+        // are safe. The remaining real risks are newlines (split into
+        // separate commands) and null bytes (truncate). We sanitize those
+        // unconditionally and document the quoting requirement for hook
+        // authors. AUDIT-forge-2026-04-28.md P0 #12.
+        let sanitized_env: HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.clone(), sanitize_env_value(v)))
+            .collect();
+
         for hook in &self.hooks {
             if hook.event != event {
                 continue;
@@ -139,7 +173,7 @@ impl HookRunner {
 
             // If the hook has a tool filter, only run when FORGE_TOOL_NAME matches.
             if let Some(ref tool_filter) = hook.tool {
-                match env.get("FORGE_TOOL_NAME") {
+                match sanitized_env.get("FORGE_TOOL_NAME") {
                     Some(tool_name) if tool_name == tool_filter => {}
                     _ => continue,
                 }
@@ -157,7 +191,7 @@ impl HookRunner {
                     .arg(&hook.command)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .envs(env.iter())
+                    .envs(sanitized_env.iter())
                     .kill_on_drop(true)
                     .output(),
             )
@@ -479,5 +513,76 @@ tool = "bash"
         let hooks = builtin_hook_prompts();
         let tdd = hooks.iter().find(|h| h.name == "tdd-reminder").unwrap();
         assert!(!tdd.enabled_by_default);
+    }
+
+    // ── CAT 1 env-value sanitization tests (AUDIT P0 #12) ──────────────────
+
+    /// SECURITY (CAT 1): newline in an env value can split a single
+    /// `$VAR` reference (when unquoted) into multiple shell commands.
+    /// Sanitizer must replace newlines with spaces.
+    #[test]
+    fn test_security_sanitize_env_value_neutralizes_newlines() {
+        let attacker_value = "/tmp/legit\nrm -rf ~";
+        let sanitized = sanitize_env_value(attacker_value);
+        assert!(!sanitized.contains('\n'), "newlines must be removed");
+        assert!(!sanitized.contains('\r'), "carriage returns must be removed");
+    }
+
+    /// SECURITY (CAT 1): null bytes in env values can truncate downstream
+    /// readers and have caused CVEs in path-handling code.
+    #[test]
+    fn test_security_sanitize_env_value_strips_null_bytes() {
+        let attacker_value = "/tmp/legit\0/etc/passwd";
+        let sanitized = sanitize_env_value(attacker_value);
+        assert!(!sanitized.contains('\0'), "null bytes must be removed");
+    }
+
+    /// Functional: ordinary path values pass through unchanged. The
+    /// sanitizer only neutralizes the two characters that can corrupt
+    /// shell expansion regardless of quoting.
+    #[test]
+    fn test_sanitize_env_value_preserves_normal_paths() {
+        let normal = "/Users/foo/Developer/my-project/src/main.rs";
+        assert_eq!(sanitize_env_value(normal), normal);
+
+        let with_special_chars = "/tmp/file with spaces; and (parens)";
+        assert_eq!(sanitize_env_value(with_special_chars), with_special_chars);
+    }
+
+    /// SECURITY (CAT 1) — integration:
+    /// A pre-existing test (`test_p0_command_injection_via_env_vars`)
+    /// covered the case where the hook command does NOT reference the
+    /// env var. This new test covers the harder case: hook command
+    /// USES the env var unquoted, env value contains a newline, and
+    /// the injected post-newline command must NOT execute.
+    #[tokio::test]
+    async fn test_security_p0_env_newline_does_not_inject() {
+        let tmp = std::env::temp_dir().join("forge_hook_env_newline_test");
+        let _ = std::fs::remove_file(&tmp);
+
+        // Hook uses unquoted $FORGE_FILE_PATH — the sanitizer is the
+        // only thing standing between newline injection and command exec.
+        let runner = HookRunner::new(vec![HookConfig {
+            event: "after_tool".to_string(),
+            command: "echo $FORGE_FILE_PATH > /dev/null".to_string(),
+            tool: None,
+            description: None,
+            timeout_ms: 5000,
+        }]);
+        let mut env = HashMap::new();
+        env.insert(
+            "FORGE_FILE_PATH".to_string(),
+            format!("/tmp/legit\ntouch {}", tmp.display()),
+        );
+        let result = runner.run("after_tool", &env).await;
+        assert!(result.is_ok());
+
+        // Sanitizer should have replaced newline with space, so the
+        // injected `touch` becomes part of the echo argument list,
+        // not a separate command.
+        assert!(
+            !tmp.exists(),
+            "Newline-based env injection succeeded — CAT 1 violation"
+        );
     }
 }
