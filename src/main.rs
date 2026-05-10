@@ -186,24 +186,51 @@ async fn main() -> Result<()> {
                 }
                 std::fs::create_dir_all(&dest)?;
 
-                // Try huggingface-cli first, fall back to direct download hint
-                let status = std::process::Command::new("huggingface-cli")
-                    .args(["download", &name, "--local-dir", &dest.to_string_lossy()])
-                    .status();
+                // Try the modern `hf` CLI first (huggingface_hub >=1.0
+                // renamed the binary from `huggingface-cli` to `hf`), then
+                // fall back to the legacy name, then surface install
+                // instructions if neither is found.
+                //
+                // BUG FIX (2026-05-09): pre-fix this only tried
+                // `huggingface-cli` and broke installs on machines with the
+                // newer huggingface_hub 1.3+ which ships `hf` only.
+                let candidates: &[&[&str]] = &[
+                    &["hf", "download"],
+                    &["huggingface-cli", "download"],
+                ];
 
-                match status {
-                    Ok(s) if s.success() => {
-                        println!("Model installed to {}", dest.display());
-                        println!("Activate with: forge model use {name}");
+                let mut succeeded = false;
+                for argv in candidates {
+                    let mut cmd = std::process::Command::new(argv[0]);
+                    cmd.arg(argv[1])
+                        .arg(&name)
+                        .args(["--local-dir", &dest.to_string_lossy()]);
+                    match cmd.status() {
+                        Ok(s) if s.success() => {
+                            succeeded = true;
+                            break;
+                        }
+                        // Binary not found — try the next candidate.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        // Binary ran but failed (auth, network, repo not
+                        // found, etc.) — surface and stop trying.
+                        _ => break,
                     }
-                    _ => {
-                        // Clean up empty dir
-                        let _ = std::fs::remove_dir(&dest);
-                        eprintln!("huggingface-cli not found or download failed.");
-                        eprintln!("Install it with: pip install huggingface-hub");
-                        eprintln!("Or manually download the model to: {}", dest.display());
-                        std::process::exit(1);
-                    }
+                }
+
+                if succeeded {
+                    println!("Model installed to {}", dest.display());
+                    println!("Activate with: forge model use {name}");
+                } else {
+                    // Clean up empty dir
+                    let _ = std::fs::remove_dir(&dest);
+                    eprintln!("Model download failed.");
+                    eprintln!("Install the HuggingFace CLI with one of:");
+                    eprintln!("  pipx install huggingface_hub   (recommended)");
+                    eprintln!("  pip install --user huggingface_hub");
+                    eprintln!("Forge looks for both `hf` (modern) and `huggingface-cli` (legacy).");
+                    eprintln!("Or manually download the model to: {}", dest.display());
+                    std::process::exit(1);
                 }
             }
             ModelAction::Use { name } => {
