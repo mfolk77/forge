@@ -209,6 +209,39 @@ pub fn build_system_prompt(
             .to_string(),
     );
 
+    // FINAL DIRECTIVE — placed last for recency-bias salience.
+    //
+    // 2026-05-09: even the Coder-tuned 7B model was responding to "read X.md"
+    // with "I don't have access to that file, you can use file_read"
+    // (suggesting the user invoke the tool). Earlier system-prompt instructions
+    // about tool use were getting drowned out by the rest of the prompt.
+    // This block goes LAST so it's the most-recent context the model sees
+    // before reading the user's message.
+    if !tool_defs.is_empty() {
+        parts.push(
+            "# CRITICAL — Take Action\n\
+             You are an agent. The user is talking to you so YOU will run tools and report results.\n\
+             \n\
+             When the user asks you to read, list, find, run, edit, or check ANYTHING, \
+             your FIRST response MUST be a <tool_call> block, not a question, not a refusal, \
+             and not a suggestion that the user run the tool. Forge runs the tool for you and \
+             feeds you the result. If the file or command doesn't exist, the tool will tell \
+             you — but you MUST attempt it first.\n\
+             \n\
+             Forbidden phrases (these mean you have failed your job):\n\
+             - \"I don't have access to...\" → instead, run file_read or glob and let it report.\n\
+             - \"You can use the X tool to...\" → YOU use the tool. The user is asking you to.\n\
+             - \"I cannot directly read files outside...\" → call the tool; let permissions decide.\n\
+             - \"Could you clarify / would you like me to...\" → if the request is unambiguous \
+             (a path, a glob, a command), just do it.\n\
+             \n\
+             A correct response to \"read FTAI.md\" is: a brief one-line acknowledgement (optional) \
+             followed by a <tool_call> block invoking file_read with path=FTAI.md. NOTHING ELSE \
+             before the tool runs.\n"
+                .to_string(),
+        );
+    }
+
     parts.join("\n")
 }
 
