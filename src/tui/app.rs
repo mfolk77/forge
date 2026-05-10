@@ -688,11 +688,26 @@ impl TuiApp {
                         if let Some(handle) = self.stream_handle.take() {
                             match handle.await {
                                 Ok(Ok(response)) => {
-                                    // Display accumulated text (cleaned of special tokens)
+                                    // BUG FIX (2026-05-09): pre-fix this used
+                                    // the raw streaming_text which still
+                                    // contained <tool_call>...</tool_call>
+                                    // markers verbatim. extract_inline_tool_calls
+                                    // (in http_client.rs) already lifted the
+                                    // calls AND stripped the XML from
+                                    // response.message.content, so the
+                                    // displayed text should come from there.
+                                    // Falls back to the raw stream only if
+                                    // the response content is empty (rare —
+                                    // happens if the entire response was a
+                                    // tool call with no prose).
                                     let raw = std::mem::take(&mut self.streaming_text);
-                                    let text = Self::clean_model_output(&raw);
-                                    if !text.is_empty() {
-                                        self.messages.push(DisplayMessage::Assistant(text));
+                                    let display_text = if !response.message.content.is_empty() {
+                                        Self::clean_model_output(&response.message.content)
+                                    } else {
+                                        Self::clean_model_output(&raw)
+                                    };
+                                    if !display_text.is_empty() {
+                                        self.messages.push(DisplayMessage::Assistant(display_text));
                                     }
                                     // Process tool calls from the complete response
                                     self.process_response_after_stream(response).await?;
@@ -819,7 +834,24 @@ impl TuiApp {
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if self.is_generating {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                // BUG FIX (2026-05-09): pre-fix, this only flipped the
+                // is_generating flag, leaving the streaming JoinHandle
+                // running server-side. The HTTP request to MLX kept burning
+                // tokens until it naturally completed; the UI looked dead
+                // and the user had to force-quit forge to escape a
+                // small-model tool-call loop.
+                //
+                // Now we actively abort the streaming task and drop the
+                // token receiver so any pending tokens are discarded.
+                if let Some(handle) = self.stream_handle.take() {
+                    handle.abort();
+                }
+                self.token_rx = None;
+                self.streaming_text.clear();
                 self.is_generating = false;
+                self.messages.push(DisplayMessage::System(
+                    "Generation cancelled by Ctrl+C.".to_string(),
+                ));
             }
             return Ok(());
         }
