@@ -279,19 +279,38 @@ impl HardwareInfo {
     /// fast even on CPU, smarter than dense models of similar inference cost.
     pub fn recommended_model(&self) -> ModelRecommendation {
         match (&self.arch, &self.gpu, self.ram_gb) {
-            // Apple Silicon — MLX backend (safetensors, download whole repo)
+            // Apple Silicon — MLX backend (safetensors, download whole repo).
+            //
+            // CHOICE OF MODEL FAMILY (2026-05-09):
+            // Live testing showed non-Coder models (Qwen3.5-4B-4bit) get
+            // stuck in tool-call loops on multi-step agentic tasks. The
+            // *-Coder-Instruct family from Qwen2.5 is explicitly trained on
+            // tool-use behavior and is dramatically more reliable at this.
+            // We default to dense Coder variants sized to the RAM tier
+            // (verified to exist in mlx-community as of testing date):
+            //
+            //   - 32GB+ → 14B Coder (8.3 GB download, fits with margin)
+            //   - 16GB+ → 7B Coder (4.3 GB download, sweet spot)
+            //   - <16GB → 3B Coder (2 GB, still Coder-tuned > non-Coder 4B)
+            (CpuArch::AppleSilicon, _, ram) if ram >= 32 => ModelRecommendation {
+                name: "Qwen2.5-Coder-14B-Instruct-4bit".to_string(),
+                backend: crate::config::BackendType::Mlx,
+                size_gb: 9,
+                hf_repo: "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit".to_string(),
+                hf_file: None,
+            },
             (CpuArch::AppleSilicon, _, ram) if ram >= 16 => ModelRecommendation {
-                name: "Qwen3.5-35B-A3B-4bit".to_string(),
+                name: "Qwen2.5-Coder-7B-Instruct-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
                 size_gb: 5,
-                hf_repo: "mlx-community/Qwen3.5-35B-A3B-4bit".to_string(),
+                hf_repo: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".to_string(),
                 hf_file: None,
             },
             (CpuArch::AppleSilicon, _, _) => ModelRecommendation {
-                name: "Qwen3.5-4B-4bit".to_string(),
+                name: "Qwen2.5-Coder-3B-Instruct-4bit".to_string(),
                 backend: crate::config::BackendType::Mlx,
-                size_gb: 3,
-                hf_repo: "mlx-community/Qwen3.5-4B-4bit".to_string(),
+                size_gb: 2,
+                hf_repo: "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".to_string(),
                 hf_file: None,
             },
             // NVIDIA GPU or CPU-only — GGUF via llama.cpp (download single file)
@@ -364,7 +383,10 @@ mod tests {
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-4bit");
+        // 2026-05-09: switched from Qwen3.5-35B-A3B-4bit to a Coder-tuned
+        // 7B dense — small models without explicit Coder training were
+        // looping on multi-step tool tasks.
+        assert_eq!(rec.name, "Qwen2.5-Coder-7B-Instruct-4bit");
         assert_eq!(rec.backend, crate::config::BackendType::Mlx);
     }
 
@@ -376,7 +398,9 @@ mod tests {
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-4bit");
+        // 32GB tier moves up to dense 14B Coder (8.3 GB download, fits with
+        // headroom for KV cache + tools).
+        assert_eq!(rec.name, "Qwen2.5-Coder-14B-Instruct-4bit");
     }
 
     #[test]
