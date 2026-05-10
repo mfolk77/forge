@@ -196,10 +196,44 @@ pub fn escape_tool_result(text: &str) -> String {
     out
 }
 
-/// Core Qwen 3.5 XML parsing logic, exposed for reuse by recovery/streaming.
+/// Core Qwen XML tool-call parsing logic, exposed for reuse by recovery/streaming.
+///
+/// Handles two emission shapes the Qwen family produces:
+///
+/// 1. **Wrapped form** (Qwen3 / Qwen3-Coder native template):
+///    ```text
+///    <tool_call>
+///    <function=name>
+///    <parameter=key>value</parameter>
+///    </function>
+///    </tool_call>
+///    ```
+///
+/// 2. **Bare form** (Qwen2.5-Coder native style — no outer `<tool_call>`,
+///    often wrapped in markdown code fences):
+///    ```text
+///    <function=name>
+///    <parameter=key>value</parameter>
+///    </function>
+///    ```
+///
+/// SECURITY (CAT 7): The wrapped form is parsed AFTER `strip_code_fences`
+/// runs (so tool calls hidden in code-block examples are ignored). The
+/// bare form is parsed AFTER fences are stripped too — but if no bare
+/// `<function=>` calls are found in the stripped text, we make ONE more
+/// pass over the original (un-stripped) text looking for bare calls
+/// inside what looks like the model's actual emission (top-level fenced
+/// block, not nested in prose). This catches Qwen2.5-Coder's habit of
+/// fence-wrapping its own tool calls without sacrificing the
+/// example-code-block defense.
+///
+/// Defense-in-depth: even if a hostile pattern slips through, it's still
+/// gated by `hard_block_check`, `classify`, `check_permission`, and
+/// `ToolCallValidator` (tool-name allowlist + JSON schema).
 pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
-    // SECURITY (P0 #7): Strip markdown code fences before parsing to prevent
-    // extraction of tool calls from example/documentation code blocks.
+    let original = text;
+    // SECURITY (CAT 7): Strip markdown code fences before parsing the
+    // wrapped form to prevent extraction of tool calls from example code.
     let text = strip_code_fences(text);
 
     let block_re = Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap();
@@ -244,6 +278,87 @@ pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
                 arguments: args,
                 raw_text: block_raw.to_string(),
             });
+        }
+    }
+
+    // BARE-FORM FALLBACK (Qwen2.5-Coder style): if the wrapped <tool_call>
+    // form yielded nothing, scan for top-level <function=>...</function>
+    // blocks. Look in the stripped text first; if still empty AND the
+    // original text had a fenced block, scan inside the fence too.
+    if calls.is_empty() {
+        // Pass 1: stripped text (legitimate non-fenced bare emissions).
+        for func_cap in func_re.captures_iter(&text) {
+            let func_name = func_cap.get(1).unwrap().as_str().trim().to_string();
+            let func_body = func_cap.get(2).unwrap().as_str();
+            let raw = func_cap.get(0).unwrap().as_str().to_string();
+
+            let mut args = HashMap::new();
+            for param_cap in param_re.captures_iter(func_body) {
+                let key = param_cap.get(1).unwrap().as_str().trim().to_string();
+                let val = param_cap.get(2).unwrap().as_str();
+                if args.contains_key(&key) {
+                    eprintln!(
+                        "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
+                        key, func_name
+                    );
+                    continue;
+                }
+                let json_val = serde_json::from_str(val.trim())
+                    .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
+                args.insert(key, json_val);
+            }
+            calls.push(ParsedToolCall {
+                name: func_name,
+                arguments: args,
+                raw_text: raw,
+            });
+        }
+
+        // Pass 2: if still empty AND the original wrapped its tool call in a
+        // markdown fence (Qwen2.5-Coder habit), scan the original text WITHOUT
+        // stripping fences. We scope the scan tighter — only fenced blocks
+        // whose entire content matches a `<function=>...</function>` pattern,
+        // ignoring fenced blocks that contain prose around the tags (which
+        // would be example/documentation code, the original CAT 7 concern).
+        if calls.is_empty() {
+            let fence_re = Regex::new(r"(?s)```[^\n]*\n(.*?)```").unwrap();
+            for fence_cap in fence_re.captures_iter(original) {
+                let fence_body = fence_cap.get(1).unwrap().as_str().trim();
+                // Only treat as a tool call if the entire fence body is a
+                // single <function=>...</function> emission (no prose).
+                if let Some(func_cap) = func_re.captures(fence_body) {
+                    let full_match = func_cap.get(0).unwrap().as_str();
+                    if full_match.trim() != fence_body {
+                        // The fence has surrounding text — looks like an
+                        // example block, not a real tool emission. Skip.
+                        continue;
+                    }
+                    let func_name = func_cap.get(1).unwrap().as_str().trim().to_string();
+                    let func_body = func_cap.get(2).unwrap().as_str();
+                    let raw = func_cap.get(0).unwrap().as_str().to_string();
+
+                    let mut args = HashMap::new();
+                    for param_cap in param_re.captures_iter(func_body) {
+                        let key = param_cap.get(1).unwrap().as_str().trim().to_string();
+                        let val = param_cap.get(2).unwrap().as_str();
+                        if args.contains_key(&key) {
+                            eprintln!(
+                                "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
+                                key, func_name
+                            );
+                            continue;
+                        }
+                        let json_val = serde_json::from_str(val.trim())
+                            .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
+                        args.insert(key, json_val);
+                    }
+                    calls.push(ParsedToolCall {
+                        name: func_name,
+                        arguments: args,
+                        raw_text: raw,
+                    });
+                }
+            }
         }
     }
 
@@ -750,6 +865,101 @@ line three</parameter>
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "ask_user");
         assert!(calls[0].arguments.is_empty());
+    }
+
+    // ── Qwen2.5-Coder bare-form tolerance (LIVE-OBSERVED 2026-05-09) ────────
+
+    /// Qwen2.5-Coder-7B emitted `<function=NAME>...</function>` without
+    /// the `<tool_call>` wrapper. Pre-fix: parser saw nothing and Forge
+    /// returned control to the user. Post-fix: parser falls through to a
+    /// bare-form pass and extracts the call.
+    #[test]
+    fn test_qwen25_coder_bare_function_form_extracts() {
+        let input = r#"Sure! I'll read FTAI.md.
+
+<function=file_read>
+<parameter=path>FTAI.md</parameter>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1, "bare <function=> form must parse (Qwen2.5-Coder style)");
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "FTAI.md");
+    }
+
+    /// Qwen2.5-Coder-7B also frequently wraps its bare form in a markdown
+    /// code fence. Pre-fix: `strip_code_fences` deleted the entire fence
+    /// content, leaving nothing to parse. Post-fix: a second pass scans
+    /// fenced blocks whose ENTIRE content is a `<function=>` block (no
+    /// surrounding prose, which would indicate example code) and extracts
+    /// from those.
+    #[test]
+    fn test_qwen25_coder_fenced_bare_form_extracts() {
+        let input = "Sure! I'll read FTAI.md.\n\n```\n<function=file_read>\n<parameter=path>FTAI.md</parameter>\n</function>\n```\n";
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(
+            calls.len(),
+            1,
+            "fenced bare <function=> form must parse (Qwen2.5-Coder habit)"
+        );
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "FTAI.md");
+    }
+
+    /// SECURITY (CAT 7): the fenced-bare-form fallback must NOT extract
+    /// from a fence that has prose surrounding the tags — that's example
+    /// code, not a real tool emission. This was the original concern that
+    /// motivated `strip_code_fences`.
+    #[test]
+    fn test_security_fenced_bare_with_prose_does_not_extract() {
+        let input = "Here's an example of how the tool format works:\n\n```\nFor instance:\n<function=bash>\n<parameter=command>rm -rf /</parameter>\n</function>\nThat would be dangerous.\n```\n\nDoes that help?";
+        let calls = parse_qwen35_xml(input);
+        assert!(
+            calls.is_empty(),
+            "fenced block with prose around tags MUST NOT parse (CAT 7 — that's example code)"
+        );
+    }
+
+    /// SECURITY (CAT 7): code fences containing only NATURAL prose (no tags)
+    /// should still get stripped before the wrapped-form parse — i.e. the
+    /// existing CAT 7 defense for `<tool_call>` inside ```code``` still works.
+    #[test]
+    fn test_security_fenced_wrapped_call_still_blocked() {
+        let input = "Look at this example:\n\n```xml\n<tool_call>\n<function=bash>\n<parameter=command>rm -rf /</parameter>\n</function>\n</tool_call>\n```\n";
+        let calls = parse_qwen35_xml(input);
+        // The wrapped form inside a code fence is a known attack pattern.
+        // Note: with the new bare-form fallback, a fenced bare <function=> WITHOUT
+        // a `<tool_call>` wrapper IS extracted (Qwen2.5-Coder habit). The fenced
+        // wrapped form remains flagged because the wrapper signals "real call"
+        // semantics that an example block shouldn't carry. To preserve the
+        // original CAT 7 defense for the wrapped form, the fence-bare fallback
+        // skips fences whose content includes the wrapper.
+        //
+        // This test currently asserts that the wrapped-with-fence pattern
+        // does NOT parse via either path — preserving the defense.
+        assert!(
+            calls.is_empty(),
+            "wrapped <tool_call> inside markdown fence must remain blocked (CAT 7)"
+        );
+    }
+
+    /// Both forms together: model emits a wrapped tool_call AND a separate
+    /// bare function call. Wrapped form takes precedence; bare-form fallback
+    /// only fires when no wrapped calls were found. Avoids double-extraction.
+    #[test]
+    fn test_wrapped_form_preferred_over_bare_when_both_present() {
+        let input = r#"<tool_call>
+<function=glob>
+<parameter=pattern>*.rs</parameter>
+</function>
+</tool_call>
+
+<function=bash>
+<parameter=command>ls</parameter>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        // Wrapped form found → bare-form fallback is skipped.
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
     }
 
     // ── CAT 7 LLM-output-injection sanitization tests (AUDIT P0 #5) ────────
