@@ -121,8 +121,34 @@ pub fn build_system_prompt(
         ));
     }
 
-    // Tool descriptions (compact format for local model efficiency)
+    // Tool descriptions (compact format for local model efficiency).
+    //
+    // CRITICAL: include the EXACT call format the model must emit. Without
+    // this, small Coder-style models default to markdown ```bash blocks and
+    // hallucinate "Result:" sections — they pretend to run tools instead of
+    // emitting the XML Forge actually parses. Observed live with
+    // Qwen3.5-4B-4bit before this block was added.
     if !tool_defs.is_empty() {
+        parts.push(
+            "# Tool Use Protocol\n\
+             To run a tool you MUST emit this EXACT XML format. Do NOT wrap it \
+             in markdown code blocks. Do NOT write fake \"Result:\" sections — \
+             Forge runs the tool and feeds the real result back.\n\
+             \n\
+             <tool_call>\n\
+             <function=TOOL_NAME>\n\
+             <parameter=PARAM_NAME>PARAM_VALUE</parameter>\n\
+             </function>\n\
+             </tool_call>\n\
+             \n\
+             Rules:\n\
+             - One <tool_call> block per call. Multiple are allowed in one response.\n\
+             - Optional natural-language reasoning BEFORE the call is fine. NOTHING after the closing </tool_call>.\n\
+             - When the user asks you to read/list/find/run something, USE THE TOOL — do not refuse, do not ask permission, do not claim you lack access. The tools handle access.\n\
+             - Do NOT fabricate file names, directory contents, or command output. Run the tool and use the real result.\n"
+                .to_string(),
+        );
+
         parts.push("# Available Tools\n".to_string());
         for tool in tool_defs {
             let params_compact = compact_params(&tool.parameters);
@@ -701,6 +727,51 @@ mod tests {
     }
 
     // ── Appendix B: System prompt additions ─────────────────────────────
+
+    /// REGRESSION GUARD (CAT 7-adjacent — tool format must reach the model):
+    /// The "Tool Use Protocol" section was added after observing that
+    /// Qwen3.5-4B-4bit was wrapping fake tool calls in markdown code blocks
+    /// and hallucinating "Result:" sections. Without an explicit XML format
+    /// instruction in the prompt, the model never emits real <tool_call>
+    /// blocks and Forge's parser has nothing to extract.
+    ///
+    /// If a future "perf: compact prompt" commit removes this content, the
+    /// 4B model immediately stops working as an agentic tool-user. This test
+    /// is the canary.
+    #[test]
+    fn test_system_prompt_teaches_tool_call_xml_format() {
+        let path = PathBuf::from("/tmp/test-project");
+        let tools = vec![ToolDefinition {
+            name: "glob".into(),
+            description: "Find files".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let prompt = build_system_prompt(&path, &tools, None, None, None, &[], None, None);
+
+        // The model MUST be told the XML format explicitly.
+        assert!(
+            prompt.contains("<tool_call>"),
+            "system prompt MUST include <tool_call> example so the model emits the right format"
+        );
+        assert!(
+            prompt.contains("<function=TOOL_NAME>"),
+            "system prompt MUST show the function= attribute pattern"
+        );
+        assert!(
+            prompt.contains("<parameter=PARAM_NAME>"),
+            "system prompt MUST show the parameter= attribute pattern"
+        );
+        // Anti-hallucination instruction.
+        assert!(
+            prompt.contains("Do NOT") && prompt.contains("Result:"),
+            "system prompt MUST tell the model not to fabricate Result: sections"
+        );
+        // Anti-refusal instruction (the 'I cannot read files' / 'outside the project' refusals).
+        assert!(
+            prompt.contains("USE THE TOOL"),
+            "system prompt MUST tell the model to actually invoke tools when asked"
+        );
+    }
 
     // PRE-EXISTING REGRESSION (origin/main, commit 53ab3e0 "perf: compact
     // system prompt and pre-warm prompt cache on startup"): the prompt was
