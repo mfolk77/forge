@@ -104,6 +104,39 @@ If you're on an older binary, run `forge update`.
 
 Cosmetic only, self-corrects after the first turn. Tracked but not yet reproduced reliably for fixing — if you can capture it consistently on a fresh `forge` cold-start, please grab a screenshot and the order of operations that produced it.
 
+### Model gets stuck in a tool-call loop ("read this file" → reads → reads same file again → ...)
+
+This is a **small-model limitation**, not a Forge bug. Qwen3.5-4B-4bit (and similar 4B-class Coder models) have limited working memory across long conversations. Once a session crosses ~10K tokens of context, the model can lose track of which files it has already read and re-call the same tool repeatedly.
+
+**Symptoms:**
+- Same tool call (`file_read` on the same path, or `glob` with the same pattern) appearing turn after turn.
+- Response time stretching to ~60s per turn as conversation grows.
+- Model never converges on a final answer.
+
+**Mitigations, in order of effectiveness:**
+
+1. **Use a larger model.** A 9B+ dense Coder model is dramatically more reliable for multi-step agentic tasks. On Apple Silicon 32GB+, you can comfortably run a 9B-4bit (~5GB RAM). Install with:
+   ```
+   forge model install Qwen/Qwen3.5-9B-4bit
+   forge model use Qwen3.5-9B-4bit
+   ```
+   *(Verify the repo name on huggingface.co first; mlx-community usually mirrors Qwen releases.)*
+
+2. **Hit Ctrl+C to cancel** when you notice the loop. The cancel handler now properly aborts the in-flight request (fixed 2026-05-09).
+
+3. **Type a corrective prompt** like "Stop reading files. Summarize what you've found in 3 sentences." This usually breaks the loop on small models.
+
+4. **Forge has a hard safety limit** of 24 tool-calling iterations per turn (`MAX_CONTINUATION_TURNS` in `src/tui/app.rs`). The loop eventually breaks itself.
+
+If you're stuck on 16GB Apple Silicon and can't fit a larger model, prefer one-shot tasks over open-ended exploration with the 4B model. Ask "read CLAUDE.md and summarize" rather than "explore the codebase and tell me what you think."
+
+### Long sessions feel sluggish (~60s per turn after 10K+ tokens)
+
+Known limitation: MLX's prompt-cache flag isn't currently being utilized for incremental hits in Forge. Each turn re-processes the full prompt (~17K tokens at conversation depth). Investigation is logged for follow-up. Until then:
+
+- Use `/compact` proactively in long sessions to keep the prompt short.
+- Restart forge between distinct tasks instead of accumulating one long session.
+
 ### Session memory growing without bound
 
 Long-running sessions trigger Forge's 5-tier compaction system automatically:
