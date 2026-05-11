@@ -230,6 +230,72 @@ pub fn escape_tool_result(text: &str) -> String {
 /// Defense-in-depth: even if a hostile pattern slips through, it's still
 /// gated by `hard_block_check`, `classify`, `check_permission`, and
 /// `ToolCallValidator` (tool-name allowlist + JSON schema).
+/// Parse parameters out of a `<function=NAME>...</function>` body.
+///
+/// Tries the two parameter syntaxes the Qwen family produces:
+///   1. `<parameter=name>value</parameter>` (Qwen3 / Qwen3-Coder)
+///   2. `<name>value</name>` (Qwen2.5-Coder bare-form parameters)
+///
+/// If the parameter= form yields ≥1 entries, returns those. Otherwise falls
+/// back to direct-tag form. SECURITY (P0 #4): duplicate parameter names
+/// in either form keep only the first occurrence to defeat injection.
+fn parse_function_params(func_body: &str, func_name: &str) -> HashMap<String, serde_json::Value> {
+    let param_re = Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>").unwrap();
+    let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+
+    for cap in param_re.captures_iter(func_body) {
+        let key = cap.get(1).unwrap().as_str().trim().to_string();
+        let val = cap.get(2).unwrap().as_str();
+        if args.contains_key(&key) {
+            eprintln!(
+                "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
+                key, func_name
+            );
+            continue;
+        }
+        let json_val = serde_json::from_str(val.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
+        args.insert(key, json_val);
+    }
+
+    if !args.is_empty() {
+        return args;
+    }
+
+    // Fallback: Qwen2.5-Coder bare parameter tags. The model emits
+    // `<name>value</name>` directly inside `<function=NAME>...</function>`.
+    // Restrict to alphanumeric/underscore tag names so we don't false-
+    // positive on arbitrary HTML/XML inside parameter values.
+    //
+    // Rust's `regex` crate doesn't support backreferences, so we capture
+    // both tag names separately and verify equality in code.
+    let bare_re = Regex::new(
+        r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</([a-zA-Z_][a-zA-Z0-9_]*)>",
+    )
+    .unwrap();
+    for cap in bare_re.captures_iter(func_body) {
+        let open = cap.get(1).unwrap().as_str().trim();
+        let val = cap.get(2).unwrap().as_str();
+        let close = cap.get(3).unwrap().as_str().trim();
+        if open != close {
+            continue; // mismatched tags — not a parameter pair
+        }
+        let key = open.to_string();
+        if args.contains_key(&key) {
+            eprintln!(
+                "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
+                key, func_name
+            );
+            continue;
+        }
+        let json_val = serde_json::from_str(val.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
+        args.insert(key, json_val);
+    }
+
+    args
+}
+
 pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
     let original = text;
     // SECURITY (CAT 7): Strip markdown code fences before parsing the
@@ -238,7 +304,6 @@ pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
 
     let block_re = Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap();
     let func_re = Regex::new(r"(?s)<function=([^>]+)>(.*?)</function>").unwrap();
-    let param_re = Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>").unwrap();
 
     let mut calls = Vec::new();
 
@@ -249,29 +314,7 @@ pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
         for func_cap in func_re.captures_iter(block_body) {
             let func_name = func_cap.get(1).unwrap().as_str().trim().to_string();
             let func_body = func_cap.get(2).unwrap().as_str();
-
-            let mut args = HashMap::new();
-            for param_cap in param_re.captures_iter(func_body) {
-                let key = param_cap.get(1).unwrap().as_str().trim().to_string();
-                let val = param_cap.get(2).unwrap().as_str();
-
-                // SECURITY (P0 #4): Reject duplicate parameter names.
-                // An attacker can inject a second <parameter=path> tag after the
-                // legitimate one. HashMap::insert overwrites, so the LAST value
-                // wins -- the attacker's value. We keep only the FIRST occurrence.
-                if args.contains_key(&key) {
-                    eprintln!(
-                        "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
-                        key, func_name
-                    );
-                    continue;
-                }
-
-                // Try to parse as JSON first (numbers, bools, objects), fall back to string.
-                let json_val = serde_json::from_str(val.trim())
-                    .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
-                args.insert(key, json_val);
-            }
+            let args = parse_function_params(func_body, &func_name);
 
             calls.push(ParsedToolCall {
                 name: func_name,
@@ -291,22 +334,7 @@ pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
             let func_name = func_cap.get(1).unwrap().as_str().trim().to_string();
             let func_body = func_cap.get(2).unwrap().as_str();
             let raw = func_cap.get(0).unwrap().as_str().to_string();
-
-            let mut args = HashMap::new();
-            for param_cap in param_re.captures_iter(func_body) {
-                let key = param_cap.get(1).unwrap().as_str().trim().to_string();
-                let val = param_cap.get(2).unwrap().as_str();
-                if args.contains_key(&key) {
-                    eprintln!(
-                        "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
-                        key, func_name
-                    );
-                    continue;
-                }
-                let json_val = serde_json::from_str(val.trim())
-                    .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
-                args.insert(key, json_val);
-            }
+            let args = parse_function_params(func_body, &func_name);
             calls.push(ParsedToolCall {
                 name: func_name,
                 arguments: args,
@@ -336,22 +364,7 @@ pub fn parse_qwen35_xml(text: &str) -> Vec<ParsedToolCall> {
                     let func_name = func_cap.get(1).unwrap().as_str().trim().to_string();
                     let func_body = func_cap.get(2).unwrap().as_str();
                     let raw = func_cap.get(0).unwrap().as_str().to_string();
-
-                    let mut args = HashMap::new();
-                    for param_cap in param_re.captures_iter(func_body) {
-                        let key = param_cap.get(1).unwrap().as_str().trim().to_string();
-                        let val = param_cap.get(2).unwrap().as_str();
-                        if args.contains_key(&key) {
-                            eprintln!(
-                                "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
-                                key, func_name
-                            );
-                            continue;
-                        }
-                        let json_val = serde_json::from_str(val.trim())
-                            .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
-                        args.insert(key, json_val);
-                    }
+                    let args = parse_function_params(func_body, &func_name);
                     calls.push(ParsedToolCall {
                         name: func_name,
                         arguments: args,
@@ -940,6 +953,69 @@ line three</parameter>
             calls.is_empty(),
             "wrapped <tool_call> inside markdown fence must remain blocked (CAT 7)"
         );
+    }
+
+    // ── Qwen2.5-Coder direct-tag parameter form (LIVE-OBSERVED 2026-05-10) ──
+
+    /// Qwen2.5-Coder-7B emits parameter values using direct tag names
+    /// (`<path>value</path>`) instead of the `<parameter=path>` attribute
+    /// form. Pre-fix: parser found the `<function=>` block but extracted
+    /// zero parameters; ToolCallValidator correctly rejected the call with
+    /// "missing required parameter: path". Post-fix: the direct-tag form
+    /// is a fallback path inside parse_function_params, so `<path>value</path>`
+    /// extracts as `{ "path": "value" }`.
+    #[test]
+    fn test_qwen25_coder_direct_tag_params_extract() {
+        let input = r#"<function=file_read>
+<path>FTAI.md</path>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1, "direct-tag parameter form must parse");
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "FTAI.md");
+    }
+
+    /// Multiple direct-tag parameters: `<function=bash><command>ls</command></function>`
+    /// and similar must all extract.
+    #[test]
+    fn test_qwen25_coder_direct_tag_multiple_params() {
+        let input = r#"<function=bash>
+<command>ls -la</command>
+<timeout>5000</timeout>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+        // JSON parser tries first for numbers — 5000 parses as integer.
+        assert_eq!(calls[0].arguments["timeout"], 5000);
+    }
+
+    /// `<parameter=name>` form must STILL parse when present (Qwen3-Coder
+    /// path remains supported alongside the new Qwen2.5-Coder fallback).
+    #[test]
+    fn test_qwen3_parameter_attribute_form_still_works() {
+        let input = r#"<function=file_read>
+<parameter=path>FTAI.md</parameter>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "FTAI.md");
+    }
+
+    /// If both forms are present in the same body (shouldn't happen but
+    /// belt-and-suspenders), `<parameter=name>` form takes precedence
+    /// because it's checked first and produces results.
+    #[test]
+    fn test_parameter_attribute_form_preferred_over_direct_tag() {
+        let input = r#"<function=file_read>
+<parameter=path>real_path.md</parameter>
+<path>decoy_path.md</path>
+</function>"#;
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1);
+        // Parameter attribute form wins.
+        assert_eq!(calls[0].arguments["path"], "real_path.md");
     }
 
     /// Both forms together: model emits a wrapped tool_call AND a separate
