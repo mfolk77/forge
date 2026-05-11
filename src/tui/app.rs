@@ -481,17 +481,16 @@ impl TuiApp {
         // Enter TUI mode FIRST so the user can see the splash and exit
         terminal::enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
-        // NOTE (2026-05-10): We deliberately do NOT enable mouse capture.
-        // Mouse capture steals click-drag events from the terminal, which
-        // breaks the user's ability to select-to-copy chat content using
-        // their normal terminal mechanism. PgUp/PgDn keys still work for
-        // scrolling. Copy-paste matters more than scroll-wheel for a
-        // coding tool — without it, the chat is effectively read-only and
-        // the user can't get code out into another file or window.
-        //
-        // If we add scroll-wheel back later, do it under a config flag
-        // (config.tui.mouse_capture, default false) so users who never
-        // copy out of the chat can opt in.
+        // Enable mouse capture so scroll-wheel works for navigating chat.
+        // Tradeoff: native terminal click-drag selection is captured by
+        // the app. To copy text out of the chat, use the terminal's
+        // modifier-bypass:
+        //   - macOS Terminal / iTerm2: Option-drag to select, then ⌘C.
+        //   - Linux gnome-terminal: Shift-drag.
+        //   - Windows Terminal: Alt-drag.
+        // PgUp/PgDn and Shift+Up/Shift+Down also scroll without needing
+        // the mouse.
+        stdout().execute(crossterm::event::EnableMouseCapture)?;
         stdout().execute(crossterm::event::EnableBracketedPaste)?;
         let _guard = TerminalGuard; // restores terminal on any exit path
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
