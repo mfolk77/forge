@@ -722,13 +722,45 @@ impl TuiApp {
                                     self.process_response_after_stream(response).await?;
                                 }
                                 Ok(Err(e)) => {
+                                    // BUG FIX (2026-05-10): pre-fix, a
+                                    // streaming-finalization error would push
+                                    // only a 'Stream error: ...' system
+                                    // message and discard whatever tokens
+                                    // had already streamed in. The user
+                                    // watched the response render live for
+                                    // 5 minutes and then it vanished when
+                                    // the stream finalization errored on the
+                                    // last chunk — they saw the model
+                                    // produce the answer and then forge
+                                    // appeared to swallow it.
+                                    //
+                                    // Now we preserve whatever was streamed
+                                    // as an Assistant message BEFORE
+                                    // surfacing the stream error. Even a
+                                    // partial response is more useful than
+                                    // none.
+                                    let raw = std::mem::take(&mut self.streaming_text);
+                                    let partial = Self::clean_model_output(&raw);
+                                    if !partial.is_empty() {
+                                        self.messages.push(DisplayMessage::Assistant(partial));
+                                    }
                                     self.messages.push(DisplayMessage::System(
-                                        format!("Stream error: {e}"),
+                                        format!("Stream error (response above may be incomplete): {e}"),
                                     ));
                                 }
                                 Err(e) => {
+                                    // Same as the Ok(Err(_)) case: preserve
+                                    // whatever the user already saw streaming
+                                    // before reporting the panic, so the
+                                    // visible chat history matches what they
+                                    // observed.
+                                    let raw = std::mem::take(&mut self.streaming_text);
+                                    let partial = Self::clean_model_output(&raw);
+                                    if !partial.is_empty() {
+                                        self.messages.push(DisplayMessage::Assistant(partial));
+                                    }
                                     self.messages.push(DisplayMessage::System(
-                                        format!("Stream task panicked: {e}"),
+                                        format!("Stream task panicked (response above may be incomplete): {e}"),
                                     ));
                                 }
                             }
