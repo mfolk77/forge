@@ -264,33 +264,57 @@ fn parse_function_params(func_body: &str, func_name: &str) -> HashMap<String, se
 
     // Fallback: Qwen2.5-Coder bare parameter tags. The model emits
     // `<name>value</name>` directly inside `<function=NAME>...</function>`.
-    // Restrict to alphanumeric/underscore tag names so we don't false-
-    // positive on arbitrary HTML/XML inside parameter values.
     //
-    // Rust's `regex` crate doesn't support backreferences, so we capture
-    // both tag names separately and verify equality in code.
-    let bare_re = Regex::new(
-        r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</([a-zA-Z_][a-zA-Z0-9_]*)>",
-    )
-    .unwrap();
-    for cap in bare_re.captures_iter(func_body) {
-        let open = cap.get(1).unwrap().as_str().trim();
-        let val = cap.get(2).unwrap().as_str();
-        let close = cap.get(3).unwrap().as_str().trim();
-        if open != close {
-            continue; // mismatched tags — not a parameter pair
-        }
-        let key = open.to_string();
+    // CRITICAL: must NOT recurse into the value's own XML. For
+    // `<function=file_write><path>x.plist</path><content><?xml ...><dict><key>K</key><string>V</string></dict></content></function>`,
+    // the parameters are exactly `path` and `content` — the `<key>` and
+    // `<string>` tags INSIDE `<content>` belong to the file body, not the
+    // function arguments. A naive regex over all `<name>...</name>` pairs
+    // (the previous implementation) extracted nested tags as if they were
+    // parameters, triggered duplicate warnings on every nested `<string>`,
+    // and corrupted the content value.
+    //
+    // Correct approach: positional matching. Find the next top-level
+    // `<NAME>` opening tag. Find the first matching `</NAME>` after it.
+    // Take everything between as the value (preserving nested XML
+    // verbatim). Advance past the close tag. Repeat.
+    let open_re = Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_]*)>").unwrap();
+    let mut pos = 0;
+    while pos < func_body.len() {
+        let Some(open_match) = open_re.find_at(func_body, pos) else {
+            break;
+        };
+        let open_caps = open_re.captures(&func_body[open_match.start()..]).unwrap();
+        let key = open_caps.get(1).unwrap().as_str().to_string();
+        let value_start = open_match.end();
+        // Find the FIRST `</NAME>` after the opening tag.
+        let close_marker = format!("</{key}>");
+        let Some(close_offset) = func_body[value_start..].find(&close_marker) else {
+            // Open tag without matching close — skip past this opening tag
+            // and continue. (Could indicate a half-emitted parameter; safer
+            // to ignore than to consume the rest of the body.)
+            pos = open_match.end();
+            continue;
+        };
+        let value_end = value_start + close_offset;
+        let val = &func_body[value_start..value_end];
+
         if args.contains_key(&key) {
+            // SECURITY (P0 #4): true duplicate at this level (e.g. two top-
+            // level <path> tags emitted by the model) — keep first.
             eprintln!(
                 "[SECURITY] Duplicate parameter '{}' in tool call '{}' -- keeping first, ignoring duplicate",
                 key, func_name
             );
-            continue;
+        } else {
+            let json_val = serde_json::from_str(val.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
+            args.insert(key, json_val);
         }
-        let json_val = serde_json::from_str(val.trim())
-            .unwrap_or_else(|_| serde_json::Value::String(val.to_string()));
-        args.insert(key, json_val);
+
+        // Advance past this entire <NAME>...</NAME> block — do NOT recurse
+        // into the value's own XML.
+        pos = value_end + close_marker.len();
     }
 
     args
@@ -973,6 +997,45 @@ line three</parameter>
         assert_eq!(calls.len(), 1, "direct-tag parameter form must parse");
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[0].arguments["path"], "FTAI.md");
+    }
+
+    /// LIVE-OBSERVED 2026-05-10: when the model uses file_write with a
+    /// `<content>` parameter containing nested XML/plist tags, the parser
+    /// MUST treat the entire inner XML as the value — NOT recurse into
+    /// the inner `<key>` / `<string>` / etc. tags as if they were
+    /// parameters of the outer function.
+    ///
+    /// Pre-fix: naive regex matched every nested `<NAME>...</NAME>` pair
+    /// inside the body, treating `<string>` (a plist element) as a
+    /// `string` parameter. The duplicate-parameter security guard fired
+    /// dozens of times per call and the actual file content was
+    /// fragmented across what should have been ONE `content` parameter.
+    #[test]
+    fn test_file_write_with_nested_xml_content_does_not_recurse() {
+        let input = "<function=file_write>\n<path>Info.plist</path>\n<content>\n<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleName</key>\n<string>CalculatorApp</string>\n<key>CFBundleVersion</key>\n<string>1.0</string>\n</dict>\n</plist>\n</content>\n</function>";
+
+        let calls = parse_qwen35_xml(input);
+        assert_eq!(calls.len(), 1, "expected exactly one file_write call");
+        let call = &calls[0];
+        assert_eq!(call.name, "file_write");
+
+        // Exactly TWO top-level params: path and content. Nested <key> /
+        // <string> tags must NOT show up as parameters.
+        assert!(call.arguments.contains_key("path"), "path param missing");
+        assert!(call.arguments.contains_key("content"), "content param missing");
+        assert!(!call.arguments.contains_key("key"), "<key> from plist content must NOT be a param");
+        assert!(!call.arguments.contains_key("string"), "<string> from plist content must NOT be a param");
+        assert_eq!(call.arguments.len(), 2, "expected exactly 2 params (path, content)");
+
+        // The content value must include the complete plist body — nothing
+        // dropped, nothing fragmented.
+        let content = call.arguments["content"].as_str().unwrap_or_default();
+        assert!(content.contains("CFBundleName"));
+        assert!(content.contains("CalculatorApp"));
+        assert!(content.contains("CFBundleVersion"));
+        assert!(content.contains("1.0"));
+        assert!(content.contains("</dict>"));
+        assert!(content.contains("</plist>"));
     }
 
     /// Multiple direct-tag parameters: `<function=bash><command>ls</command></function>`
