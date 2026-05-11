@@ -104,11 +104,25 @@ impl ConversationEngine {
             && !(config.model.backend == crate::config::BackendType::Mlx
                 && config.model.tool_calling != crate::config::ToolCallingMode::Native);
 
+        // max_tokens: the per-response output limit. 4096 was too tight
+        // for substantial code generations and long documentation responses
+        // — users observed the model cut off mid-sentence (e.g. mid-list,
+        // mid-function-body) when explaining/dumping engineering rules,
+        // generating a multi-file SwiftUI app, etc. We give 75% of the
+        // remaining context window after the system prompt + conversation,
+        // so a 32K-context model with 10K used gets ~16K for the response
+        // (capped at 16K to keep generation latency bounded — even a 4B
+        // model spends real wall time per token).
+        let used_tokens = self.estimated_request_tokens(chat_mode);
+        let remaining = self.max_context_tokens.saturating_sub(used_tokens);
+        let target_output_budget = (remaining * 3) / 4;
+        let max_tokens = target_output_budget.clamp(1024, 16384);
+
         ChatRequest {
             messages,
             tools: if use_native_tools { self.tools.clone() } else { vec![] },
             temperature: config.model.temperature,
-            max_tokens: Some(4096),
+            max_tokens: Some(max_tokens),
             model_id: config.model.path.as_deref()
                 .map(|p| crate::backend::manager::BackendManager::resolve_path(p)),
         }
