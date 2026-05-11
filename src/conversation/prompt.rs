@@ -217,16 +217,32 @@ pub fn build_system_prompt(
     // about tool use were getting drowned out by the rest of the prompt.
     // This block goes LAST so it's the most-recent context the model sees
     // before reading the user's message.
+    //
+    // 2026-05-10: extended after observing that Qwen2.5-Coder-7B writes
+    // correct code as TEXT in the chat instead of using file_write to
+    // actually create files when asked to "build an app." Added explicit
+    // CREATE-mode directive.
     if !tool_defs.is_empty() {
         parts.push(
             "# CRITICAL — Take Action\n\
              You are an agent. The user is talking to you so YOU will run tools and report results.\n\
              \n\
-             When the user asks you to read, list, find, run, edit, or check ANYTHING, \
-             your FIRST response MUST be a <tool_call> block, not a question, not a refusal, \
+             ## READ requests (read/list/find/check/show/explain)\n\
+             When the user asks you to read, list, find, run, or check ANYTHING, \
+             your FIRST response MUST be a tool call, not a question, not a refusal, \
              and not a suggestion that the user run the tool. Forge runs the tool for you and \
              feeds you the result. If the file or command doesn't exist, the tool will tell \
              you — but you MUST attempt it first.\n\
+             \n\
+             ## CREATE/EDIT requests (build/create/make/write/edit/implement/add/scaffold)\n\
+             When the user asks you to CREATE files or BUILD something, you MUST use the \
+             write tools (file_write to create a new file with content; file_edit to modify \
+             an existing file; bash to run mkdir/cp/git/etc.). Do NOT write code as text in \
+             the chat and call it done — text in the chat does not exist on disk and the \
+             user cannot run it. A request like \"create a calculator app in Swift\" means \
+             call file_write multiple times (one per source file) and bash for project \
+             scaffolding, NOT \"here are the files you should create...\" followed by \
+             pasted code.\n\
              \n\
              Forbidden phrases (these mean you have failed your job):\n\
              - \"I don't have access to...\" → instead, run file_read or glob and let it report.\n\
@@ -234,10 +250,18 @@ pub fn build_system_prompt(
              - \"I cannot directly read files outside...\" → call the tool; let permissions decide.\n\
              - \"Could you clarify / would you like me to...\" → if the request is unambiguous \
              (a path, a glob, a command), just do it.\n\
+             - \"Here is the code you should put in <filename>...\" → instead, call \
+             file_write with path=<filename> and that code as content.\n\
+             - \"Step 1: open Xcode and create...\" → instead, run bash for the scaffolding \
+             and file_write for the source files.\n\
              \n\
-             A correct response to \"read FTAI.md\" is: a brief one-line acknowledgement (optional) \
-             followed by a <tool_call> block invoking file_read with path=FTAI.md. NOTHING ELSE \
-             before the tool runs.\n"
+             A correct response to \"create a calculator app in Swift\" is a sequence of \
+             tool calls — bash for mkdir / swift package init, then file_write for each \
+             source file. NOT a markdown walkthrough.\n\
+             \n\
+             A correct response to \"read FTAI.md\" is: a brief one-line acknowledgement \
+             (optional) followed by a tool call invoking file_read with path=FTAI.md. \
+             NOTHING ELSE before the tool runs.\n"
                 .to_string(),
         );
     }
