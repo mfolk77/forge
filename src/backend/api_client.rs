@@ -903,6 +903,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         let client = ApiClient::from_config(&config);
         assert!(client.is_ok());
@@ -922,6 +923,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         let result = ApiClient::from_config(&config);
         assert!(result.is_err());
@@ -938,6 +940,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         assert_eq!(resolve_api_key(&config), Some("direct-key".to_string()));
     }
@@ -953,6 +956,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         assert_eq!(resolve_api_key(&config), Some("env-key-value".to_string()));
         std::env::remove_var("TEST_FALLBACK_KEY");
@@ -968,6 +972,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         assert_eq!(resolve_api_key(&config), None);
     }
@@ -983,6 +988,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         assert_eq!(resolve_api_key(&config), Some("from-env".to_string()));
         std::env::remove_var("TEST_EMPTY_DIRECT_KEY");
@@ -1010,6 +1016,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         let client = ApiClient::from_config(&config).unwrap();
 
@@ -1067,6 +1074,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         let client = ApiClient::from_config(&config).unwrap();
 
@@ -1138,6 +1146,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         // Empty key should not resolve
         assert_eq!(resolve_api_key(&config), None);
@@ -1157,6 +1166,7 @@ mod tests {
             model: "test".into(),
             base_url: None,
             max_tokens: 4096,
+            fallback: false,
         };
         let client = ApiClient::from_config(&config).unwrap();
 

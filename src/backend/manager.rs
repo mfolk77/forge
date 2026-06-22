@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 
-use crate::config::{BackendType, Config};
+use crate::config::{BackendType, Config, CriticBackend};
 use super::api_client::ApiClient;
 use super::http_client::HttpModelClient;
 use super::llamacpp::LlamaCppServer;
+use super::lemonade::LemonadeServer;
 use super::mlx::MlxServer;
 use super::types::{ChatRequest, ChatResponse, HardwareInfo, Token, ToolDefinition};
 use tokio::sync::mpsc;
 
 const LLAMACPP_PORT: u16 = 8411;
 const MLX_PORT: u16 = 8412;
+/// Critic model runs as a second llama-server on its own port (8411 = proposer).
+const CRITIC_PORT: u16 = 8413;
 
 /// Manages the active model backend
 pub enum BackendManager {
@@ -20,6 +23,8 @@ pub enum BackendManager {
     External(HttpModelClient),
     /// Cloud API backend (Anthropic, OpenAI, etc.)
     Api(ApiClient),
+    /// lemonade-server sidecar — runs a model on the AMD NPU.
+    Lemonade(LemonadeServer),
 }
 
 impl BackendManager {
@@ -60,10 +65,93 @@ impl BackendManager {
         }
     }
 
+    /// Build the adversarial critic backend, if configured and enabled.
+    /// Returns `None` when the critic is disabled or has no model path — the caller
+    /// then runs single-model (proposer-only) with no behavior change.
+    pub fn from_critic_config(config: &Config) -> Option<Self> {
+        if !config.critic.enabled {
+            return None;
+        }
+        match config.critic.backend {
+            CriticBackend::LlamaCpp => config
+                .critic
+                .path
+                .as_ref()
+                .map(|_| BackendManager::LlamaCpp(LlamaCppServer::new(CRITIC_PORT))),
+            CriticBackend::Lemonade => config.critic.model.as_ref().map(|model| {
+                BackendManager::Lemonade(LemonadeServer::new(
+                    config.critic.lemonade_port,
+                    model.clone(),
+                ))
+            }),
+        }
+    }
+
+    /// Build a cloud API client to use as a FALLBACK when the local model fails.
+    /// Returns `None` unless `api.enabled && api.fallback` and a key resolves.
+    /// (When `api.enabled && !api.fallback`, the API is the *primary* backend and is
+    /// wired via `from_config` instead — not here.)
+    pub fn api_fallback_from_config(config: &Config) -> Option<Self> {
+        if !(config.api.enabled && config.api.fallback) {
+            return None;
+        }
+        if super::api_client::resolve_api_key(&config.api).is_none() {
+            eprintln!("Warning: API fallback enabled but no API key found. Fallback disabled.");
+            return None;
+        }
+        match ApiClient::from_config(&config.api) {
+            Ok(client) => Some(BackendManager::Api(client)),
+            Err(e) => {
+                eprintln!("Warning: API fallback configured but failed to initialize: {e}");
+                None
+            }
+        }
+    }
+
     /// Create a backend that connects to an external server
     #[allow(dead_code)]
     pub fn external(base_url: &str) -> Self {
         BackendManager::External(HttpModelClient::new(base_url))
+    }
+
+    /// Spawn a local llama-server with explicit parameters (used by the critic,
+    /// which spawns from `config.critic.*` rather than `config.model.*`).
+    /// No-op for non-llama.cpp backends.
+    pub fn spawn_only_with(
+        &mut self,
+        model_path: &str,
+        gpu_layers: i32,
+        threads: usize,
+        context_length: usize,
+    ) -> Result<()> {
+        let resolved = Self::resolve_path(model_path);
+        match self {
+            BackendManager::LlamaCpp(server) => {
+                server.spawn_only(&resolved, gpu_layers, threads, context_length)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Spawn the critic backend from `config.critic.*`. Dispatches on the critic
+    /// backend type: llama.cpp spawns a llama-server; lemonade spawns lemond.exe.
+    pub fn spawn_critic(&mut self, config: &Config) -> Result<()> {
+        match self {
+            BackendManager::Lemonade(server) => server.spawn_only(),
+            _ => {
+                let path = config
+                    .critic
+                    .path
+                    .as_deref()
+                    .context("Critic enabled but no critic.path configured")?;
+                self.spawn_only_with(
+                    path,
+                    config.critic.llamacpp.gpu_layers,
+                    config.critic.llamacpp.threads,
+                    config.critic.context_length,
+                )
+            }
+        }
     }
 
     /// Resolve a bare model name to a full local path.
@@ -110,6 +198,7 @@ impl BackendManager {
     pub async fn wait_until_ready(&mut self) -> Result<()> {
         match self {
             BackendManager::LlamaCpp(server) => server.wait_until_ready().await,
+            BackendManager::Lemonade(server) => server.wait_until_ready().await,
             _ => Ok(()),
         }
     }
@@ -151,6 +240,10 @@ impl BackendManager {
                         // External server is already running
                         Ok(())
                     }
+                    BackendManager::Lemonade(server) => {
+                        server.spawn_only()?;
+                        server.wait_until_ready().await
+                    }
                     BackendManager::Api(_) => unreachable!(),
                 }
             }
@@ -163,6 +256,7 @@ impl BackendManager {
         match self {
             BackendManager::LlamaCpp(server) => server.stop(),
             BackendManager::Mlx(server) => server.stop(),
+            BackendManager::Lemonade(server) => server.stop(),
             BackendManager::External(_) => {}
             BackendManager::Api(_) => {}
         }
@@ -173,6 +267,7 @@ impl BackendManager {
             BackendManager::LlamaCpp(server) => Some(server.client()),
             BackendManager::Mlx(server) => Some(server.client()),
             BackendManager::External(client) => Some(client),
+            BackendManager::Lemonade(server) => Some(server.client()),
             BackendManager::Api(_) => None,
         }
     }
@@ -231,6 +326,39 @@ impl BackendManager {
         let _ = self.generate(&request).await;
     }
 
+    /// Pre-warm the prompt cache WITHOUT blocking the caller. Clones the HTTP client
+    /// and spawns a fire-and-forget task, so the TUI stays fully responsive while the
+    /// (slow) system-prompt prefill runs in the background. No-op for the cloud API
+    /// backend (nothing local to warm).
+    pub fn warm_up_prompt_background(&self, system_prompt: String, tools: Vec<ToolDefinition>) {
+        let Some(client) = self.http_client().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let request = ChatRequest {
+                messages: vec![
+                    crate::backend::types::Message {
+                        role: crate::backend::types::Role::System,
+                        content: system_prompt,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    crate::backend::types::Message {
+                        role: crate::backend::types::Role::User,
+                        content: "hi".to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+                temperature: 0.0,
+                max_tokens: Some(1),
+                model_id: None,
+                tools,
+            };
+            let _ = client.generate(&request).await;
+        });
+    }
+
     /// Get hardware info and model recommendation
     pub fn hardware_info() -> HardwareInfo {
         HardwareInfo::detect()
@@ -242,6 +370,7 @@ impl BackendManager {
             BackendManager::Mlx(_) => "MLX",
             BackendManager::External(_) => "external",
             BackendManager::Api(_) => "api",
+            BackendManager::Lemonade(_) => "lemonade",
         }
     }
 
@@ -316,6 +445,79 @@ mod tests {
     fn test_external_backend() {
         let manager = BackendManager::external("http://localhost:11434");
         assert_eq!(manager.backend_name(), "external");
+    }
+
+    #[test]
+    fn test_from_critic_config_disabled_returns_none() {
+        let config = Config::default(); // critic disabled by default
+        assert!(BackendManager::from_critic_config(&config).is_none());
+    }
+
+    #[test]
+    fn test_from_critic_config_enabled_without_path_returns_none() {
+        let mut config = Config::default();
+        config.critic.enabled = true; // but no path
+        assert!(BackendManager::from_critic_config(&config).is_none());
+    }
+
+    #[test]
+    fn test_from_critic_config_enabled_with_path() {
+        let mut config = Config::default();
+        config.critic.enabled = true;
+        config.critic.path = Some("/models/critic.gguf".to_string());
+        let critic = BackendManager::from_critic_config(&config);
+        assert!(critic.is_some());
+        assert_eq!(critic.unwrap().backend_name(), "llama.cpp");
+    }
+
+    #[test]
+    fn test_from_critic_config_lemonade_backend() {
+        let mut config = Config::default();
+        config.critic.enabled = true;
+        config.critic.backend = crate::config::CriticBackend::Lemonade;
+        config.critic.model = Some("Qwen2.5-7B-Instruct-NPU".to_string());
+        let critic = BackendManager::from_critic_config(&config);
+        assert!(critic.is_some());
+        assert_eq!(critic.unwrap().backend_name(), "lemonade");
+    }
+
+    #[test]
+    fn test_from_critic_config_lemonade_without_model_returns_none() {
+        let mut config = Config::default();
+        config.critic.enabled = true;
+        config.critic.backend = crate::config::CriticBackend::Lemonade;
+        // no model set
+        assert!(BackendManager::from_critic_config(&config).is_none());
+    }
+
+    #[test]
+    fn test_api_fallback_requires_enabled_and_fallback_flags() {
+        std::env::set_var("TEST_FALLBACK_MGR_KEY", "sk-test-fallback");
+        let mut config = Config::default();
+        config.api.api_key_env = Some("TEST_FALLBACK_MGR_KEY".into());
+
+        // enabled but fallback=false → not a fallback (API would be primary instead)
+        config.api.enabled = true;
+        config.api.fallback = false;
+        assert!(BackendManager::api_fallback_from_config(&config).is_none());
+
+        // enabled AND fallback=true → fallback client
+        config.api.fallback = true;
+        let fb = BackendManager::api_fallback_from_config(&config);
+        assert!(fb.is_some());
+        assert_eq!(fb.unwrap().backend_name(), "api");
+
+        std::env::remove_var("TEST_FALLBACK_MGR_KEY");
+    }
+
+    #[test]
+    fn test_api_fallback_disabled_when_no_key() {
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.fallback = true;
+        config.api.api_key = None;
+        config.api.api_key_env = Some("NONEXISTENT_FALLBACK_KEY_98765".into());
+        assert!(BackendManager::api_fallback_from_config(&config).is_none());
     }
 
     #[test]

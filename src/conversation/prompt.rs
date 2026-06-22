@@ -43,6 +43,53 @@ fn compact_params(schema: &serde_json::Value) -> String {
     }
 }
 
+/// Core tools the model reaches for constantly — worth their full parameter detail.
+fn is_core_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "file_read"
+            | "file_write"
+            | "file_edit"
+            | "glob"
+            | "grep"
+            | "git"
+            | "agent_spawn"
+            | "task"
+            | "request_permissions"
+    )
+}
+
+/// Ultra-compact param rendering for less-used (extended) tools: one line of
+/// `name (type[, required])` with NO descriptions. Keeps the tool fully callable
+/// (the model still sees every parameter name + type) while cutting the bulk of
+/// the system-prompt weight that comes from per-parameter descriptions.
+fn minimal_params(schema: &serde_json::Value) -> String {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return String::new();
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if props.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = props
+        .iter()
+        .map(|(name, def)| {
+            let typ = def.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+            if required.contains(&name.as_str()) {
+                format!("{name} ({typ}, required)")
+            } else {
+                format!("{name} ({typ})")
+            }
+        })
+        .collect();
+    format!("Params: {}", list.join(", "))
+}
+
 /// Load FTAI.md / context.ftai from global and project layers.
 /// Priority: FTAI.md first, then context.ftai. Both layers concatenated.
 pub fn load_ftai_context(project_path: &Path) -> Option<String> {
@@ -104,7 +151,7 @@ pub fn build_system_prompt(
 
     // Core identity
     parts.push(format!(
-        "You are FTAI, a FolkTech AI terminal coding assistant. \
+        "You are Forge, a FolkTech AI terminal coding assistant. \
          You help users with software engineering tasks by reading, writing, and editing code, \
          running commands, and managing git operations.\n\
          \n\
@@ -121,17 +168,19 @@ pub fn build_system_prompt(
         ));
     }
 
-    // Tool descriptions (compact format for local model efficiency)
+    // Tool descriptions (compact format for local model efficiency).
+    // Core tools get full parameter detail; extended tools get a one-line param
+    // list (names + types only) to keep the always-on prompt lean — they stay
+    // callable, just without verbose per-parameter descriptions.
     if !tool_defs.is_empty() {
         parts.push("# Available Tools\n".to_string());
         for tool in tool_defs {
-            let params_compact = compact_params(&tool.parameters);
-            parts.push(format!(
-                "## {}\n{}\n{}\n",
-                tool.name,
-                tool.description,
-                params_compact
-            ));
+            let params = if is_core_tool(&tool.name) {
+                compact_params(&tool.parameters)
+            } else {
+                minimal_params(&tool.parameters)
+            };
+            parts.push(format!("## {}\n{}\n{}\n", tool.name, tool.description, params));
         }
     }
 
@@ -355,7 +404,7 @@ mod tests {
     fn test_build_system_prompt_basic() {
         let path = PathBuf::from("/tmp/test-project");
         let prompt = build_system_prompt(&path, &[], None, None, None, &[], None, None);
-        assert!(prompt.contains("FTAI"));
+        assert!(prompt.contains("Forge")); // identity (was "FTAI" before the rename)
         assert!(prompt.contains("/tmp/test-project"));
     }
 

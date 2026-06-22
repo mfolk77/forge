@@ -8,6 +8,7 @@ use super::types::{
 };
 
 /// OpenAI-compatible HTTP client for local model servers
+#[derive(Clone)]
 pub struct HttpModelClient {
     client: reqwest::Client,
     base_url: String,

@@ -25,6 +25,9 @@ pub struct Config {
     pub hooks: Vec<HookConfig>,
     #[serde(default)]
     pub api: ApiConfig,
+    /// Adversarial critic model (proposer → critic loop). Off by default.
+    #[serde(default)]
+    pub critic: CriticConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +43,11 @@ pub struct ApiConfig {
     /// Override the provider's default base URL
     pub base_url: Option<String>,
     pub max_tokens: usize,
+    /// When true, the API is used only as a FALLBACK when the local model fails
+    /// (server crash, generation error). Local stays primary. When false and
+    /// `enabled` is true, the API is the primary backend (legacy behavior).
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 impl Default for ApiConfig {
@@ -52,6 +60,66 @@ impl Default for ApiConfig {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             max_tokens: 8192,
+            fallback: false,
+        }
+    }
+}
+
+/// Which inference backend runs the critic model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CriticBackend {
+    /// llama.cpp (GGUF) — runs on CPU/GPU like the proposer.
+    LlamaCpp,
+    /// lemonade-server (lemond.exe) — runs the critic on the AMD NPU via Ryzen AI.
+    Lemonade,
+}
+
+/// When the adversarial critic reviews the proposer's output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CriticTrigger {
+    /// Review only the final answer of a user turn (after the tool loop settles). Default.
+    Final,
+    /// Review every assistant message (expensive).
+    Always,
+    /// Review only when the final answer contains code.
+    CodeOnly,
+}
+
+/// Adversarial critic model — a second model that reviews the proposer's output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CriticConfig {
+    pub enabled: bool,
+    /// Which backend runs the critic (llama.cpp on CPU/GPU, or lemonade on the NPU).
+    pub backend: CriticBackend,
+    /// GGUF path for the critic model (used when `backend = "llamacpp"`).
+    pub path: Option<String>,
+    /// Lemonade model name (used when `backend = "lemonade"`), e.g. "Qwen2.5-7B-Instruct-NPU".
+    pub model: Option<String>,
+    /// Port for the lemonade-server sidecar (used when `backend = "lemonade"`).
+    pub lemonade_port: u16,
+    pub context_length: usize,
+    /// Maximum proposer revision rounds triggered by critic feedback.
+    pub max_rounds: usize,
+    pub trigger: CriticTrigger,
+    pub llamacpp: LlamaCppConfig,
+}
+
+impl Default for CriticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: CriticBackend::LlamaCpp,
+            path: None,
+            model: None,
+            lemonade_port: 13305,
+            context_length: 8192,
+            max_rounds: 1,
+            trigger: CriticTrigger::Final,
+            // Critic defaults to CPU so it doesn't contend with the proposer for the iGPU.
+            llamacpp: LlamaCppConfig { gpu_layers: 0, threads: 8 },
         }
     }
 }
@@ -207,6 +275,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             hooks: Vec::new(),
             api: ApiConfig::default(),
+            critic: CriticConfig::default(),
         }
     }
 }
@@ -416,6 +485,18 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             model: override_cfg.api.model,
             base_url: override_cfg.api.base_url.or(base.api.base_url),
             max_tokens: override_cfg.api.max_tokens,
+            fallback: override_cfg.api.fallback,
+        },
+        critic: CriticConfig {
+            enabled: override_cfg.critic.enabled,
+            backend: override_cfg.critic.backend,
+            path: override_cfg.critic.path.or(base.critic.path),
+            model: override_cfg.critic.model.or(base.critic.model),
+            lemonade_port: override_cfg.critic.lemonade_port,
+            context_length: override_cfg.critic.context_length,
+            max_rounds: override_cfg.critic.max_rounds,
+            trigger: override_cfg.critic.trigger,
+            llamacpp: override_cfg.critic.llamacpp,
         },
     }
 }
@@ -509,8 +590,12 @@ mode = "ask"
 
     #[test]
     fn test_load_config_defaults() {
+        // load_config(None) reads the user's real global config if present, so assert a
+        // valid context rather than a hardcoded default (the global config is user-tunable).
         let config = load_config(None).unwrap();
-        assert_eq!(config.model.context_length, 32768);
+        assert!(config.model.context_length > 0);
+        // The in-code default (no file) is 32768.
+        assert_eq!(Config::default().model.context_length, 32768);
     }
 
     #[test]
@@ -588,6 +673,130 @@ mode = "ask"
         assert!(!dir_name.contains('\\'));
         assert!(!dir_name.contains('/'));
         assert!(!dir_name.starts_with('-'));
+    }
+
+    #[test]
+    fn test_critic_config_defaults() {
+        let config = Config::default();
+        assert!(!config.critic.enabled);
+        assert_eq!(config.critic.context_length, 8192);
+        assert_eq!(config.critic.max_rounds, 1);
+        assert_eq!(config.critic.trigger, CriticTrigger::Final);
+        // Critic defaults to CPU to avoid contending with the proposer for the iGPU.
+        assert_eq!(config.critic.llamacpp.gpu_layers, 0);
+    }
+
+    #[test]
+    fn test_critic_config_from_toml() {
+        let toml_str = r#"
+[critic]
+enabled = true
+path = "C:/Users/mfolk/Models/Qwen3.5-9B-Q4_K_M.gguf"
+context_length = 8192
+max_rounds = 2
+trigger = "code-only"
+
+[critic.llamacpp]
+gpu_layers = 0
+threads = 8
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.critic.enabled);
+        assert_eq!(config.critic.max_rounds, 2);
+        assert_eq!(config.critic.trigger, CriticTrigger::CodeOnly);
+        assert_eq!(
+            config.critic.path.as_deref(),
+            Some("C:/Users/mfolk/Models/Qwen3.5-9B-Q4_K_M.gguf")
+        );
+    }
+
+    #[test]
+    fn test_critic_config_roundtrip() {
+        let mut config = Config::default();
+        config.critic.enabled = true;
+        config.critic.path = Some("/models/critic.gguf".to_string());
+        config.critic.trigger = CriticTrigger::Always;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.critic.enabled);
+        assert_eq!(parsed.critic.trigger, CriticTrigger::Always);
+        assert_eq!(parsed.critic.path.as_deref(), Some("/models/critic.gguf"));
+    }
+
+    #[test]
+    fn test_critic_lemonade_backend_from_toml() {
+        let toml_str = r#"
+[critic]
+enabled = true
+backend = "lemonade"
+model = "Qwen2.5-7B-Instruct-NPU"
+lemonade_port = 13305
+context_length = 8192
+trigger = "final"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.critic.enabled);
+        assert_eq!(config.critic.backend, CriticBackend::Lemonade);
+        assert_eq!(config.critic.model.as_deref(), Some("Qwen2.5-7B-Instruct-NPU"));
+        assert_eq!(config.critic.lemonade_port, 13305);
+    }
+
+    #[test]
+    fn test_critic_backend_defaults_to_llamacpp() {
+        let config = Config::default();
+        assert_eq!(config.critic.backend, CriticBackend::LlamaCpp);
+        assert_eq!(config.critic.lemonade_port, 13305);
+        assert!(config.critic.model.is_none());
+    }
+
+    #[test]
+    fn test_critic_lemonade_roundtrip_preserves_model() {
+        let mut config = Config::default();
+        config.critic.enabled = true;
+        config.critic.backend = CriticBackend::Lemonade;
+        config.critic.model = Some("Qwen2.5-7B-Instruct-NPU".to_string());
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.critic.backend, CriticBackend::Lemonade);
+        assert_eq!(parsed.critic.model.as_deref(), Some("Qwen2.5-7B-Instruct-NPU"));
+    }
+
+    #[test]
+    fn test_api_fallback_flag_roundtrip() {
+        let toml_str = r#"
+[api]
+enabled = true
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-6"
+max_tokens = 8192
+fallback = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.api.enabled);
+        assert!(config.api.fallback);
+        // Default (omitted) must be false — backward compatible with existing configs.
+        let bare: Config = toml::from_str("[api]\nenabled = true\n").unwrap();
+        assert!(!bare.api.fallback);
+    }
+
+    #[test]
+    fn test_merge_preserves_critic_and_fallback() {
+        let mut base = Config::default();
+        base.critic.path = Some("/base/critic.gguf".to_string());
+        // Override sets fallback + enables critic but omits the path → base path survives.
+        let override_toml = r#"
+[api]
+fallback = true
+
+[critic]
+enabled = true
+"#;
+        let override_cfg: Config = toml::from_str(override_toml).unwrap();
+        let merged = merge_config(base, override_cfg);
+        assert!(merged.api.fallback);
+        assert!(merged.critic.enabled);
+        assert_eq!(merged.critic.path.as_deref(), Some("/base/critic.gguf"));
     }
 
     // ── P0 Security Red Tests ──────────────────────────────────────────────

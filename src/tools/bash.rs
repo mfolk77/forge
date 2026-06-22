@@ -26,6 +26,30 @@ pub fn shell_command() -> (&'static str, &'static [&'static str]) {
     }
 }
 
+/// Kill a process AND its descendants. `child.kill()` alone only kills the
+/// immediate child (e.g. cmd.exe), leaving grandchildren (cargo, a launched app)
+/// orphaned and still holding the output pipe open. On Windows `taskkill /T`
+/// terminates the whole tree; on Unix the negative PID targets the process group.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // Best-effort: SIGKILL the process group (works when the child is a group leader).
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Returns true if the given path string is absolute on the current platform.
 fn is_absolute_path(path: &str) -> bool {
     if path.starts_with('/') {
@@ -110,8 +134,10 @@ impl Tool for BashTool {
             }
             cmd.arg(&command)
                 .current_dir(&working_dir)
+                .stdin(Stdio::null()) // EOF on stdin: interactive programs exit instead of hanging
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stderr(Stdio::piped())
+                .kill_on_drop(true); // dropping the future (timeout/cancel) kills the child
 
             // On Windows, set CREATE_BREAKAWAY_FROM_JOB to allow child process
             // management. Resource limits (RLIMIT_CPU) are Unix-only; on Windows
@@ -209,8 +235,10 @@ impl Tool for BashTool {
             }
             cmd.arg(&command)
                 .current_dir(&working_dir)
+                .stdin(Stdio::null()) // EOF on stdin: interactive programs exit instead of hanging
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stderr(Stdio::piped())
+                .kill_on_drop(true); // dropping the future (timeout/cancel) kills the child
 
             #[cfg(windows)]
             {
@@ -239,6 +267,7 @@ impl Tool for BashTool {
                 loop {
                     // Check cancellation
                     if *cancel_rx.borrow() {
+                        if let Some(pid) = child.id() { kill_process_tree(pid); }
                         let _ = child.kill().await;
                         return Ok(ToolResult::error("Cancelled by user"));
                     }
@@ -246,6 +275,7 @@ impl Tool for BashTool {
                     let line_result = tokio::select! {
                         line = reader.next_line() => line,
                         _ = tokio::time::sleep_until(deadline) => {
+                            if let Some(pid) = child.id() { kill_process_tree(pid); }
                             let _ = child.kill().await;
                             return Ok(ToolResult::error(
                                 format!("Command timed out after {timeout_ms}ms"),
@@ -286,6 +316,7 @@ impl Tool for BashTool {
 
             // Final cancel check before waiting on exit status
             if *cancel_rx.borrow() {
+                if let Some(pid) = child.id() { kill_process_tree(pid); }
                 let _ = child.kill().await;
                 return Ok(ToolResult::error("Cancelled by user"));
             }

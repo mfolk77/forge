@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 pub mod context;
+pub mod critic;
 #[allow(dead_code)]
 pub mod download;
 #[allow(dead_code)]

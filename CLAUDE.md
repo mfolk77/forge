@@ -89,11 +89,22 @@
 - Models stored in `~/.ftai/models/<name>/`
 - MLX (safetensors): `find_model_file()` returns directory path, not individual shards
 - GGUF: returns the .gguf file path
-- Active model: Qwen3.5-9B-4bit (dense 9B, ~6GB disk, ~7-8GB RAM, MLX backend)
+- Proposer (x86, ≥24GB RAM or dedicated GPU): Devstral Small 2 (24B dense, agentic SWE) — `unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF`, Q4_K_M ~15GB. Picker tiers in `src/backend/types.rs::recommended_model()`: Devstral ≥24GB, dense 9B ≥12GB, dense 4B otherwise; Apple Silicon → MLX. (A 22GB MoE thrashed the 32GB iGPU box, hence the lighter 24B dense + small critic.)
 - Hardware detection in `src/backend/types.rs` — `HardwareInfo::detect()` and `recommended_model()`
 - MLX server logs to `~/.ftai/mlx-server.log` for crash debugging
 - Prompt cache capped by RAM: 8192 on 16GB, 16384 on 32GB (prevents Metal OOM)
 - MLX is macOS Apple Silicon only — `is_available()` returns false on other platforms
+
+## Dual-Model Adversarial (Proposer → Critic) — spec `docs/specs/FORGE-001-dual-model-adversarial.md`
+- Optional `[critic]` config section (off by default, `#[serde(default)]` → backward compatible). On 32GB-class boxes `forge setup` enables it automatically (proposer ctx trimmed to 16K, critic 8K).
+- Proposer = primary `[model]` (Devstral, port 8411). Critic = `[critic]` model (Qwen3.5-9B, port **8413**, CPU-only by default so it doesn't contend for the iGPU). Both stay resident.
+- Flow: proposer settles on a final answer → critic reviews (APPROVE / REVISE+issues) → on REVISE, sanitized feedback is fed back for up to `critic.max_rounds` revision rounds. Wired at the agent-loop settle points in `src/tui/app.rs` (`run_critic_review`); pure logic in `src/inference/critic.rs`.
+- **Security CAT 7 (P0):** critic output is sanitized before re-injection (`critic::sanitize_critique` strips `<tool_call>`/fenced-json tool blocks, neutralizes instruction-injection, caps length) and wrapped in a "reviewer feedback (data)" envelope. Red tests run against the real `ToolCallParser`.
+- Critic config: `enabled`, `path`, `context_length`, `max_rounds`, `trigger` (`final`|`always`|`code-only`), `[critic.llamacpp]` gpu_layers/threads.
+
+## Cloud API Fallback
+- `[api] fallback = true` (with `enabled = true` + a resolvable key) makes the cloud API a *fallback*: the local model stays primary, and the API is used only when local generation errors out. (`enabled` + `fallback = false` keeps the legacy "API as primary" behavior.)
+- Chokepoint: `TuiApp::generate_with_fallback()` in `src/tui/app.rs`; armed via `BackendManager::api_fallback_from_config()`. Falls back transparently and logs a system message when used.
 
 ## Self-Update
 - `forge update` downloads latest release from GitHub Releases (mfolk77/forge)

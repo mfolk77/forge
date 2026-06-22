@@ -274,9 +274,12 @@ impl HardwareInfo {
             .unwrap_or(8)
     }
 
-    /// Recommend a model based on hardware.
-    /// Uses Qwen3.5-35B-A3B MoE everywhere — only 3B active params per token,
-    /// fast even on CPU, smarter than dense models of similar inference cost.
+    /// Recommend a proposer model based on hardware.
+    ///
+    /// On x86/Windows/Linux the proposer is Devstral Small 2 (24B dense, built for
+    /// agentic software engineering) for GPU or high-RAM (≥24 GB) systems; the dual
+    /// `[critic]` (Qwen3.5-9B) is wired separately by `forge setup`. Mid-RAM systems
+    /// fall back to a dense 9B, low-RAM to a dense 4B. Apple Silicon uses MLX.
     pub fn recommended_model(&self) -> ModelRecommendation {
         match (&self.arch, &self.gpu, self.ram_gb) {
             // Apple Silicon — MLX backend (safetensors, download whole repo)
@@ -294,22 +297,11 @@ impl HardwareInfo {
                 hf_repo: "mlx-community/Qwen3.5-4B-4bit".to_string(),
                 hf_file: None,
             },
-            // NVIDIA GPU or CPU-only — GGUF via llama.cpp (download single file)
-            (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 8 => ModelRecommendation {
-                name: "Qwen3.5-35B-A3B-Q4_K_M".to_string(),
-                backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 20,
-                hf_repo: "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
-                hf_file: Some("Qwen3.5-35B-A3B-Q4_K_M.gguf".to_string()),
-            },
-            // CPU-only with enough RAM for the 35B MoE (3B active params)
-            (_, _, ram) if ram >= 24 => ModelRecommendation {
-                name: "Qwen3.5-35B-A3B-Q4_K_M".to_string(),
-                backend: crate::config::BackendType::LlamaCpp,
-                size_gb: 20,
-                hf_repo: "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
-                hf_file: Some("Qwen3.5-35B-A3B-Q4_K_M.gguf".to_string()),
-            },
+            // NVIDIA GPU or high-RAM x86 — Devstral 24B proposer (agentic SWE model).
+            // A 22GB MoE thrashed 32GB iGPU boxes; the 24B dense + small critic fits.
+            (_, GpuType::Cuda { vram_gb }, _) if *vram_gb >= 8 => devstral_proposer(),
+            // CPU-only / Vulkan iGPU with enough RAM for the 24B proposer (+ critic).
+            (_, _, ram) if ram >= 24 => devstral_proposer(),
             // Vulkan GPU or 12+ GB RAM — dense 9B is the sweet spot
             (_, _, ram) if ram >= 12 => ModelRecommendation {
                 name: "Qwen3.5-9B-Q4_K_M".to_string(),
@@ -327,6 +319,17 @@ impl HardwareInfo {
                 hf_file: Some("Qwen3.5-4B-Q4_K_M.gguf".to_string()),
             },
         }
+    }
+}
+
+/// The default proposer for capable x86 systems: Devstral Small 2 (24B dense).
+fn devstral_proposer() -> ModelRecommendation {
+    ModelRecommendation {
+        name: "Devstral-Small-2-24B-Q4_K_M".to_string(),
+        backend: crate::config::BackendType::LlamaCpp,
+        size_gb: 15,
+        hf_repo: "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF".to_string(),
+        hf_file: Some("Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf".to_string()),
     }
 }
 
@@ -387,9 +390,9 @@ mod tests {
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
-        assert_eq!(rec.hf_repo, "unsloth/Qwen3.5-35B-A3B-GGUF");
-        assert_eq!(rec.hf_file.as_deref(), Some("Qwen3.5-35B-A3B-Q4_K_M.gguf"));
+        assert_eq!(rec.name, "Devstral-Small-2-24B-Q4_K_M");
+        assert_eq!(rec.hf_repo, "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF");
+        assert_eq!(rec.hf_file.as_deref(), Some("Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"));
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
@@ -401,7 +404,7 @@ mod tests {
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
+        assert_eq!(rec.name, "Devstral-Small-2-24B-Q4_K_M");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
@@ -413,9 +416,10 @@ mod tests {
             ram_gb: 32,
         };
         let rec = hw.recommended_model();
-        assert_eq!(rec.name, "Qwen3.5-35B-A3B-Q4_K_M");
-        assert_eq!(rec.hf_repo, "unsloth/Qwen3.5-35B-A3B-GGUF");
-        assert_eq!(rec.hf_file.as_deref(), Some("Qwen3.5-35B-A3B-Q4_K_M.gguf"));
+        // 32GB box → Devstral 24B proposer (critic wired separately by `forge setup`).
+        assert_eq!(rec.name, "Devstral-Small-2-24B-Q4_K_M");
+        assert_eq!(rec.hf_repo, "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF");
+        assert_eq!(rec.hf_file.as_deref(), Some("Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"));
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 
@@ -440,8 +444,8 @@ mod tests {
             ram_gb: 16,
         };
         let rec = hw.recommended_model();
-        // 16GB < 24GB threshold, falls through to low-RAM
-        assert_eq!(rec.name, "Qwen3.5-4B-Q4_K_M");
+        // 16GB: below the 24GB Devstral threshold, above the 12GB 9B threshold → dense 9B.
+        assert_eq!(rec.name, "Qwen3.5-9B-Q4_K_M");
         assert_eq!(rec.backend, crate::config::BackendType::LlamaCpp);
     }
 

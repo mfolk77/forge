@@ -91,6 +91,8 @@ pub struct TuiApp {
     mode: Mode,
     should_quit: bool,
     is_generating: bool,
+    /// When the current generation started (for showing elapsed time / progress)
+    generation_start: Option<std::time::Instant>,
     streaming_text: String,
     /// Channel for receiving streaming tokens during generation
     token_rx: Option<tokio::sync::mpsc::Receiver<crate::backend::types::Token>>,
@@ -128,6 +130,16 @@ pub struct TuiApp {
     session_task_description: Option<String>,
     /// True while the backend is still loading the model in the background
     backend_loading: bool,
+    /// Adversarial critic backend (proposer → critic loop). None when disabled.
+    critic_backend: Option<BackendManager>,
+    /// True once the critic has been made ready (server healthy + model loaded).
+    critic_ready: bool,
+    /// Counts agentic continuation turns within the current user message, so the
+    /// streamed continuation loop is bounded (replaces the old sync for-loop cap).
+    continuation_count: usize,
+    /// Cloud API used as a fallback when the local model fails. None unless
+    /// `api.enabled && api.fallback`.
+    api_fallback: Option<BackendManager>,
 }
 
 impl TuiApp {
@@ -246,6 +258,8 @@ impl TuiApp {
 
         let parser = ToolCallParser::new(config.model.tool_calling.clone());
         let backend = BackendManager::from_config(&config);
+        let critic_backend = BackendManager::from_critic_config(&config);
+        let api_fallback = BackendManager::api_fallback_from_config(&config);
 
         let startup_msg = format!("Forge v{}", env!("CARGO_PKG_VERSION"));
 
@@ -322,6 +336,7 @@ impl TuiApp {
             mode,
             should_quit: false,
             is_generating: false,
+            generation_start: None,
             streaming_text: String::new(),
             token_rx: None,
             stream_handle: None,
@@ -343,6 +358,10 @@ impl TuiApp {
             #[cfg(feature = "evolution")]
             session_task_description: None,
             backend_loading: false,
+            critic_backend,
+            critic_ready: false,
+            continuation_count: 0,
+            api_fallback,
         }
     }
 
@@ -496,6 +515,35 @@ impl TuiApp {
                 }
             }
         }
+
+        // Spawn the adversarial critic in the background, if configured. It loads
+        // alongside the proposer; the first review waits for it to be ready.
+        if let Some(ref mut critic) = self.critic_backend {
+            if !critic.health_check().await {
+                let where_ = if self.config.critic.backend == crate::config::CriticBackend::Lemonade {
+                    "on the NPU"
+                } else {
+                    "on CPU"
+                };
+                match critic.spawn_critic(&self.config) {
+                    Ok(()) => self.messages.push(DisplayMessage::System(
+                        format!("Adversarial critic loading {where_} in background."),
+                    )),
+                    Err(e) => {
+                        // Degrade gracefully to proposer-only rather than blocking startup.
+                        self.messages.push(DisplayMessage::System(
+                            format!("Critic disabled (spawn failed: {e})."),
+                        ));
+                        self.critic_backend = None;
+                    }
+                }
+            }
+        }
+        if self.api_fallback.is_some() {
+            self.messages.push(DisplayMessage::System(
+                "Cloud API fallback armed (used only if the local model fails).".to_string(),
+            ));
+        }
         terminal.draw(|frame| self.render(frame))?;
 
         // Start a new session for persistence
@@ -608,17 +656,17 @@ impl TuiApp {
                 if health_check_counter % 30 == 0 { // 30 * 16ms ≈ 480ms
                     if self.backend.health_check().await {
                         self.backend_loading = false;
-                        self.messages.push(DisplayMessage::System(
-                            "Model ready — warming up prompt cache...".to_string(),
-                        ));
-                        // Pre-warm: send the system prompt so it's cached before
-                        // the user's first message. This happens in the background
-                        // while the user is typing.
+                        // Pre-warm the prompt cache in a background task so the slow
+                        // first-prefill of the system prompt doesn't freeze the TUI.
+                        // (Previously this was awaited inline here, blocking the whole
+                        // loop — and thus all input/rendering — for the entire prefill.)
                         let system_prompt = self.engine.system_prompt().to_string();
                         let tool_defs = self.tools.tool_definitions();
-                        self.backend.warm_up_prompt(&system_prompt, tool_defs).await;
+                        self.backend.warm_up_prompt_background(system_prompt, tool_defs);
                         self.messages.push(DisplayMessage::System(
-                            "Ready.".to_string(),
+                            "Model ready — warming prompt cache in the background. \
+                             Your first reply may be a little slower while it finishes."
+                                .to_string(),
                         ));
                     }
                 }
@@ -679,7 +727,10 @@ impl TuiApp {
                                     if !text.is_empty() {
                                         self.messages.push(DisplayMessage::Assistant(text));
                                     }
-                                    // Process tool calls from the complete response
+                                    // Process tool calls. This may start the NEXT
+                                    // continuation turn as a stream (setting a new
+                                    // token_rx + stream_handle), in which case we keep
+                                    // generating rather than finalizing.
                                     self.process_response_after_stream(response).await?;
                                 }
                                 Ok(Err(e)) => {
@@ -694,8 +745,15 @@ impl TuiApp {
                                 }
                             }
                         }
-                        self.token_rx = None;
-                        self.is_generating = false;
+                        // Only finalize if no continuation stream was started. If
+                        // process_response_after_stream kicked off another turn, it set
+                        // a fresh stream_handle and we leave is_generating/token_rx in
+                        // place so the outer loop drains the next stream.
+                        if self.stream_handle.is_none() {
+                            self.token_rx = None;
+                            self.is_generating = false;
+                            self.generation_start = None;
+                        }
                         break;
                     } else {
                         self.streaming_text.push_str(&token.text);
@@ -757,32 +815,47 @@ impl TuiApp {
             modal.render(&self.theme, layout[1], frame.buffer_mut());
         } else {
             let mut display_msgs = self.messages.clone();
-            if self.is_generating && !self.streaming_text.is_empty() {
-                display_msgs.push(DisplayMessage::Assistant(
-                    format!("{}▊", self.streaming_text),
-                ));
+            if self.is_generating {
+                let partial = if self.streaming_text.is_empty() {
+                    let ctx = self.engine.estimated_tokens();
+                    let elapsed = self.generation_start
+                        .map(|s| {
+                            let secs = s.elapsed().as_secs();
+                            if secs > 0 { format!(" ({}s elapsed)", secs) } else { String::new() }
+                        })
+                        .unwrap_or_default();
+                    format!("[evaluating prompt (~{} tokens{}) — large models/contexts can take minutes]▊", ctx, elapsed)
+                } else {
+                    format!("{}▊", self.streaming_text)
+                };
+                display_msgs.push(DisplayMessage::Assistant(partial));
             }
             render::render_messages(&display_msgs, self.mode.label(), &self.theme, self.scroll_offset, layout[1], frame.buffer_mut());
         }
 
         // Status line
+        let gen_elapsed = self.generation_start.map(|s| s.elapsed().as_secs());
         render::render_status_line(
             self.engine.estimated_tokens(),
             self.config.model.context_length,
             self.rules.rule_count(),
+            gen_elapsed,
             &self.theme,
             layout[2],
             frame.buffer_mut(),
         );
 
         // Input
-        let input_text = if self.is_generating {
-            "generating..."
+        let input_text: String = if self.is_generating {
+            let elapsed = self.generation_start
+                .map(|s| format!("generating... ({}s)", s.elapsed().as_secs()))
+                .unwrap_or_else(|| "generating...".to_string());
+            elapsed
         } else {
-            &self.input.lines[self.input.cursor_line]
+            self.input.lines[self.input.cursor_line].clone()
         };
         let cursor_pos = render::render_input(
-            input_text,
+            &input_text,
             self.input.cursor_col,
             layout[3],
             frame.buffer_mut(),
@@ -805,6 +878,18 @@ impl TuiApp {
         if self.is_generating {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.is_generating = false;
+                self.generation_start = None;
+            } else if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                // Allow scrolling even during generation
+                if key.code == KeyCode::PageUp {
+                    self.scroll_offset = self.scroll_offset.saturating_add(10);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                }
+            } else if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            } else if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
             }
             return Ok(());
         }
@@ -871,14 +956,23 @@ impl TuiApp {
             KeyCode::Left => self.input.move_left(),
             KeyCode::Right => self.input.move_right(),
             KeyCode::Up => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Explicit command-history recall (kept off plain Up so the
+                    // mouse wheel can scroll — see below).
+                    self.input.history_up();
+                } else if key.modifiers.contains(KeyModifiers::SHIFT) || self.input.is_empty() {
+                    // Plain Up on empty input scrolls the conversation. This makes the
+                    // mouse wheel work in terminals (e.g. Windows Terminal) that send
+                    // wheel events as plain arrow keys via "alternate scroll mode".
                     self.scroll_offset = self.scroll_offset.saturating_add(3);
                 } else {
                     self.input.history_up();
                 }
             }
             KeyCode::Down => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.input.history_down();
+                } else if key.modifiers.contains(KeyModifiers::SHIFT) || self.input.is_empty() {
                     self.scroll_offset = self.scroll_offset.saturating_sub(3);
                 } else {
                     self.input.history_down();
@@ -1245,6 +1339,7 @@ author = ""
     /// intermediate turns).
     async fn run_agentic_loop(&mut self) -> Result<()> {
         const MAX_TURNS: usize = 25;
+        self.continuation_count = 0; // fresh agentic loop for this user message
         let is_chat = self.mode == Mode::Chat;
 
         for turn in 0..MAX_TURNS {
@@ -1256,6 +1351,7 @@ author = ""
                 self.engine.compact();
             }
             self.is_generating = true;
+            self.generation_start = Some(std::time::Instant::now());
             let request = self.engine.build_request_with_mode(&self.config, is_chat);
 
             if turn == 0 {
@@ -1276,7 +1372,7 @@ author = ""
             }
 
             // Sync generate (fallback for first turn, default for continuations)
-            let response = match self.backend.generate(&request).await {
+            let response = match self.generate_with_fallback(&request).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.messages.push(DisplayMessage::System(format!("Error: {e}")));
@@ -1295,7 +1391,11 @@ author = ""
             }
         }
 
+        // Proposer has settled on a final answer — run the adversarial critic.
+        self.run_critic_review().await?;
+
         self.is_generating = false;
+        self.generation_start = None;
         Ok(())
     }
 
@@ -1313,33 +1413,197 @@ author = ""
         response.message.content = String::new();
         self.process_response(response).await?;
 
-        // If there were tool calls, continue the agentic loop (sync for subsequent turns)
-        if has_tool_calls {
-            const MAX_CONTINUATION_TURNS: usize = 24;
-            for _ in 0..MAX_CONTINUATION_TURNS {
-                self.check_ftai_reload();
-                self.engine.micro_compact();
-                self.engine.compact();
-                let request = self.engine.build_request(&self.config);
-
-                let response = match self.backend.generate(&request).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.messages.push(DisplayMessage::System(format!("Error: {e}")));
-                        break;
+        // If there were tool calls, continue the agentic loop — but STREAM the next
+        // turn instead of blocking on a synchronous generate. We kick off the next
+        // stream and return; main_loop drains its tokens (keeping the UI live and
+        // interruptible) and calls us again when it finishes. This is the fix for the
+        // "frozen during multi-turn work" problem.
+        const MAX_CONTINUATION_TURNS: usize = 24;
+        if has_tool_calls && self.continuation_count < MAX_CONTINUATION_TURNS {
+            self.continuation_count += 1;
+            self.check_ftai_reload();
+            self.engine.micro_compact();
+            self.engine.compact();
+            let request = self.engine.build_request(&self.config);
+            self.streaming_text.clear();
+            match self.backend.generate_stream(&request).await {
+                Ok((rx, handle)) => {
+                    self.token_rx = Some(rx);
+                    self.stream_handle = Some(handle);
+                    // Return to main_loop; it will drain this stream and re-enter
+                    // process_response_after_stream when the turn completes.
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Streaming unavailable for this backend — fall back to one
+                    // synchronous turn so the loop still makes progress.
+                    if let Ok(resp) = self.generate_with_fallback(&request).await {
+                        return Box::pin(self.process_response_after_stream(resp)).await;
                     }
-                };
-
-                let more_tools = response.message.tool_calls.as_ref()
-                    .map_or(false, |tc| !tc.is_empty())
-                    || !self.parser.parse(&response.message.content).1.is_empty();
-
-                self.process_response(response).await?;
-
-                if !more_tools {
-                    break;
                 }
             }
+        }
+
+        // Settled: final answer, max turns reached, or streaming unavailable.
+        self.continuation_count = 0;
+        self.run_critic_review().await?;
+        Ok(())
+    }
+
+    /// Generate via the local backend; on failure, transparently retry on the cloud
+    /// API fallback if one is armed (`api.enabled && api.fallback`). The local model
+    /// stays primary — the API is touched only when local generation errors out.
+    async fn generate_with_fallback(&mut self, request: &crate::backend::types::ChatRequest) -> Result<ChatResponse> {
+        match self.backend.generate(request).await {
+            Ok(r) => Ok(r),
+            Err(local_err) => {
+                if let Some(fallback) = self.api_fallback.as_ref() {
+                    match fallback.generate(request).await {
+                        Ok(r) => {
+                            self.messages.push(DisplayMessage::System(format!(
+                                "Local model failed ({local_err}); used cloud API fallback."
+                            )));
+                            Ok(r)
+                        }
+                        Err(fb_err) => Err(anyhow::anyhow!(
+                            "local model failed ({local_err}); API fallback also failed ({fb_err})"
+                        )),
+                    }
+                } else {
+                    Err(local_err)
+                }
+            }
+        }
+    }
+
+    /// Most recent non-empty assistant answer shown to the user (the proposer's
+    /// final answer). Read from the display log because the streaming path does not
+    /// retain the streamed text in the conversation engine.
+    fn last_assistant_answer(&self) -> Option<String> {
+        self.messages.iter().rev().find_map(|m| match m {
+            DisplayMessage::Assistant(t) if !t.trim().is_empty() => Some(t.clone()),
+            _ => None,
+        })
+    }
+
+    /// Adversarial critic pass. Runs after the proposer settles on a final answer:
+    /// the critic reviews it and, on REVISE, sanitized feedback is fed back to the
+    /// proposer for up to `critic.max_rounds` revision rounds. No-op when disabled.
+    async fn run_critic_review(&mut self) -> Result<()> {
+        if self.critic_backend.is_none() {
+            return Ok(());
+        }
+
+        let Some(mut current_answer) = self.last_assistant_answer() else {
+            return Ok(()); // nothing to review
+        };
+
+        // Trigger gating.
+        if self.config.critic.trigger == crate::config::CriticTrigger::CodeOnly
+            && !current_answer.contains("```")
+        {
+            return Ok(());
+        }
+
+        // Original user request (first user message; revision envelopes are added later).
+        let user_task = self
+            .engine
+            .messages()
+            .iter()
+            .find(|m| m.role == crate::backend::types::Role::User)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        // Ensure the critic is ready once per session: server healthy + (for the
+        // NPU/lemonade backend) the model loaded. health_check alone is insufficient
+        // for lemonade because the server can be up before any model is loaded.
+        if !self.critic_ready {
+            if let Some(critic) = self.critic_backend.as_mut() {
+                self.messages
+                    .push(DisplayMessage::System("Preparing critic...".to_string()));
+                if let Err(e) = critic.wait_until_ready().await {
+                    self.messages.push(DisplayMessage::System(format!(
+                        "Critic unavailable ({e}); skipping review."
+                    )));
+                    self.critic_backend = None;
+                    return Ok(());
+                }
+            }
+            self.critic_ready = true;
+        }
+
+        let max_rounds = self.config.critic.max_rounds.max(1);
+        let temperature = self.config.model.temperature;
+
+        for round in 0..max_rounds {
+            self.messages.push(DisplayMessage::System(format!(
+                "Critic reviewing (round {}/{})...",
+                round + 1,
+                max_rounds
+            )));
+
+            let critic_req =
+                crate::inference::critic::build_critic_request(&user_task, &current_answer, temperature);
+            let verdict_text = match self.critic_backend.as_ref().unwrap().generate(&critic_req).await
+            {
+                Ok(r) => r.message.content,
+                Err(e) => {
+                    self.messages
+                        .push(DisplayMessage::System(format!("Critic error ({e}); keeping answer.")));
+                    break;
+                }
+            };
+
+            let verdict = crate::inference::critic::parse_verdict(&verdict_text);
+            if verdict.approved {
+                self.messages
+                    .push(DisplayMessage::System("Critic: APPROVED.".to_string()));
+                break;
+            }
+
+            self.messages.push(DisplayMessage::System(format!(
+                "Critic: REVISE\n{}",
+                verdict.feedback
+            )));
+
+            // Self-contained revision prompt: sanitized feedback envelope + the answer
+            // being revised (the streaming path may not retain it in engine state).
+            let prior: String = current_answer
+                .chars()
+                .take(crate::inference::critic::MAX_FEEDBACK_LEN)
+                .collect();
+            let revision = format!(
+                "{}\n\nYour previous answer (for reference):\n<<<\n{}\n>>>\n\nProduce a corrected, complete answer.",
+                crate::inference::critic::feedback_envelope(&verdict.feedback),
+                prior,
+            );
+            self.engine.add_user_message(&revision);
+
+            // Re-run the proposer once (sync; fallback-aware).
+            self.engine.micro_compact();
+            let request = self.engine.build_request(&self.config);
+            let revised = match self.generate_with_fallback(&request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.messages
+                        .push(DisplayMessage::System(format!("Revision failed ({e}).")));
+                    break;
+                }
+            };
+            let revised_text = Self::clean_model_output(&revised.message.content);
+            if !revised_text.trim().is_empty() {
+                self.messages
+                    .push(DisplayMessage::Assistant(revised_text.clone()));
+            }
+            if let Some(ref mgr) = self.session_manager {
+                let _ = mgr.save_message(
+                    crate::backend::types::Role::Assistant,
+                    &revised_text,
+                    None,
+                );
+            }
+            self.engine.add_assistant_message(revised);
+            current_answer = revised_text;
         }
 
         Ok(())

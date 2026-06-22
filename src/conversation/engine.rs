@@ -107,6 +107,18 @@ impl ConversationEngine {
     /// Run Tier 1 microcompact: replace old tool_result content with placeholders.
     /// This is cheap (no model calls) and should run before every LLM call.
     pub fn micro_compact(&mut self) -> usize {
+        // Cache-friendly gating: truncating old tool results rewrites the MIDDLE of
+        // the conversation, which invalidates the llama.cpp prompt cache from that
+        // point and forces an expensive reprocess of everything after it. Only pay
+        // that cost when we actually need the space — i.e. when token usage is high.
+        // Below the threshold, leave tool results intact so the cached prefix stays
+        // valid and continuation turns only prefill the new tokens.
+        const MICRO_COMPACT_THRESHOLD: f64 = 0.6; // 60% of the context window
+        if (self.estimated_tokens as f64)
+            < (self.max_context_tokens as f64) * MICRO_COMPACT_THRESHOLD
+        {
+            return 0;
+        }
         let compacted = compactor::micro_compact(&mut self.messages);
         if compacted > 0 {
             self.recalculate_tokens();

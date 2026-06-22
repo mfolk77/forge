@@ -27,25 +27,38 @@ const MODEL_MEDIUM_FILE: &str = "Qwen3.5-9B-Q4_K_M.gguf";
 const MODEL_MEDIUM_NAME: &str = "Qwen3.5-9B";
 const MODEL_MEDIUM_SIZE: &str = "~6 GB";
 
-/// Large model for GPU or high-RAM systems. 35B MoE (3B active), ~20GB download.
-const MODEL_LARGE_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf";
-const MODEL_LARGE_FILE: &str = "Qwen3.5-35B-A3B-Q4_K_M.gguf";
-const MODEL_LARGE_NAME: &str = "Qwen3.5-35B-A3B";
-const MODEL_LARGE_SIZE: &str = "~20 GB";
+/// Proposer for GPU or high-RAM (≥24 GB) systems. Devstral Small 2 (24B dense,
+/// agentic SWE model). Pairs with the Qwen3.5-9B critic below in the adversarial setup.
+const MODEL_LARGE_URL: &str = "https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF/resolve/main/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf";
+const MODEL_LARGE_FILE: &str = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf";
+const MODEL_LARGE_NAME: &str = "Devstral-Small-2-24B";
+const MODEL_LARGE_SIZE: &str = "~15 GB";
 
-/// Pick the right model based on hardware.
+/// Critic model for the adversarial dual-model setup (reuses the dense 9B).
+const MODEL_CRITIC_URL: &str = MODEL_MEDIUM_URL;
+const MODEL_CRITIC_FILE: &str = MODEL_MEDIUM_FILE;
+const MODEL_CRITIC_NAME: &str = MODEL_MEDIUM_NAME;
+const MODEL_CRITIC_SIZE: &str = MODEL_MEDIUM_SIZE;
+
+/// Pick the proposer model based on hardware. Mirrors `HardwareInfo::recommended_model`:
+/// Devstral 24B for a dedicated GPU or ≥24 GB RAM (enough headroom for the 24B + critic),
+/// dense 9B for ≥12 GB, dense 4B otherwise.
 fn pick_model(hw: &HardwareInfo) -> (&'static str, &'static str, &'static str, &'static str) {
     let has_dedicated_gpu = matches!(hw.gpu, GpuType::Cuda { vram_gb } if vram_gb >= 8);
 
-    if has_dedicated_gpu {
-        (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
-    } else if hw.ram_gb >= 48 {
+    if has_dedicated_gpu || hw.ram_gb >= 24 {
         (MODEL_LARGE_URL, MODEL_LARGE_FILE, MODEL_LARGE_NAME, MODEL_LARGE_SIZE)
     } else if hw.ram_gb >= 12 {
         (MODEL_MEDIUM_URL, MODEL_MEDIUM_FILE, MODEL_MEDIUM_NAME, MODEL_MEDIUM_SIZE)
     } else {
         (MODEL_SMALL_URL, MODEL_SMALL_FILE, MODEL_SMALL_NAME, MODEL_SMALL_SIZE)
     }
+}
+
+/// Whether to enable the adversarial critic: only when the proposer is the 24B Devstral
+/// AND there is enough RAM to keep both the proposer and the 9B critic resident.
+fn wants_critic(hw: &HardwareInfo, proposer_file: &str) -> bool {
+    proposer_file == MODEL_LARGE_FILE && hw.ram_gb >= 24
 }
 
 /// Run the full setup process.
@@ -76,45 +89,44 @@ pub async fn run_setup() -> Result<()> {
     }
     println!();
 
-    // Step 3: Download model
+    // Step 3: Download the proposer (and the critic, in the adversarial setup).
     let models_dir = config::global_config_dir()?.join("models");
     std::fs::create_dir_all(&models_dir)?;
-    let gguf_path = models_dir.join(model_file);
 
-    println!("[3/4] Downloading model...");
-    if gguf_path.exists() && gguf_path.metadata().map(|m| m.len() > 100_000_000).unwrap_or(false) {
-        println!("  Already downloaded: {}", gguf_path.display());
+    let critic_enabled = wants_critic(&hw, model_file);
+
+    println!("[3/4] Downloading model(s)...");
+    let proposer_path = download_model(&models_dir, model_file, model_url, model_size)?;
+
+    let critic_path = if critic_enabled {
+        println!();
+        println!("  Adversarial critic enabled — fetching critic model.");
+        Some(download_model(&models_dir, MODEL_CRITIC_FILE, MODEL_CRITIC_URL, MODEL_CRITIC_SIZE)?)
     } else {
-        // Delete any partial/empty file
-        let _ = std::fs::remove_file(&gguf_path);
-        println!("  Downloading {} ({})", model_file, model_size);
-        println!("  This will take a while...");
-        download_file(model_url, &gguf_path)?;
-
-        // Verify the file actually downloaded
-        let size = gguf_path.metadata().map(|m| m.len()).unwrap_or(0);
-        if size < 100_000_000 {
-            let _ = std::fs::remove_file(&gguf_path);
-            bail!("Download failed — file too small ({} bytes). Check your internet connection.", size);
-        }
-        println!("  Done. ({} MB)", size / (1024 * 1024));
-    }
+        None
+    };
     println!();
 
     // Step 4: Write config
     println!("[4/4] Writing config...");
-    let gguf_path_str = gguf_path.to_string_lossy().to_string();
+    let proposer_path_str = proposer_path.to_string_lossy().to_string();
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(4);
-    let gpu_layers: i32 = if has_gpu { -1 } else { 0 };
+    // Offload-all (-1) only for a dedicated CUDA GPU with its own VRAM. A Vulkan iGPU
+    // shares system RAM, so offload double-allocates weights (mmap + locked device
+    // buffer) and OOMs the small iGPU budget — CPU-only is both safer and lighter there.
+    let has_dedicated_gpu = matches!(hw.gpu, GpuType::Cuda { vram_gb } if vram_gb >= 8);
+    let gpu_layers: i32 = if has_dedicated_gpu { -1 } else { 0 };
+    let _ = has_gpu;
+    // In the dual-model setup, trim the proposer context to keep both models resident.
+    let proposer_ctx = if critic_enabled { 16384 } else { 32768 };
 
-    let config_path = config::global_config_dir()?.join("config.toml");
-    let config_content = format!(
+    let mut config_content = format!(
         r#"[model]
 backend = "llamacpp"
-path = "{gguf_path_str}"
-context_length = 32768
+path = "{proposer_path_str}"
+context_length = {proposer_ctx}
 temperature = 0.3
 tool_calling = "hybrid"
 
@@ -133,8 +145,33 @@ enabled = true
 auto_update = false
 "#
     );
+
+    // Adversarial critic section (proposer → critic loop). Critic stays on CPU so it
+    // does not contend with the proposer for the iGPU.
+    if let Some(ref critic_path) = critic_path {
+        let critic_path_str = critic_path.to_string_lossy().to_string();
+        config_content.push_str(&format!(
+            r#"
+[critic]
+enabled = true
+path = "{critic_path_str}"
+context_length = 8192
+max_rounds = 1
+trigger = "final"
+
+[critic.llamacpp]
+gpu_layers = 0
+threads = {threads}
+"#
+        ));
+    }
+
+    let config_path = config::global_config_dir()?.join("config.toml");
     std::fs::write(&config_path, &config_content)?;
-    println!("  Model: {}", gguf_path_str);
+    println!("  Proposer: {}", proposer_path_str);
+    if let Some(ref critic_path) = critic_path {
+        println!("  Critic:   {} (CPU)", critic_path.to_string_lossy());
+    }
     println!("  GPU layers: {} ({})", gpu_layers, if gpu_layers == 0 { "CPU-only" } else { "GPU" });
     println!("  Threads: {}", threads);
     println!();
@@ -143,6 +180,33 @@ auto_update = false
     println!();
 
     Ok(())
+}
+
+/// Download a GGUF into `models_dir` if not already present. Returns its path.
+fn download_model(
+    models_dir: &Path,
+    file: &str,
+    url: &str,
+    size_label: &str,
+) -> Result<PathBuf> {
+    let gguf_path = models_dir.join(file);
+    if gguf_path.exists() && gguf_path.metadata().map(|m| m.len() > 100_000_000).unwrap_or(false) {
+        println!("  Already downloaded: {}", gguf_path.display());
+        return Ok(gguf_path);
+    }
+    // Delete any partial/empty file
+    let _ = std::fs::remove_file(&gguf_path);
+    println!("  Downloading {} ({})", file, size_label);
+    println!("  This will take a while...");
+    download_file(url, &gguf_path)?;
+
+    let size = gguf_path.metadata().map(|m| m.len()).unwrap_or(0);
+    if size < 100_000_000 {
+        let _ = std::fs::remove_file(&gguf_path);
+        bail!("Download failed — file too small ({} bytes). Check your internet connection.", size);
+    }
+    println!("  Done. ({} MB)", size / (1024 * 1024));
+    Ok(gguf_path)
 }
 
 // ── llama-server ───────────────────────────────────────────────────────────

@@ -546,13 +546,21 @@ pub fn render_status_line(
     tokens: usize,
     max_tokens: usize,
     rules_count: usize,
+    generation_elapsed_secs: Option<u64>,
     theme: &Theme,
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let status = format!(
-        " tokens: {tokens}/{max_tokens} | rules: {rules_count} active"
-    );
+    let status = if let Some(secs) = generation_elapsed_secs {
+        format!(
+            " generating (evaluating prompt, {}s elapsed) | rules: {} active",
+            secs, rules_count
+        )
+    } else {
+        format!(
+            " tokens: {tokens}/{max_tokens} | rules: {rules_count} active"
+        )
+    };
     let bar = Paragraph::new(status)
         .style(Style::default().fg(theme.status_line_fg).bg(theme.status_line_bg));
     bar.render(area, buf);
