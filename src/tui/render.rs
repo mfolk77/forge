@@ -568,13 +568,29 @@ pub fn render_status_line(
 
 /// Render the input area. Returns an optional (x, y) cursor position for the
 /// terminal cursor so the caller can call `frame.set_cursor_position()`.
+/// Number of terminal rows the input content occupies once wrapped at `width`.
+/// Line 0 carries the 2-column "> " prompt prefix; every line takes at least 1 row.
+pub fn input_visual_rows(lines: &[String], width: u16) -> u16 {
+    let w = (width.max(1)) as usize;
+    let mut rows: usize = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let len = line.chars().count() + if i == 0 { 2 } else { 0 };
+        rows += ((len + w - 1) / w).max(1);
+    }
+    rows.max(1) as u16
+}
+
+/// Render the (multi-line) input area and return the terminal cursor position.
+/// All lines are rendered with wrapping so pasted/multi-line text is fully visible.
 pub fn render_input(
-    text: &str,
+    lines: &[String],
+    cursor_line: usize,
     cursor_col: usize,
     area: Rect,
     buf: &mut Buffer,
 ) -> Option<(u16, u16)> {
-    let input_text = format!("> {text}");
+    // "> " prefix on the first line only; embedded newlines render as separate lines.
+    let input_text = format!("> {}", lines.join("\n"));
     let para = Paragraph::new(input_text.as_str())
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false })
@@ -586,12 +602,20 @@ pub fn render_input(
     para.render(area, buf);
 
     // The block's TOP border occupies 1 row. Content starts at area.y + 1.
-    // The "> " prefix occupies 2 columns.
-    // Account for line wrapping: cursor position wraps at area.width.
-    let content_width = area.width.max(1) as usize;
-    let absolute_col = 2 + cursor_col; // 2 for "> " prefix
-    let cursor_x = area.x + (absolute_col % content_width) as u16;
-    let cursor_y = area.y + 1 + (absolute_col / content_width) as u16;
+    // Account for line wrapping: each rendered line wraps at area.width.
+    let w = area.width.max(1) as usize;
+
+    // Visual rows consumed by every input line above the cursor's line.
+    let mut row_offset: usize = 0;
+    for (i, line) in lines.iter().enumerate().take(cursor_line) {
+        let len = line.chars().count() + if i == 0 { 2 } else { 0 };
+        row_offset += ((len + w - 1) / w).max(1);
+    }
+
+    // Within the cursor's line, account for the prefix (line 0 only) + wrapping.
+    let absolute_col = cursor_col + if cursor_line == 0 { 2 } else { 0 };
+    let cursor_x = area.x + (absolute_col % w) as u16;
+    let cursor_y = area.y + 1 + (row_offset + absolute_col / w) as u16;
 
     // Only return if cursor fits inside the area
     if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
@@ -767,7 +791,7 @@ mod tests {
     fn render_input_returns_cursor_position() {
         let area = Rect::new(0, 0, 80, 3);
         let mut buf = Buffer::empty(area);
-        let pos = render_input("hello", 5, area, &mut buf);
+        let pos = render_input(&["hello".to_string()], 0, 5, area, &mut buf);
         // cursor_x = 0 + 2 + 5 = 7, cursor_y = 0 + 1 = 1
         assert_eq!(pos, Some((7, 1)));
     }
@@ -776,8 +800,31 @@ mod tests {
     fn render_input_cursor_out_of_bounds() {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        let pos = render_input("hello", 100, area, &mut buf);
+        let pos = render_input(&["hello".to_string()], 0, 100, area, &mut buf);
         assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn render_input_multiline_cursor_on_lower_line() {
+        // Two-line input, cursor on the second line: the cursor must land on the
+        // row below the first line (regression test for single-line-only rendering).
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buf = Buffer::empty(area);
+        let lines = vec!["abc".to_string(), "de".to_string()];
+        let pos = render_input(&lines, 1, 2, area, &mut buf);
+        // line 0 occupies 1 row; cursor on line 1 col 2 (no prefix) → x=2, y=1+1=2
+        assert_eq!(pos, Some((2, 2)));
+    }
+
+    #[test]
+    fn input_visual_rows_counts_wrapped_and_multiline() {
+        // Single short line (+ "> " prefix) → 1 row.
+        assert_eq!(input_visual_rows(&["hi".to_string()], 80), 1);
+        // Three lines → at least 3 rows.
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(input_visual_rows(&three, 80), 3);
+        // A long first line wraps: 18 chars + 2 prefix = 20 at width 10 → 2 rows.
+        assert_eq!(input_visual_rows(&["x".repeat(18)], 10), 2);
     }
 
     // ── P0 Security Red Tests ──────────────────────────────────────────────

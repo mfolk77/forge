@@ -771,20 +771,15 @@ impl TuiApp {
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Calculate input height based on text wrapping
-        let input_text_for_height = if self.is_generating {
-            "generating..."
-        } else {
-            &self.input.lines[self.input.cursor_line]
-        };
-        // "> " prefix = 2 chars, +1 for border, +1 for content line minimum
-        let input_content_width = area.width.saturating_sub(3).max(1) as usize;
-        let input_lines = if input_content_width > 0 && !input_text_for_height.is_empty() {
-            ((input_text_for_height.len() + 2 + input_content_width - 1) / input_content_width) as u16
-        } else {
+        // Calculate input height from ALL input lines (multi-line + wrapping), so
+        // pasted/multi-line text is fully visible instead of showing one line.
+        let input_rows = if self.is_generating {
             1
+        } else {
+            render::input_visual_rows(&self.input.lines, area.width)
         };
-        let input_height = (input_lines + 2).min(area.height / 3); // +2 for border + padding, cap at 1/3 screen
+        // +1 for the TOP border; let the box grow up to half the screen for big pastes.
+        let input_height = (input_rows + 1).min((area.height / 2).max(2)).max(2);
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -845,21 +840,21 @@ impl TuiApp {
             frame.buffer_mut(),
         );
 
-        // Input
-        let input_text: String = if self.is_generating {
+        // Input — render ALL lines so multi-line / pasted text is fully visible.
+        let cursor_pos = if self.is_generating {
             let elapsed = self.generation_start
                 .map(|s| format!("generating... ({}s)", s.elapsed().as_secs()))
                 .unwrap_or_else(|| "generating...".to_string());
-            elapsed
+            render::render_input(&[elapsed], 0, 0, layout[3], frame.buffer_mut())
         } else {
-            self.input.lines[self.input.cursor_line].clone()
+            render::render_input(
+                &self.input.lines,
+                self.input.cursor_line,
+                self.input.cursor_col,
+                layout[3],
+                frame.buffer_mut(),
+            )
         };
-        let cursor_pos = render::render_input(
-            &input_text,
-            self.input.cursor_col,
-            layout[3],
-            frame.buffer_mut(),
-        );
 
         // Render autocomplete overlay in the message area (bottom-aligned)
         if self.autocomplete.active {
@@ -1384,7 +1379,7 @@ author = ""
                 .map_or(false, |tc| !tc.is_empty())
                 || !self.parser.parse(&response.message.content).1.is_empty();
 
-            self.process_response(response).await?;
+            self.process_response(response, false).await?;
 
             if !has_tool_calls {
                 break;
@@ -1406,12 +1401,10 @@ author = ""
             .map_or(false, |tc| !tc.is_empty())
             || !self.parser.parse(&response.message.content).1.is_empty();
 
-        // Text was already displayed during streaming — clear content before
-        // passing to process_response so it doesn't display it again.
-        // Tool calls and engine state are still handled normally.
-        let mut response = response;
-        response.message.content = String::new();
-        self.process_response(response).await?;
+        // Text was already rendered live during streaming, so suppress the re-display —
+        // but keep the real content so the engine's conversation state and the session
+        // DB retain the answer (blanking it here dropped streamed answers from both).
+        self.process_response(response, true).await?;
 
         // If there were tool calls, continue the agentic loop — but STREAM the next
         // turn instead of blocking on a synchronous generate. We kick off the next
@@ -1579,33 +1572,49 @@ author = ""
             );
             self.engine.add_user_message(&revision);
 
-            // Re-run the proposer once (sync; fallback-aware).
+            // Re-run the proposer to settlement (sync, fallback-aware) so it actually
+            // CARRIES OUT the fix — executing any tool calls (e.g. writing the corrected
+            // file) instead of stopping at a preamble. A single generate() dropped the
+            // proposer's tool actions, leaving the revision a one-line "I'll address...".
+            self.run_proposer_to_settle_sync().await?;
+
+            // Next round (if any) reviews the freshly revised answer.
+            current_answer = self.last_assistant_answer().unwrap_or(current_answer);
+        }
+
+        Ok(())
+    }
+
+    /// Run the proposer to settlement using synchronous generation, executing tool
+    /// calls each turn. Used by critic-revision rounds so the proposer can actually
+    /// perform its fix (write files, run checks) rather than emitting only a preamble.
+    /// Returns when the proposer stops requesting tools or MAX_TURNS is reached.
+    async fn run_proposer_to_settle_sync(&mut self) -> Result<()> {
+        const MAX_TURNS: usize = 24;
+        for _ in 0..MAX_TURNS {
+            self.check_ftai_reload();
             self.engine.micro_compact();
+            self.engine.compact();
             let request = self.engine.build_request(&self.config);
-            let revised = match self.generate_with_fallback(&request).await {
+            let response = match self.generate_with_fallback(&request).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.messages
-                        .push(DisplayMessage::System(format!("Revision failed ({e}).")));
+                        .push(DisplayMessage::System(format!("Revision error: {e}")));
                     break;
                 }
             };
-            let revised_text = Self::clean_model_output(&revised.message.content);
-            if !revised_text.trim().is_empty() {
-                self.messages
-                    .push(DisplayMessage::Assistant(revised_text.clone()));
+            let has_tool_calls = response
+                .message
+                .tool_calls
+                .as_ref()
+                .map_or(false, |tc| !tc.is_empty())
+                || !self.parser.parse(&response.message.content).1.is_empty();
+            self.process_response(response, false).await?;
+            if !has_tool_calls {
+                break;
             }
-            if let Some(ref mgr) = self.session_manager {
-                let _ = mgr.save_message(
-                    crate::backend::types::Role::Assistant,
-                    &revised_text,
-                    None,
-                );
-            }
-            self.engine.add_assistant_message(revised);
-            current_answer = revised_text;
         }
-
         Ok(())
     }
 
@@ -1619,13 +1628,17 @@ author = ""
             .to_string()
     }
 
-    async fn process_response(&mut self, response: ChatResponse) -> Result<()> {
+    /// Process a model response: display it (unless `suppress_display`, used by the
+    /// streaming path which already rendered the text live), persist it, add it to the
+    /// engine's conversation state, and execute any tool calls. Persistence + engine
+    /// state always use the real content so resume and follow-up turns retain the answer.
+    async fn process_response(&mut self, response: ChatResponse, suppress_display: bool) -> Result<()> {
         let content = Self::clean_model_output(&response.message.content);
         let tool_calls = response.message.tool_calls.clone();
 
         // In Chat mode skip tool call parsing — display the full response as text.
         if self.mode == Mode::Chat {
-            if !content.trim().is_empty() {
+            if !suppress_display && !content.trim().is_empty() {
                 self.messages.push(DisplayMessage::Assistant(content.clone()));
             }
             if let Some(ref mgr) = self.session_manager {
@@ -1638,7 +1651,7 @@ author = ""
         // Parse tool calls from text (for prompted mode)
         let (display_text, parsed_calls) = self.parser.parse(&content);
 
-        if !display_text.trim().is_empty() {
+        if !suppress_display && !display_text.trim().is_empty() {
             self.messages
                 .push(DisplayMessage::Assistant(Self::clean_model_output(&display_text)));
         }
